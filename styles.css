@@ -479,6 +479,12 @@ h2 {
   border-color: #afc5f0;
 }
 
+.notice.notice-error {
+  background: #fdf0f0;
+  color: #7b1c1c;
+  border-color: #e8a0a0;
+}
+
 .hidden {
   display: none;
 }

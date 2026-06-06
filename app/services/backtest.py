@@ -3,8 +3,6 @@ import statistics
 
 import pandas as pd
 
-from app.sample_data import sample_backtest
-
 logger = logging.getLogger(__name__)
 
 try:
@@ -175,9 +173,9 @@ def _compute_metrics(trades: list[dict]) -> dict:
 # ── public API ────────────────────────────────────────────────────────────────
 
 def run_backtest() -> dict:
-    """Run real historical backtest using yfinance data. Falls back to sample."""
+    """Run real historical backtest using yfinance data. Raises if data unavailable."""
     if not _BACKTEST_DEPS:
-        return _sample_result()
+        raise RuntimeError("yfinance / ta-lib not installed — run: pip install yfinance ta")
 
     all_trades: list[dict] = []
     strategy_rows: list[dict] = []
@@ -214,7 +212,7 @@ def run_backtest() -> dict:
             })
 
     if not all_trades:
-        return _sample_result()
+        raise RuntimeError("No signals detected in the 180-day window — backtest data unavailable")
 
     overall = _compute_metrics(all_trades)
     # Treat 1 R ≈ 1% account risk for drawdown %
@@ -232,25 +230,6 @@ def run_backtest() -> dict:
             "disclaimer":     "Uses daily OHLCV candles as a signal proxy. Not directly comparable to live intraday signals.",
         },
         "strategies": strategy_rows,
-    }
-
-
-def _sample_result() -> dict:
-    s          = sample_backtest()
-    win_rate   = (s["wins"] / s["totalTrades"]) * 100 if s["totalTrades"] else 0
-    pf         = s["grossProfitR"] / s["grossLossR"] if s["grossLossR"] else 0
-    return {
-        "metrics": {
-            "winRate":        round(win_rate, 1),
-            "profitFactor":   round(pf, 2),
-            "maxDrawdownPct": s["maxDrawdownPct"],
-            "sharpeProxy":    s["sharpeProxy"],
-            "totalTrades":    s["totalTrades"],
-            "dataSource":     "sample",
-            "dataType":       "daily_candle_proxy",
-            "disclaimer":     "Uses daily OHLCV candles as a signal proxy. Not directly comparable to live intraday signals.",
-        },
-        "strategies": s["strategies"],
     }
 
 

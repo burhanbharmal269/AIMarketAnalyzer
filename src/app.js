@@ -348,17 +348,24 @@
 
   // ── backtest ──────────────────────────────────────────────────────────────
 
+  function _setBacktestError(msg) {
+    const el = document.getElementById("backtestError");
+    const txt = document.getElementById("backtestErrorText");
+    if (el)  { el.classList.toggle("hidden", !msg); }
+    if (txt && msg) txt.textContent = msg;
+  }
+
   function renderBacktest(btData) {
+    _setBacktestError(null); // clear any previous error
     const m = btData.metrics;
     els.winRate.textContent      = m.winRate + "%";
     els.profitFactor.textContent = m.profitFactor === null ? "∞ (perfect)" : m.profitFactor;
     els.maxDrawdown.textContent  = m.maxDrawdownPct + "%";
     els.sharpeRatio.textContent  = m.sharpeProxy;
 
-    const src = m.dataSource === "live"
-      ? "Live historical data (" + (m.totalTrades || 0) + " trades) · daily candle proxy"
-      : "Sample data — connect NSE for live metrics";
-    if (els.backtestSource) els.backtestSource.textContent = src;
+    if (els.backtestSource) {
+      els.backtestSource.textContent = "Live historical data (" + (m.totalTrades || 0) + " trades) · daily candle proxy";
+    }
 
     const disc = document.getElementById("backtestDisclaimer");
     const discTxt = document.getElementById("backtestDisclaimerText");
@@ -380,18 +387,32 @@
     }).join("");
   }
 
+  function showBacktestUnavailable(reason) {
+    _setBacktestError(reason || "Backtest data unavailable.");
+    ["winRate", "profitFactor", "maxDrawdown", "sharpeRatio"].forEach(function (id) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = "—";
+    });
+    if (els.backtestSource) els.backtestSource.textContent = "Unavailable";
+    if (els.strategyRows) {
+      els.strategyRows.innerHTML =
+        '<tr><td colspan="5" class="empty-row">No data — see error above.</td></tr>';
+    }
+  }
+
   function loadBacktest() {
     if (!apiAvailable) {
-      const m = engine.backtestMetrics(data.backtest);
-      renderBacktest({ metrics: { ...m, dataSource: "sample" }, strategies: data.backtest.strategies });
+      showBacktestUnavailable("Backend offline — start the server to compute backtest.");
       return;
     }
     fetch("/api/backtest")
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (e) { throw new Error(e.detail || "Backtest unavailable"); });
+        return r.json();
+      })
       .then(renderBacktest)
-      .catch(function () {
-        const m = engine.backtestMetrics(data.backtest);
-        renderBacktest({ metrics: { ...m, dataSource: "sample" }, strategies: data.backtest.strategies });
+      .catch(function (err) {
+        showBacktestUnavailable(err.message || "Could not load backtest data.");
       });
   }
 

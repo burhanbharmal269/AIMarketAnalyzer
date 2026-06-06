@@ -329,7 +329,11 @@ def scan_default():
 
 @app.get("/api/backtest")
 def backtest():
-    return backtest_snapshot()
+    try:
+        return backtest_snapshot()
+    except Exception as exc:
+        logger.warning("Backtest unavailable: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 # ── API: audit ────────────────────────────────────────────────────────────────
