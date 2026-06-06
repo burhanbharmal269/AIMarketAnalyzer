@@ -52,7 +52,7 @@
           <article class="metric-panel">
             <span>Approved Signals</span>
             <strong id="approvedCount">0</strong>
-            <small>Max 3 per day</small>
+            <small>Max 5 per day</small>
           </article>
           <article class="metric-panel">
             <span>Rejected Setups</span>
@@ -147,6 +147,10 @@
             </div>
             <span id="backtestSource">Loading…</span>
           </div>
+          <div id="backtestDisclaimer" class="notice notice-info hidden">
+            <strong>Daily candle proxy.</strong>
+            <span id="backtestDisclaimerText"></span>
+          </div>
           <div class="backtest-grid">
             <article>
               <span>Win Rate</span>
@@ -188,7 +192,10 @@
               <p class="eyebrow">Manual execution tracking</p>
               <h2>Trade Journal</h2>
             </div>
-            <button id="logTradeButton" type="button">+ Log Trade</button>
+            <div style="display:flex;gap:8px;">
+              <button id="logTradeButton" type="button">+ Log Trade</button>
+              <a id="exportCsvLink" href="/api/journal/export" download class="btn-secondary">Export CSV</a>
+            </div>
           </div>
 
           <!-- Log trade form (hidden by default) -->
@@ -215,8 +222,16 @@
                 <input id="jStopLoss" type="number" step="0.5" min="0">
               </label>
               <label>
-                Target 2 (primary)
+                Target 1
+                <input id="jTarget1" type="number" step="0.5" min="0">
+              </label>
+              <label>
+                Target 2
                 <input id="jTarget2" type="number" step="0.5" min="0">
+              </label>
+              <label>
+                Target 3
+                <input id="jTarget3" type="number" step="0.5" min="0">
               </label>
               <label>
                 Confidence Score
@@ -233,6 +248,22 @@
             </div>
           </div>
 
+          <!-- Analytics stats bar -->
+          <div id="analyticsBar" class="analytics-bar">
+            <div class="analytics-stat"><span>Total Trades</span><strong id="aTotalTrades">—</strong></div>
+            <div class="analytics-stat"><span>Win Rate</span><strong id="aWinRate">—</strong></div>
+            <div class="analytics-stat"><span>Total P&amp;L</span><strong id="aTotalR">—</strong></div>
+            <div class="analytics-stat"><span>Profit Factor</span><strong id="aProfitFactor">—</strong></div>
+            <div class="analytics-stat"><span>Avg Win</span><strong id="aAvgWin">—</strong></div>
+            <div class="analytics-stat"><span>Avg Loss</span><strong id="aAvgLoss">—</strong></div>
+            <div class="analytics-stat"><span>Best Trade</span><strong id="aBest">—</strong></div>
+            <div class="analytics-stat"><span>Worst Trade</span><strong id="aWorst">—</strong></div>
+          </div>
+          <div class="analytics-breakdown">
+            <span id="aBreakdownPaper">Paper: —</span>
+            <span id="aBreakdownLive">Live: —</span>
+          </div>
+
           <!-- Journal table -->
           <div class="table-wrap">
             <table id="journalTable">
@@ -243,7 +274,7 @@
                   <th>Dir</th>
                   <th>Entry</th>
                   <th>SL</th>
-                  <th>T2</th>
+                  <th>T1 / T2 / T3</th>
                   <th>Score</th>
                   <th>Status</th>
                   <th>Outcome</th>

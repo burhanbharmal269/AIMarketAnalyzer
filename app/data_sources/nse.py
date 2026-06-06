@@ -1,8 +1,9 @@
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date as _date, datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -86,6 +87,52 @@ _NSE_CHART_INDEX_MAP = {
     "FINNIFTY":  ("FINNIFTY",  True),
     # All F&O stocks → (symbol, False) — resolved dynamically in the method
 }
+
+
+def _bs_greeks(spot: float, strike: float, dte: float, iv_pct: float, opt_type: str) -> dict:
+    """Black-Scholes Delta, Theta (per calendar day), Vega (per 1% IV move).
+    Uses only the standard library — no scipy dependency.
+    """
+    _SAFE = {"delta": 0.0, "theta": 0.0, "vega": 0.0}
+    try:
+        T     = max(float(dte), 0.01) / 365.0
+        sigma = max(float(iv_pct), 0.1) / 100.0
+        S, K  = float(spot), float(strike)
+        r     = 0.07  # India 10-yr bond proxy
+
+        if S <= 0 or K <= 0:
+            return _SAFE
+
+        sqrt_T = math.sqrt(T)
+        d1     = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt_T)
+        d2     = d1 - sigma * sqrt_T
+
+        def _cdf(x):
+            return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+        def _pdf(x):
+            return math.exp(-0.5 * x * x) / math.sqrt(2 * math.pi)
+
+        Nd1 = _cdf(d1)
+        Nd2 = _cdf(d2)
+        nd1 = _pdf(d1)
+
+        if opt_type == "CE":
+            delta = Nd1
+            theta = (-(S * nd1 * sigma) / (2 * sqrt_T) - r * K * math.exp(-r * T) * Nd2) / 365
+        else:  # PE
+            delta = Nd1 - 1
+            theta = (-(S * nd1 * sigma) / (2 * sqrt_T) + r * K * math.exp(-r * T) * (1 - Nd2)) / 365
+
+        vega = S * nd1 * sqrt_T / 100  # per 1% IV change
+
+        return {
+            "delta": round(delta, 3),
+            "theta": round(theta, 2),
+            "vega":  round(vega, 2),
+        }
+    except Exception:
+        return _SAFE
 
 
 def _supertrend_direction(high, low, close, period: int = 7, multiplier: float = 3.0):
@@ -377,6 +424,21 @@ class NSEDataSource:
             else:
                 logger.debug("Indicators using daily fallback (NSE chart unavailable)")
 
+            # ── 15-min confluence — resample 1-min data, no extra API call ──
+            tf15_bull = False
+            tf15_bear = False
+            if intraday_closes is not None and len(intraday_closes) >= 30:
+                try:
+                    import pandas as pd
+                    c15 = intraday_closes.resample("15min").last().dropna()
+                    if len(c15) >= 9:
+                        ema9_15  = c15.ewm(span=9,  adjust=False).mean()
+                        ema21_15 = c15.ewm(span=21, adjust=False).mean()
+                        tf15_bull = float(ema9_15.iloc[-1]) > float(ema21_15.iloc[-1])
+                        tf15_bear = float(ema9_15.iloc[-1]) < float(ema21_15.iloc[-1])
+                except Exception as exc:
+                    logger.debug("15-min resample failed: %s", exc)
+
             return {
                 "ema20":             round(float(ema20), 2),
                 "ema50":             round(float(ema50_), 2),
@@ -392,6 +454,8 @@ class NSEDataSource:
                 "supertrendBullish": st_dir == 1,
                 "prevDayHigh":       round(prev_high, 2),
                 "prevDayLow":        round(prev_low, 2),
+                "tf15Bull":          tf15_bull,
+                "tf15Bear":          tf15_bear,
             }
         except Exception as exc:
             logger.warning("Indicator computation failed: %s", exc)
@@ -460,6 +524,13 @@ class NSEDataSource:
             max_pain_strike = min(pain, key=pain.get) if pain else atm_strike
             max_pain_dist   = round(abs(spot - max_pain_strike) / spot * 100, 2) if spot > 0 else 0.0
 
+            # Days-to-expiry — used for signal validity and same-day blocking
+            try:
+                expiry_date = datetime.strptime(nearest, "%d-%b-%Y").date()
+                dte = max((expiry_date - _date.today()).days, 0)
+            except Exception:
+                dte = 7  # safe fallback
+
             return {
                 "atm_strike":        atm_strike,
                 "entry":             round(last_price, 1) if last_price > 1 else None,
@@ -472,6 +543,8 @@ class NSEDataSource:
                 "maxPainDistancePct": max_pain_dist,
                 "expiry":            nearest,
                 "atmIV":             round(atm_iv, 1),
+                "dte":               dte,
+                "optType":           opt_key,   # "CE" or "PE"
             }
         except Exception as exc:
             logger.warning("Option chain parse failed [%s]: %s", symbol, exc)
@@ -486,30 +559,54 @@ class NSEDataSource:
         if not (bullish or bearish):
             return None  # mixed trend — skip
 
-        opt_type   = "CE" if bullish else "PE"
-        direction  = "BUY"
-        strike     = opt["atm_strike"]
-        instrument = f"{symbol} {strike} {opt_type}"
+        opt_type  = opt.get("optType", "CE" if bullish else "PE")
+        direction = "BUY" if bullish else "SELL"   # BUY=bullish CE, SELL=bearish PE (buying puts)
+        strike    = opt["atm_strike"]
+        instrument = f"{symbol} {int(strike)} {opt_type}"
+
+        # ── DTE-based guards ────────────────────────────────────────────────
+        dte     = opt.get("dte", 7)
+        now_ist = datetime.now(IST)
+        if dte == 0 and now_ist.hour >= 14:
+            return None  # zero-DTE after 14:00 — theta is catastrophic on failed moves
+
+        if dte == 0:
+            signal_valid = 20
+        elif dte <= 3:
+            signal_valid = 40
+        else:
+            signal_valid = 45 if symbol in INDEX_SYMBOLS else 60
+
+        expiry_label = "Monthly" if dte > 14 else "Weekly"
 
         entry = opt.get("entry")
         if not entry or entry < 1:
             return None
 
-        # ATR-based stop/targets on option premium (ATM delta ≈ 0.5)
-        underlying_atr  = ind.get("atr", 0)
+        # ── stop / targets on option premium (ATM delta ≈ 0.5) ─────────────
+        underlying_atr   = ind.get("atr", 0)
         option_stop_dist = round(max(underlying_atr * 0.35, entry * 0.15), 1)
         stop_loss        = round(entry - option_stop_dist, 1)
         if stop_loss < 1:
             stop_loss        = round(entry * 0.80, 1)
             option_stop_dist = entry - stop_loss
 
-        t1 = round(entry + option_stop_dist,       1)
-        t2 = round(entry + 2 * option_stop_dist,   1)
-        t3 = round(entry + 3 * option_stop_dist,   1)
+        t1 = round(entry + option_stop_dist,     1)
+        t2 = round(entry + 2 * option_stop_dist, 1)
+        t3 = round(entry + 3 * option_stop_dist, 1)
         _risk = abs(entry - stop_loss)
         rr = round(abs(t2 - entry) / _risk, 2) if _risk > 0 else 2.0
 
-        # Price action description
+        # ── Black-Scholes Greeks ──────────────────────────────────────────────
+        greeks = _bs_greeks(
+            spot=ind["spotPrice"],
+            strike=float(strike),
+            dte=max(dte, 0.5),
+            iv_pct=opt.get("atmIV", 15.0),
+            opt_type=opt_type,
+        )
+
+        # ── price action description ─────────────────────────────────────────
         rsi = ind["rsi"]
         adx = ind["adx"]
         if bullish:
@@ -525,17 +622,20 @@ class NSEDataSource:
             else:
                 price_action = "Bearish EMA alignment with downward pressure"
 
-        # Sentiment (0–10) — reduced by high VIX
         vix_penalty      = 0 if vix <= 16 else (2 if vix <= 20 else 4)
         market_sentiment = max(0, min(10, (7 if bullish else 6) - vix_penalty))
 
-        expiry_raw   = opt.get("expiry", "")
-        # NSE format is "DD-MMM-YYYY"; check the DAY (index 0), not the year (index -1)
-        try:
-            expiry_day = int(expiry_raw.split("-")[0]) if expiry_raw else 0
-        except (ValueError, IndexError):
-            expiry_day = 0
-        expiry_label = "Monthly" if expiry_day > 25 else "Weekly"
+        # ── IV rank (built up over time from stored daily readings) ──────────
+        from app.services.storage import store_iv_reading, get_iv_rank
+        atm_iv = opt.get("atmIV", 0)
+        store_iv_reading(symbol, atm_iv)
+        iv_rank = get_iv_rank(symbol)   # None until 20+ days of history
+
+        # ── 15-min confluence flag ────────────────────────────────────────────
+        tf15_aligned = (
+            (bullish and ind.get("tf15Bull", False)) or
+            (bearish and ind.get("tf15Bear", False))
+        )
 
         return {
             "id":               f"{symbol.lower()}-{opt_type.lower()}-{strike}",
@@ -544,7 +644,8 @@ class NSEDataSource:
             "direction":        direction,
             "style":            "Intraday trend continuation" if adx >= 20 else "Intraday momentum setup",
             "expiry":           expiry_label,
-            "signalValidMinutes": 45 if symbol in INDEX_SYMBOLS else 60,
+            "dte":              dte,
+            "signalValidMinutes": signal_valid,
             "entry":            entry,
             "stopLoss":         stop_loss,
             "targets":          [t1, t2, t3],
@@ -572,10 +673,15 @@ class NSEDataSource:
             "pdBreakout": (
                 (bullish and ind["spotPrice"] > ind.get("prevDayHigh", ind["spotPrice"]))
                 or
-                (bearish and ind["spotPrice"] < ind.get("prevDayLow", ind["spotPrice"]))
+                (bearish and ind["spotPrice"] < ind.get("prevDayLow",  ind["spotPrice"]))
             ),
-            "atmIV":            opt.get("atmIV", 0),
-            "notes":            [f"Live NSE data. Underlying spot: {ind['spotPrice']:.0f}."],
+            "atmIV":        opt.get("atmIV", 0),
+            "ivRank":       iv_rank,
+            "tf15Aligned":  tf15_aligned,
+            "delta":        greeks["delta"],
+            "theta":        greeks["theta"],
+            "vega":         greeks["vega"],
+            "notes":        [f"Live NSE data. Spot: {ind['spotPrice']:.0f}. DTE: {dte}."],
         }
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -631,6 +737,114 @@ class NSEDataSource:
         logger.info("Scanned %d instruments → %d candidates", len(instruments), len(candidates))
         return candidates
 
+    # ── event calendar ────────────────────────────────────────────────────────
+
+    def _build_event_calendar(self) -> list[dict]:
+        """Return upcoming high-impact events as [{name, severity, minutesAway}].
+
+        Sources:
+          - NSE weekly/monthly option expiries (computed algorithmically)
+          - RBI MPC announcement dates (hardcoded for 2025–2026)
+          - NSE trading holidays (hardcoded for 2025–2026)
+        Only events within the next 5 trading days are returned.
+        """
+        from datetime import date, timedelta as td
+        now_ist  = datetime.now(IST)
+        today    = now_ist.date()
+        events: list[dict] = []
+
+        def _minutes_away(event_date: date, hour: int = 9, minute: int = 15) -> float:
+            event_dt = datetime(event_date.year, event_date.month, event_date.day,
+                                hour, minute, tzinfo=IST)
+            return (event_dt - now_ist).total_seconds() / 60.0
+
+        def _last_thursday(year: int, month: int) -> date:
+            """Last Thursday of the given month."""
+            import calendar
+            last_day = calendar.monthrange(year, month)[1]
+            d = date(year, month, last_day)
+            # weekday(): Monday=0 … Thursday=3
+            offset = (d.weekday() - 3) % 7
+            return d - td(days=offset)
+
+        def _add(name: str, event_date: date, severity: str, hour: int = 9, minute: int = 15):
+            mins = _minutes_away(event_date, hour, minute)
+            if -30 <= mins <= 5 * 24 * 60:   # from 30 min ago to 5 days ahead
+                events.append({"name": name, "severity": severity, "minutesAway": round(mins)})
+
+        # ── NSE market holidays 2025 ──────────────────────────────────────────
+        _NSE_HOLIDAYS_2025 = [
+            date(2025, 1, 26),   # Republic Day
+            date(2025, 2, 26),   # Mahashivratri
+            date(2025, 3, 14),   # Holi
+            date(2025, 4, 14),   # Dr. Ambedkar Jayanti
+            date(2025, 4, 18),   # Good Friday
+            date(2025, 5, 1),    # Maharashtra Day
+            date(2025, 8, 15),   # Independence Day
+            date(2025, 10, 2),   # Gandhi Jayanti
+            date(2025, 10, 24),  # Diwali Laxmi Puja
+            date(2025, 11, 5),   # Diwali Balipratipada
+            date(2025, 11, 15),  # Gurunanak Jayanti
+            date(2025, 12, 25),  # Christmas
+        ]
+        _NSE_HOLIDAYS_2026 = [
+            date(2026, 1, 26),   # Republic Day
+            date(2026, 3, 3),    # Maha Shivratri (estimated)
+            date(2026, 3, 20),   # Holi (estimated)
+            date(2026, 4, 3),    # Good Friday (estimated)
+            date(2026, 4, 14),   # Dr. Ambedkar Jayanti
+            date(2026, 5, 1),    # Maharashtra Day
+            date(2026, 8, 15),   # Independence Day
+            date(2026, 10, 2),   # Gandhi Jayanti
+            date(2026, 10, 21),  # Diwali (estimated)
+            date(2026, 11, 5),   # Gurunanak Jayanti (estimated)
+            date(2026, 12, 25),  # Christmas
+        ]
+        _ALL_HOLIDAYS = set(_NSE_HOLIDAYS_2025 + _NSE_HOLIDAYS_2026)
+
+        # ── RBI MPC announcement dates (decision day = 3rd day of meeting) ──
+        _RBI_MPC_DATES = [
+            date(2025, 4, 9),
+            date(2025, 6, 6),
+            date(2025, 8, 7),
+            date(2025, 10, 8),
+            date(2025, 12, 5),
+            date(2026, 2, 6),
+            date(2026, 4, 3),
+            date(2026, 6, 5),
+            date(2026, 8, 6),
+            date(2026, 10, 7),
+            date(2026, 12, 4),
+        ]
+
+        # Check holidays
+        for h in _ALL_HOLIDAYS:
+            _add("NSE Market Holiday", h, "high", hour=0, minute=0)
+
+        # Check RBI MPC days
+        for mpc in _RBI_MPC_DATES:
+            _add("RBI MPC Announcement", mpc, "high", hour=10, minute=0)
+
+        # Weekly expiry: every Thursday (or nearest non-holiday)
+        d = today
+        for _ in range(10):   # look up to 10 days ahead
+            if d.weekday() == 3 and d not in _ALL_HOLIDAYS:  # Thursday
+                _add("NSE Weekly Expiry", d, "medium", hour=15, minute=30)
+                break
+            d += td(days=1)
+
+        # Monthly expiry: last Thursday of each upcoming month
+        for delta_months in range(3):
+            month = (today.month - 1 + delta_months) % 12 + 1
+            year  = today.year + (today.month - 1 + delta_months) // 12
+            lt = _last_thursday(year, month)
+            if lt >= today:
+                _add("NSE Monthly Expiry", lt, "high", hour=15, minute=30)
+
+        # Sort by minutesAway ascending
+        events.sort(key=lambda e: e["minutesAway"])
+        return events
+
     def get_market_snapshot(self) -> dict:
         vix = self.get_india_vix()
 
@@ -656,7 +870,7 @@ class NSEDataSource:
             "indiaVix":       vix,
             "breadth":        breadth,
             "globalSentiment": "Neutral",
-            "eventCalendar":  [],
+            "eventCalendar":  self._build_event_calendar(),
             "news": [
                 f"India VIX at {vix}. {'Calm conditions support directional trades.' if vix < 16 else 'Elevated volatility — use tighter stops.'}",
                 "Live market data sourced from NSE.",

@@ -228,6 +228,8 @@ def run_backtest() -> dict:
             "sharpeProxy":    overall.get("sharpeProxy", 0),
             "totalTrades":    overall.get("totalTrades", 0),
             "dataSource":     "live",
+            "dataType":       "daily_candle_proxy",
+            "disclaimer":     "Uses daily OHLCV candles as a signal proxy. Not directly comparable to live intraday signals.",
         },
         "strategies": strategy_rows,
     }
@@ -245,6 +247,8 @@ def _sample_result() -> dict:
             "sharpeProxy":    s["sharpeProxy"],
             "totalTrades":    s["totalTrades"],
             "dataSource":     "sample",
+            "dataType":       "daily_candle_proxy",
+            "disclaimer":     "Uses daily OHLCV candles as a signal proxy. Not directly comparable to live intraday signals.",
         },
         "strategies": s["strategies"],
     }

@@ -288,6 +288,102 @@ h2 {
   color: var(--warn);
 }
 
+/* ── Journal analytics stats bar ─────────────────────────────────────────── */
+
+.analytics-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.analytics-breakdown {
+  display: flex;
+  gap: 20px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  margin-bottom: 16px;
+  padding-left: 2px;
+}
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  padding: 7px 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.84rem;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+}
+.btn-secondary:hover { background: var(--border); }
+
+.analytics-stat {
+  flex: 1;
+  min-width: 100px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.analytics-stat span {
+  font-size: 0.72rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.analytics-stat strong {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--ink);
+}
+
+/* ── Option Greeks row inside signal cards ───────────────────────────────── */
+
+.greeks-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--line);
+  background: var(--surface-2);
+}
+
+.greeks-row span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.74rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.greeks-row span strong {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--ink);
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.iv-rank { border-radius: 4px; padding: 2px 5px; }
+.iv-rank--low  { background: #e6f9ec; color: #1a7a3a; }
+.iv-rank--mid  { background: #fef9e6; color: #7a6010; }
+.iv-rank--high { background: #fdeaea; color: #9b1c1c; }
+
+.tf15-badge { border-radius: 4px; padding: 2px 5px; }
+.tf15-badge--ok   { background: #e6f9ec; color: #1a7a3a; }
+.tf15-badge--warn { background: #fdeaea; color: #9b1c1c; }
+
 .trade-levels {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -593,6 +689,18 @@ textarea {
 @keyframes scan-slide {
   0%   { background-position: 200% 0; }
   100% { background-position: -200% 0; }
+}
+
+.scan-bar--error {
+  height: auto;
+  padding: 10px 20px;
+  background: #c0392b;
+  animation: none;
+  color: #fff;
+  font-size: 0.88rem;
+  font-weight: 600;
+  text-align: center;
+  letter-spacing: 0.01em;
 }
 
 /* ── Scan button loading state ───────────────────────────────────────────── */

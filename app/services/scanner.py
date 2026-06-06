@@ -63,6 +63,10 @@ def trend_score(candidate):
     if candidate.get("pdBreakout"):
         score += 4
 
+    # 15-min EMA9/21 confirms daily direction — adds intraday confluence
+    if candidate.get("tf15Aligned"):
+        score += 3
+
     # Price action pattern
     price_action = candidate["priceAction"].lower()
     if "breakout" in price_action:
@@ -137,7 +141,7 @@ def option_chain_score(candidate):
     elif candidate["spreadPct"] <= 3:
         score += 1
 
-    # IV check — no gap between 30-42; full monotone ladder
+    # IV check — raw level ladder
     atm_iv = candidate.get("atmIV", 0)
     if atm_iv > 0:
         if atm_iv < 20:
@@ -145,11 +149,23 @@ def option_chain_score(candidate):
         elif atm_iv < 28:
             score += 1    # fair value
         elif atm_iv < 35:
-            pass          # neutral zone — neither reward nor penalty
+            pass          # neutral zone
         elif atm_iv < 42:
             score -= 2    # somewhat expensive
         else:
             score -= 4    # very expensive — erodes edge significantly
+
+    # IV Rank — relative expensiveness vs 52-week history (more precise than raw level)
+    iv_rank = candidate.get("ivRank")
+    if iv_rank is not None:
+        if iv_rank < 20:
+            score += 3    # historically cheap IV — option buyers' sweet spot
+        elif iv_rank < 35:
+            score += 1
+        elif iv_rank > 75:
+            score -= 3    # historically expensive — premium hurts buyers
+        elif iv_rank > 55:
+            score -= 1
 
     return clamp(score, 0, CATEGORY_MAX["optionChain"])
 

@@ -17,6 +17,29 @@
     return Math.max(min, Math.min(max, value));
   }
 
+  function istHourMinute() {
+    const parts = new Intl.DateTimeFormat("en-IN", {
+      timeZone: "Asia/Kolkata",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }).formatToParts(new Date());
+    const h = parseInt(parts.find(function (p) { return p.type === "hour"; }).value, 10);
+    const m = parseInt(parts.find(function (p) { return p.type === "minute"; }).value, 10);
+    return [h, m];
+  }
+
+  function timeGateBlocked() {
+    const hm = istHourMinute();
+    const h = hm[0], m = hm[1];
+    // Opening auction volatility: 9:15 – 9:30 IST
+    if (h === 9 && m >= 15 && m < 30) { return true; }
+    // Pre-close / expiry settlement: 14:45 – 15:30 IST
+    if (h === 14 && m >= 45) { return true; }
+    if (h === 15 && m <= 30) { return true; }
+    return false;
+  }
+
   function isBullishTrend(candidate) {
     return candidate.ema20 > candidate.ema50 && candidate.ema50 > candidate.ema200;
   }
@@ -151,8 +174,8 @@
       maxDailyLossPct: 3,
       maxWeeklyDrawdownPct: 8,
       maxMonthlyDrawdownPct: 15,
-      minScore: 80,
-      maxSignals: 3
+      minScore: 72,
+      maxSignals: 5
     };
   }
 
@@ -169,6 +192,9 @@
     const failures = [];
     const alignedTrend = candidate.direction === "BUY" ? isBullishTrend(candidate) : isBearishTrend(candidate);
 
+    if (timeGateBlocked()) {
+      failures.push("Time gate: opening (9:15–9:30) or pre-close (14:45–15:30) IST window.");
+    }
     if (settings.lossStreak >= 3) {
       failures.push("Stop-trading rule active after 3 consecutive losses.");
     }

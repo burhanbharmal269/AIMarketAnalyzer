@@ -22,6 +22,15 @@
     capitalMode:        document.getElementById("capitalMode"),
     riskState:          document.getElementById("riskState"),
     noTradeBanner:      document.getElementById("noTradeBanner"),
+    // Journal analytics
+    aTotalTrades: document.getElementById("aTotalTrades"),
+    aWinRate:     document.getElementById("aWinRate"),
+    aTotalR:      document.getElementById("aTotalR"),
+    aProfitFactor:document.getElementById("aProfitFactor"),
+    aAvgWin:      document.getElementById("aAvgWin"),
+    aAvgLoss:     document.getElementById("aAvgLoss"),
+    aBest:        document.getElementById("aBest"),
+    aWorst:       document.getElementById("aWorst"),
 
     signalsGrid:        document.getElementById("signalsGrid"),
     scanTimestamp:      document.getElementById("scanTimestamp"),
@@ -46,7 +55,9 @@
     jDirection:         document.getElementById("jDirection"),
     jEntry:             document.getElementById("jEntry"),
     jStopLoss:          document.getElementById("jStopLoss"),
+    jTarget1:           document.getElementById("jTarget1"),
     jTarget2:           document.getElementById("jTarget2"),
+    jTarget3:           document.getElementById("jTarget3"),
     jScore:             document.getElementById("jScore"),
     jNotes:             document.getElementById("jNotes"),
     settings: {
@@ -169,7 +180,9 @@
         "\" data-direction=\"" + escapeHtml(c.direction) +
         "\" data-entry=\""    + c.entry +
         "\" data-sl=\""       + c.stopLoss +
+        "\" data-t1=\""       + (c.targets[0] || 0) +
         "\" data-t2=\""       + (c.targets[1] || 0) +
+        "\" data-t3=\""       + (c.targets[2] || 0) +
         "\" data-score=\""    + item.score.total +
         "\">Log Trade</button>"
       : "";
@@ -183,7 +196,9 @@
       "<div class=\"signal-head\">",
       "<div><h3>" + escapeHtml(c.instrument) + "</h3><span>" + escapeHtml(c.style) + "</span></div>",
       "<div style=\"display:flex;gap:8px;align-items:center\">",
-      "<span class=\"badge buy\">" + escapeHtml(c.direction) + " | Confidence " + item.score.total + "/100</span>",
+      "<span class=\"badge " + (c.direction === "BUY" ? "buy" : "sell") + "\">" +
+        (c.direction === "BUY" ? "BULLISH" : "BEARISH") +
+        " | Confidence " + item.score.total + "/100</span>",
       logBtn,
       "</div>",
       "</div>",
@@ -196,8 +211,23 @@
       "<div><span>Risk Reward</span><strong>1:"  + c.rr             + "</strong></div>",
       "<div><span>Confidence</span><strong>"     + item.score.total + "/100</strong></div>",
       "<div><span>Valid Until</span><strong>"    + item.validUntil  + "</strong></div>",
+      "<div><span>Expiry</span><strong>"         + escapeHtml(c.expiry) + (c.dte != null ? " (" + c.dte + "d)" : "") + "</strong></div>",
       "<div><span>Position Size</span><strong>"  + item.sizing.lots + " lot(s)</strong></div>",
       "</div>",
+      // Greeks row — Delta/Theta/Vega from Black-Scholes
+      (c.delta != null ? [
+        "<div class=\"greeks-row\">",
+        "<span>Delta<strong>" + (c.delta >= 0 ? "+" : "") + c.delta.toFixed(3) + "</strong></span>",
+        "<span>Theta<strong>" + c.theta.toFixed(2) + "/day</strong></span>",
+        "<span>Vega<strong>+" + c.vega.toFixed(2) + "</strong></span>",
+        "<span>ATM IV<strong>" + (c.atmIV || "—") + "%</strong></span>",
+        "<span>DTE<strong>" + (c.dte != null ? c.dte + (c.dte === 1 ? " day" : " days") : "—") + "</strong></span>",
+        (c.ivRank != null
+          ? "<span class=\"iv-rank iv-rank--" + (c.ivRank < 35 ? "low" : c.ivRank > 65 ? "high" : "mid") + "\">IV Rank<strong>" + c.ivRank + "</strong></span>"
+          : ""),
+        "<span class=\"tf15-badge tf15-badge--" + (c.tf15Aligned ? "ok" : "warn") + "\">15m<strong>" + (c.tf15Aligned ? "✓" : "✗") + "</strong></span>",
+        "</div>"
+      ].join("") : ""),
       "<div class=\"score-block\">" + scoreRows(item) + "</div>",
       "<div class=\"text-block\">",
       "<div class=\"reason-list\"><strong>AI Explanation</strong><p>" + escapeHtml(item.explanation) + "</p></div>",
@@ -246,7 +276,9 @@
         els.jDirection.value  = btn.dataset.direction;
         els.jEntry.value      = btn.dataset.entry;
         els.jStopLoss.value   = btn.dataset.sl;
+        els.jTarget1.value    = btn.dataset.t1;
         els.jTarget2.value    = btn.dataset.t2;
+        els.jTarget3.value    = btn.dataset.t3;
         els.jScore.value      = btn.dataset.score;
         els.journalForm.classList.remove("hidden");
         document.getElementById("journal").scrollIntoView({ behavior: "smooth" });
@@ -324,9 +356,16 @@
     els.sharpeRatio.textContent  = m.sharpeProxy;
 
     const src = m.dataSource === "live"
-      ? "Live historical data (" + (m.totalTrades || 0) + " trades)"
+      ? "Live historical data (" + (m.totalTrades || 0) + " trades) · daily candle proxy"
       : "Sample data — connect NSE for live metrics";
     if (els.backtestSource) els.backtestSource.textContent = src;
+
+    const disc = document.getElementById("backtestDisclaimer");
+    const discTxt = document.getElementById("backtestDisclaimerText");
+    if (disc && discTxt && m.disclaimer) {
+      discTxt.textContent = m.disclaimer;
+      disc.classList.remove("hidden");
+    }
 
     els.strategyRows.innerHTML = (btData.strategies || []).map(function (s) {
       return [
@@ -374,6 +413,45 @@
       .catch(function () {});
   }
 
+  // ── journal analytics ─────────────────────────────────────────────────────
+
+  function loadAnalytics() {
+    if (!apiAvailable) return;
+    fetch("/api/journal/analytics")
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (els.aTotalTrades)  els.aTotalTrades.textContent  = d.totalTrades || 0;
+        if (els.aWinRate)      els.aWinRate.textContent      = (d.winRate  || 0) + "%";
+        if (els.aProfitFactor) els.aProfitFactor.textContent = d.profitFactor || "—";
+        if (els.aAvgWin)       els.aAvgWin.textContent       = "+" + (d.avgWinR  || 0) + "R";
+        if (els.aAvgLoss)      els.aAvgLoss.textContent      = (d.avgLossR || 0) + "R";
+        if (els.aBest)         els.aBest.textContent         = (d.bestTrade  >= 0 ? "+" : "") + (d.bestTrade  || 0) + "R";
+        if (els.aWorst)        els.aWorst.textContent        = (d.worstTrade || 0) + "R";
+        if (els.aTotalR) {
+          var r = d.totalR || 0;
+          els.aTotalR.textContent = (r >= 0 ? "+" : "") + r + "R";
+          els.aTotalR.style.color = r > 0 ? "var(--good)" : r < 0 ? "var(--danger)" : "";
+        }
+        // Paper vs live breakdown sub-labels
+        var paper = d.paper || {}, live = d.live || {};
+        var paperLabel = document.getElementById("aBreakdownPaper");
+        var liveLabel  = document.getElementById("aBreakdownLive");
+        if (paperLabel) paperLabel.textContent = "Paper: " + (paper.totalTrades || 0) + " trades, " + (paper.winRate || 0) + "% win";
+        if (liveLabel)  liveLabel.textContent  = "Live: "  + (live.totalTrades  || 0) + " trades, " + (live.winRate  || 0) + "% win";
+      })
+      .catch(function () {});
+  }
+
+  // Pre-fill loss streak from scan response (journal-computed)
+  function syncLossStreak(lossStreak) {
+    if (lossStreak == null) return;
+    var el = els.settings.lossStreak;
+    if (el && +el.value < lossStreak) {
+      el.value = lossStreak;
+      el.style.borderColor = lossStreak >= 3 ? "var(--danger)" : "";
+    }
+  }
+
   // ── trade journal ─────────────────────────────────────────────────────────
 
   function renderJournalRows(items) {
@@ -389,7 +467,7 @@
         "<td>" + escapeHtml(t.direction)     + "</td>",
         "<td>" + t.entry                     + "</td>",
         "<td>" + t.stop_loss                 + "</td>",
-        "<td>" + t.target_2                  + "</td>",
+        "<td>" + [t.target_1, t.target_2, t.target_3].filter(Boolean).join(" / ") + "</td>",
         "<td>" + t.confidence_score          + "</td>",
         "<td>" + escapeHtml(t.status || "paper") + "</td>",
         "<td>" + escapeHtml(t.outcome || "—")    + "</td>",
@@ -413,7 +491,7 @@
       direction:       els.jDirection.value,
       entry:           +els.jEntry.value,
       stopLoss:        +els.jStopLoss.value,
-      targets:         [0, +els.jTarget2.value, 0],
+      targets:         [+els.jTarget1.value || 0, +els.jTarget2.value || 0, +els.jTarget3.value || 0],
       confidenceScore: +els.jScore.value,
       status:          "paper",
       notes:           els.jNotes.value.trim()
@@ -431,9 +509,10 @@
       if (!resp.ok) throw new Error("Save failed");
       els.journalForm.classList.add("hidden");
       // Clear form
-      [els.jInstrument, els.jEntry, els.jStopLoss, els.jTarget2, els.jNotes].forEach(function (el) { el.value = ""; });
+      [els.jInstrument, els.jEntry, els.jStopLoss, els.jTarget1, els.jTarget2, els.jTarget3, els.jNotes].forEach(function (el) { el.value = ""; });
       els.jScore.value = "0";
       loadJournal();
+      loadAnalytics();
     } catch (err) {
       alert("Could not save trade: " + err.message);
     }
@@ -453,11 +532,14 @@
         if (s.liveDataAvailable) {
           els.liveDataDot.classList.add("live");
           els.liveDataDot.style.background = "";
-          els.liveDataLabel.textContent    = "Live NSE data — VIX " + s.indiaVix;
+          const lastScan = s.lastScanAt
+            ? " · Last scan " + new Date(s.lastScanAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })
+            : "";
+          els.liveDataLabel.textContent = "Live NSE data — VIX " + s.indiaVix + lastScan;
         } else {
           els.liveDataDot.classList.remove("live");
-          els.liveDataDot.style.background = "#e67e22";
-          els.liveDataLabel.textContent    = "Sample data (NSE offline)";
+          els.liveDataDot.style.background = "#e02020";
+          els.liveDataLabel.textContent    = "NSE OFFLINE — do not trade";
         }
       })
       .catch(function () {
@@ -477,36 +559,53 @@
     loadAiSummary();
   }
 
-  function runLocalScan() {
-    setScanLoading(true);
-    setTimeout(function () {
-      latestScan = engine.runScan(data, settingValues());
-      renderAll(latestScan, data.market);
-      setScanLoading(false);
-      const n = latestScan.approved.length;
-      showToast(n > 0 ? "Scan complete — " + n + " signal" + (n > 1 ? "s" : "") + " approved" : "Scan complete — no approved signals", n > 0 ? "success" : "info");
-    }, 50);
+  function showScanError(message) {
+    const bar = els.scanBar;
+    if (bar) {
+      bar.textContent = "⚠ " + message;
+      bar.className = "scan-bar scan-bar--error";
+    }
+    showToast(message, "error");
+  }
+
+  function clearScanError() {
+    const bar = els.scanBar;
+    if (bar) bar.className = "scan-bar hidden";
   }
 
   async function runScan() {
-    if (!apiAvailable) { runLocalScan(); return; }
+    // If server is completely unreachable, show error — never silently use sample data
+    if (!apiAvailable) {
+      showScanError("Backend server is offline. Start the server before scanning.");
+      return;
+    }
     setScanLoading(true);
+    clearScanError();
     try {
       const response = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(settingValues())
       });
-      if (!response.ok) throw new Error("API error");
+      if (!response.ok) {
+        const err = await response.json().catch(function () { return {}; });
+        const reason = (err.detail) || ("HTTP " + response.status);
+        showScanError("Live scan failed — " + reason + ". Do NOT trade without fresh data.");
+        return;
+      }
       const payload = await response.json();
+      if (payload.dataSource && payload.dataSource !== "live") {
+        showScanError("Non-live data returned. Do NOT trade on this scan.");
+        return;
+      }
+      clearScanError();
       renderAll(normalizeApiScan(payload), payload.market);
+      syncLossStreak(payload.lossStreak);
+      loadAnalytics();
       const n = payload.approved.length;
       showToast(n > 0 ? "Scan complete — " + n + " signal" + (n > 1 ? "s" : "") + " approved" : "Scan complete — no approved signals", n > 0 ? "success" : "info");
     } catch (_) {
-      apiAvailable = false;
-      showToast("Live scan failed — using local data", "error");
-      runLocalScan();
-      return;
+      showScanError("Server unreachable — check that the backend is running. Do NOT trade without live data.");
     } finally {
       setScanLoading(false);
     }
@@ -522,14 +621,16 @@
     checkDataStatus();
     loadBacktest();
     loadJournal();
-    runScan();
+    loadAnalytics();
+    // Do NOT auto-scan on load — user must press Run Scan to get live data
+    if (!apiAvailable) {
+      showScanError("Backend offline — start the server then press Run Scan.");
+    }
   }
 
   // ── event bindings ────────────────────────────────────────────────────────
 
-  Object.keys(els.settings).forEach(function (key) {
-    els.settings[key].addEventListener("input", runScan);
-  });
+  // Settings changes do not auto-scan — in live trading, scan is a deliberate action
 
   els.scanButton.addEventListener("click", runScan);
 
