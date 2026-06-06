@@ -249,11 +249,22 @@ def hard_gate_failures(candidate, market, risk_state, settings):
         failures.append("India VIX is elevated beyond directional buying threshold.")
 
     # Time-of-day gate — avoid opening chop and closing volatility
-    now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).time()
-    if dtime(9, 15) <= now_ist <= dtime(10, 0):
+    now_ist     = datetime.now(ZoneInfo("Asia/Kolkata"))
+    now_ist_t   = now_ist.time()
+    if dtime(9, 15) <= now_ist_t <= dtime(10, 0):
         failures.append("Opening volatility window (9:15–10:00 IST) — wait for price discovery and trend confirmation.")
-    if dtime(14, 45) <= now_ist <= dtime(15, 30):
+    if dtime(14, 45) <= now_ist_t <= dtime(15, 30):
         failures.append("Closing volatility window (14:45–15:30 IST) — avoid new entries near close.")
+
+    # Expiry day gate — Thursday after 11:00 IST
+    # Weekly options expire every Thursday; gamma accelerates and time decay becomes
+    # punishing after 11am, making new long-option entries a negative-expectancy bet.
+    if now_ist.weekday() == 3 and now_ist_t >= dtime(11, 0):
+        if candidate.get("expiry") == "Weekly":
+            failures.append(
+                "Weekly expiry day (Thursday) after 11:00 IST — accelerated gamma and "
+                "time decay make new long-option entries unfavourable."
+            )
 
     return failures
 
