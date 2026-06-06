@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Indian Options Research Desk</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Primary navigation">
+        <div class="brand">
+          <div class="brand-mark">IO</div>
+          <div>
+            <strong>Options Research Desk</strong>
+            <span>Rule-first, AI-assisted</span>
+          </div>
+        </div>
+        <nav>
+          <a href="#signals" class="active">Signals</a>
+          <a href="#risk">Risk</a>
+          <a href="#backtest">Backtest</a>
+          <a href="#journal">Journal</a>
+          <a href="#reports">Reports</a>
+          <a href="#settings">Settings</a>
+        </nav>
+        <div class="sidebar-note">
+          <span class="status-dot" id="liveDataDot"></span>
+          <span id="liveDataLabel">Checking data source…</span>
+        </div>
+      </aside>
+
+      <main>
+        <div id="scanBar" class="scan-bar hidden"></div>
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Personal-use trading research platform</p>
+            <h1>High-conviction Indian options scanner</h1>
+          </div>
+          <div class="top-actions">
+            <button id="scanButton" class="primary-action" type="button">Run Scan</button>
+            <button id="telegramButton" type="button">Telegram Preview</button>
+          </div>
+        </header>
+
+        <section class="summary-grid" aria-label="Market summary">
+          <article class="metric-panel">
+            <span>Market Regime</span>
+            <strong id="marketRegime">Loading</strong>
+            <small id="marketBias">Waiting for scan</small>
+          </article>
+          <article class="metric-panel">
+            <span>Approved Signals</span>
+            <strong id="approvedCount">0</strong>
+            <small>Max 3 per day</small>
+          </article>
+          <article class="metric-panel">
+            <span>Rejected Setups</span>
+            <strong id="rejectedCount">0</strong>
+            <small>Audit trail retained</small>
+          </article>
+          <article class="metric-panel">
+            <span>Capital Mode</span>
+            <strong id="capitalMode">Protected</strong>
+            <small id="riskState">Risk checks active</small>
+          </article>
+        </section>
+
+        <!-- Signals -->
+        <section id="signals" class="section-band">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Validated output</p>
+              <h2>Signals</h2>
+            </div>
+            <span id="scanTimestamp">Not scanned yet</span>
+          </div>
+          <div id="noTradeBanner" class="notice hidden">
+            <strong>No trade mode active.</strong>
+            <span>Current candidates failed one or more capital-preservation gates.</span>
+          </div>
+
+          <div id="signalsGrid" class="signals-grid"></div>
+        </section>
+
+        <!-- Risk Controls -->
+        <section id="risk" class="section-band">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Before scoring</p>
+              <h2>Risk Controls</h2>
+            </div>
+            <span>Hard gates cannot be overridden by AI</span>
+          </div>
+          <div class="controls-grid">
+            <label>
+              Account Capital
+              <input id="accountCapital" type="number" min="10000" step="10000" value="30000">
+            </label>
+            <label>
+              Risk Per Trade
+              <select id="riskPercent">
+                <option value="0.5">0.5%</option>
+                <option value="1">1%</option>
+                <option value="1.5">1.5%</option>
+                <option value="2" selected>2%</option>
+                <option value="2.5">2.5%</option>
+                <option value="3">3%</option>
+              </select>
+            </label>
+            <label>
+              Consecutive Losses
+              <input id="lossStreak" type="number" min="0" max="10" step="1" value="0">
+            </label>
+            <label>
+              Max Spread
+              <select id="maxSpread">
+                <option value="1">1%</option>
+                <option value="1.5" selected>1.5%</option>
+                <option value="2">2%</option>
+                <option value="3">3%</option>
+              </select>
+            </label>
+            <label>
+              Minimum Option Volume
+              <input id="minVolume" type="number" min="1000" step="1000" value="50000">
+            </label>
+            <label>
+              Event Block Window
+              <select id="eventWindow">
+                <option value="30">30 min</option>
+                <option value="60" selected>60 min</option>
+                <option value="120">120 min</option>
+                <option value="240">240 min</option>
+              </select>
+            </label>
+          </div>
+          <div id="riskChecklist" class="checklist"></div>
+        </section>
+
+        <!-- Backtest -->
+        <section id="backtest" class="section-band">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Paper-first roadmap</p>
+              <h2>Backtest Snapshot</h2>
+            </div>
+            <span id="backtestSource">Loading…</span>
+          </div>
+          <div class="backtest-grid">
+            <article>
+              <span>Win Rate</span>
+              <strong id="winRate">0%</strong>
+            </article>
+            <article>
+              <span>Profit Factor</span>
+              <strong id="profitFactor">0.00</strong>
+            </article>
+            <article>
+              <span>Max Drawdown</span>
+              <strong id="maxDrawdown">0%</strong>
+            </article>
+            <article>
+              <span>Sharpe Proxy</span>
+              <strong id="sharpeRatio">0.00</strong>
+            </article>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Strategy</th>
+                  <th>Trades</th>
+                  <th>Win Rate</th>
+                  <th>Avg RR</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="strategyRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Trade Journal -->
+        <section id="journal" class="section-band">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Manual execution tracking</p>
+              <h2>Trade Journal</h2>
+            </div>
+            <button id="logTradeButton" type="button">+ Log Trade</button>
+          </div>
+
+          <!-- Log trade form (hidden by default) -->
+          <div id="journalForm" class="journal-form hidden">
+            <h3>Log a Trade</h3>
+            <div class="controls-grid">
+              <label>
+                Instrument
+                <input id="jInstrument" type="text" placeholder="BANKNIFTY 62000 CE">
+              </label>
+              <label>
+                Direction
+                <select id="jDirection">
+                  <option value="BUY">BUY</option>
+                  <option value="SELL">SELL</option>
+                </select>
+              </label>
+              <label>
+                Entry Price
+                <input id="jEntry" type="number" step="0.5" min="0">
+              </label>
+              <label>
+                Stop Loss
+                <input id="jStopLoss" type="number" step="0.5" min="0">
+              </label>
+              <label>
+                Target 2 (primary)
+                <input id="jTarget2" type="number" step="0.5" min="0">
+              </label>
+              <label>
+                Confidence Score
+                <input id="jScore" type="number" min="0" max="100" value="0">
+              </label>
+              <label>
+                Notes
+                <input id="jNotes" type="text" placeholder="Optional notes">
+              </label>
+            </div>
+            <div class="form-actions">
+              <button id="saveJournalButton" class="primary-action" type="button">Save Trade</button>
+              <button id="cancelJournalButton" type="button">Cancel</button>
+            </div>
+          </div>
+
+          <!-- Journal table -->
+          <div class="table-wrap">
+            <table id="journalTable">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Instrument</th>
+                  <th>Dir</th>
+                  <th>Entry</th>
+                  <th>SL</th>
+                  <th>T2</th>
+                  <th>Score</th>
+                  <th>Status</th>
+                  <th>Outcome</th>
+                  <th>P&amp;L (R)</th>
+                </tr>
+              </thead>
+              <tbody id="journalRows">
+                <tr><td colspan="10" class="empty-row">No trades logged yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Reports -->
+        <section id="reports" class="section-band">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">AI-assisted narrative</p>
+              <h2>Daily Market Summary</h2>
+            </div>
+            <span id="summaryProvider">Rule-based</span>
+          </div>
+          <div id="dailySummary" class="report-box"></div>
+        </section>
+
+        <!-- Settings / Roadmap -->
+        <section id="settings" class="section-band">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">Future-ready architecture</p>
+              <h2>Integration Plan</h2>
+            </div>
+            <span>Low operating cost first</span>
+          </div>
+          <div class="roadmap">
+            <article>
+              <strong>Phase 1 — Done</strong>
+              <p>Local dashboard, deterministic scanner, live NSE data, OpenAI explanations, Telegram alerts, audit log, real backtest metrics, trade journal.</p>
+            </article>
+            <article>
+              <strong>Phase 2</strong>
+              <p>Broker API integration (Zerodha/Groww), paper trading with PnL tracking, portfolio risk, PostgreSQL migration.</p>
+            </article>
+            <article>
+              <strong>Phase 3</strong>
+              <p>Semi-automated execution approval flow, multi-timeframe confluence scoring, ML signal filtering, SaaS architecture.</p>
+            </article>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Telegram dialog -->
+    <dialog id="telegramDialog">
+      <div class="dialog-header">
+        <h2>Telegram Message Preview</h2>
+        <button id="closeDialog" type="button" aria-label="Close">×</button>
+      </div>
+      <textarea id="telegramPreview" readonly></textarea>
+      <div class="dialog-actions">
+        <button id="sendTelegramButton" type="button" class="primary-action">Send via Telegram</button>
+        <p>Requires TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env</p>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+    <script src="src/data.js"></script>
+    <script src="src/engine.js"></script>
+    <script src="src/app.js"></script>
+  </body>
+</html>
