@@ -12,26 +12,56 @@ _TTL = 900  # 15-minute cache — news doesn't change that fast
 
 # Search-friendly names for NSE symbols (improves headline relevance)
 _SYMBOL_QUERY = {
+    # Indices
     "NIFTY":       "Nifty 50 index India market",
-    "BANKNIFTY":   "Bank Nifty India banking",
-    "FINNIFTY":    "Finnifty NSE financial services India",
-    "RELIANCE":    "Reliance Industries stock",
+    "BANKNIFTY":   "Bank Nifty India banking sector",
+    "FINNIFTY":    "Nifty Financial Services Finnifty India",
+    # IT / Tech
+    "INFY":        "Infosys stock earnings results",
+    "TCS":         "TCS Tata Consultancy Services stock",
+    "WIPRO":       "Wipro stock earnings India IT",
+    "HCLTECH":     "HCL Technologies stock India IT",
+    "TECHM":       "Tech Mahindra stock India IT",
+    # Banking / Finance
     "HDFCBANK":    "HDFC Bank stock India",
     "ICICIBANK":   "ICICI Bank stock India",
-    "INFY":        "Infosys stock earnings",
-    "TCS":         "TCS Tata Consultancy stock",
     "AXISBANK":    "Axis Bank stock India",
-    "SBIN":        "SBI State Bank India stock",
+    "SBIN":        "SBI State Bank of India stock",
     "KOTAKBANK":   "Kotak Mahindra Bank stock",
-    "LT":          "Larsen Toubro L&T stock India",
-    "WIPRO":       "Wipro stock earnings",
-    "BAJFINANCE":  "Bajaj Finance stock India",
-    "TATAMOTORS":  "Tata Motors stock India",
-    "ADANIENT":    "Adani Enterprises stock",
-    "ADANIPORTS":  "Adani Ports stock India",
-    "MARUTI":      "Maruti Suzuki stock India",
-    "SUNPHARMA":   "Sun Pharma stock India",
-    "HINDUNILVR":  "Hindustan Unilever HUL stock",
+    "INDUSINDBK":  "IndusInd Bank stock India",
+    "BAJFINANCE":  "Bajaj Finance NBFC stock India",
+    "BAJAJFINSV":  "Bajaj Finserv stock India",
+    "HDFCLIFE":    "HDFC Life Insurance stock India",
+    # Energy / PSU
+    "RELIANCE":    "Reliance Industries RIL stock",
+    "NTPC":        "NTPC power stock India PSU",
+    "POWERGRID":   "Power Grid Corporation stock India",
+    "ONGC":        "ONGC oil gas stock India",
+    # Auto
+    "TATAMOTORS":  "Tata Motors EV stock India",
+    "MARUTI":      "Maruti Suzuki automobile stock India",
+    "M&M":         "Mahindra Mahindra auto stock India",
+    "EICHERMOT":   "Eicher Motors Royal Enfield stock India",
+    # Pharma
+    "SUNPHARMA":   "Sun Pharma pharmaceutical stock India",
+    "DRREDDY":     "Dr Reddy Laboratories stock India",
+    "CIPLA":       "Cipla pharma stock India",
+    "DIVISLAB":    "Divi's Laboratories stock India",
+    # FMCG / Consumer
+    "HINDUNILVR":  "Hindustan Unilever HUL FMCG stock",
+    "ASIANPAINT":  "Asian Paints stock India",
+    "TITAN":       "Titan Company watches jewellery stock India",
+    "PIDILITIND":  "Pidilite Industries Fevicol stock India",
+    # Metals
+    "TATASTEEL":   "Tata Steel stock India metals",
+    "JSWSTEEL":    "JSW Steel stock India",
+    "HINDALCO":    "Hindalco aluminium copper stock India",
+    # Infra / Conglomerate
+    "LT":          "Larsen Toubro L&T infrastructure stock India",
+    "ADANIENT":    "Adani Enterprises stock India",
+    "ADANIPORTS":  "Adani Ports SEZ stock India",
+    "ULTRACEMCO":  "UltraTech Cement stock India",
+    "GRASIM":      "Grasim Industries Aditya Birla stock India",
 }
 
 _NEWSAPI_URL = "https://newsapi.org/v2/everything"

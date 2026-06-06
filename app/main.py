@@ -83,12 +83,14 @@ def on_startup():
 
     # Start scheduler if enabled
     if settings.enable_scheduler:
+        from app.data_sources.nse import nse_data as _nse
         from app.services.scheduler import create_scheduler
         from app.services.telegram import send_message as tg_send
 
         sched = create_scheduler(
             scan_fn=lambda: build_scan(persist=False),
             send_fn=tg_send,
+            nse_data=_nse,
         )
         if sched:
             sched.start()

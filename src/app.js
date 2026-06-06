@@ -299,7 +299,7 @@
   function renderBacktest(btData) {
     const m = btData.metrics;
     els.winRate.textContent      = m.winRate + "%";
-    els.profitFactor.textContent = m.profitFactor;
+    els.profitFactor.textContent = m.profitFactor === null ? "∞ (perfect)" : m.profitFactor;
     els.maxDrawdown.textContent  = m.maxDrawdownPct + "%";
     els.sharpeRatio.textContent  = m.sharpeProxy;
 

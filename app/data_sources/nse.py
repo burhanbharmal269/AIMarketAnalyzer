@@ -501,7 +501,8 @@ class NSEDataSource:
         t1 = round(entry + option_stop_dist,       1)
         t2 = round(entry + 2 * option_stop_dist,   1)
         t3 = round(entry + 3 * option_stop_dist,   1)
-        rr = round((t2 - entry) / (entry - stop_loss), 2) if entry > stop_loss else 2.0
+        _risk = abs(entry - stop_loss)
+        rr = round(abs(t2 - entry) / _risk, 2) if _risk > 0 else 2.0
 
         # Price action description
         rsi = ind["rsi"]

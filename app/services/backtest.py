@@ -14,15 +14,22 @@ try:
 except ImportError:
     _BACKTEST_DEPS = False
 
-# Instruments → yfinance tickers
+# Instruments → yfinance tickers (indices + top liquid F&O stocks)
 _BT_SYMBOLS = {
     "NIFTY":     "^NSEI",
     "BANKNIFTY": "^NSEBANK",
+    "FINNIFTY":  "NIFTY_FIN_SERVICE.NS",
+    "RELIANCE":  "RELIANCE.NS",
+    "HDFCBANK":  "HDFCBANK.NS",
+    "ICICIBANK": "ICICIBANK.NS",
+    "INFY":      "INFY.NS",
+    "SBIN":      "SBIN.NS",
 }
 
-_LOOKBACK    = "180d"
-_INTERVAL    = "1d"
-_STOP_FACTOR = 0.15   # 15% option stop as fraction of entry premium (proxy)
+_LOOKBACK = "180d"
+_INTERVAL = "1d"
+# ATR multiplier for stop: 1.5× ATR is a realistic ATM option stop distance
+_ATR_STOP_MULT = 1.5
 
 
 # ── data loading ──────────────────────────────────────────────────────────────
@@ -51,11 +58,12 @@ def _add_indicators(df):
     df["macd"]        = macd_i.macd()
     df["macd_signal"] = macd_i.macd_signal()
     df["adx"]         = ta.trend.ADXIndicator(high, low, close).adx()
+    df["atr"]         = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range()
 
     avg_vol           = df["Volume"].rolling(20).mean()
     df["rel_vol"]     = df["Volume"] / avg_vol.replace(0, float("nan"))
 
-    return df.dropna(subset=["ema200", "rsi", "adx", "macd"])
+    return df.dropna(subset=["ema200", "rsi", "adx", "macd", "atr"])
 
 
 # ── signal detection (simplified, mirrors scanner rules) ─────────────────────
@@ -81,37 +89,45 @@ def _detect_signal(row) -> str | None:
 # ── trade simulation ──────────────────────────────────────────────────────────
 
 def _simulate(df, entry_idx: int, direction: str) -> float | None:
+    """Simulate trade outcome as R-multiple using ATR-based stops.
+
+    Stop distance = ATR × 1.5 (realistic for Indian ATM options).
+    This is more accurate than a fixed % of underlying price because
+    ATR reflects actual daily volatility — a ₹50 move means very
+    different things on NIFTY vs a ₹500 stock.
+    SL is checked before targets on each bar (conservative assumption).
     """
-    Simulates trade outcome as R-multiple.
-    Uses underlying price movement as proxy for option P&L.
-    Checks next 10 bars for SL/target hits.
-    """
-    price    = df.iloc[entry_idx]["Close"]
-    stop_d   = price * _STOP_FACTOR
+    row     = df.iloc[entry_idx]
+    price   = row["Close"]
+    atr     = row["atr"]
+    stop_d  = atr * _ATR_STOP_MULT
+
+    if stop_d <= 0:
+        return None
 
     if direction == "BUY_CE":
         sl, t1, t2, t3 = price - stop_d, price + stop_d, price + 2*stop_d, price + 3*stop_d
-        def sl_hit(low, _high):  return low  <= sl
-        def t1_hit(_low, high):  return high >= t1
-        def t2_hit(_low, high):  return high >= t2
-        def t3_hit(_low, high):  return high >= t3
+        def sl_hit(low, _h): return low  <= sl
+        def t1_hit(_l, high): return high >= t1
+        def t2_hit(_l, high): return high >= t2
+        def t3_hit(_l, high): return high >= t3
     else:
         sl, t1, t2, t3 = price + stop_d, price - stop_d, price - 2*stop_d, price - 3*stop_d
-        def sl_hit(low, high): return high >= sl
-        def t1_hit(low, _h):   return low  <= t1
-        def t2_hit(low, _h):   return low  <= t2
-        def t3_hit(low, _h):   return low  <= t3
+        def sl_hit(_l, high): return high >= sl
+        def t1_hit(low, _h):  return low  <= t1
+        def t2_hit(low, _h):  return low  <= t2
+        def t3_hit(low, _h):  return low  <= t3
 
     for i in range(entry_idx + 1, min(entry_idx + 11, len(df))):
-        row  = df.iloc[i]
-        low  = row["Low"]
-        high = row["High"]
-        if sl_hit(low, high): return -1.0
+        bar  = df.iloc[i]
+        low  = bar["Low"]
+        high = bar["High"]
+        if sl_hit(low, high): return -1.0   # SL checked first — conservative
         if t3_hit(low, high): return  3.0
         if t2_hit(low, high): return  2.0
         if t1_hit(low, high): return  1.0
 
-    return 0.0  # breakeven — expired without hitting any level
+    return 0.0  # expired without hitting any level
 
 
 # ── metrics ───────────────────────────────────────────────────────────────────
@@ -125,7 +141,8 @@ def _compute_metrics(trades: list[dict]) -> dict:
     win_rate      = round(len(wins) / len(trades) * 100, 1)
     gross_profit  = sum(t["r"] for t in wins)
     gross_loss    = abs(sum(t["r"] for t in losses))
-    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss else 0.0
+    # gross_loss=0 means zero losing trades — perfect record, not a zero score
+    profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else None
 
     # Equity-curve drawdown in R
     equity = peak = max_dd = 0.0

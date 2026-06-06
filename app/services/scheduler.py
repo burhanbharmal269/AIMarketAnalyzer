@@ -1,9 +1,14 @@
 import logging
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.interval import IntervalTrigger
 except Exception:
     BackgroundScheduler = None
+    IntervalTrigger     = None
 
 from app.config import settings
 
@@ -38,7 +43,17 @@ def _make_eod_job(scan_fn, send_fn):
     return job
 
 
-def create_scheduler(scan_fn, send_fn=None):
+def _make_monitor_job(nse_data, send_fn):
+    def job():
+        try:
+            from app.services.monitor import check_positions
+            check_positions(nse_data, send_fn)
+        except Exception as exc:
+            logger.error("Monitor job failed: %s", exc)
+    return job
+
+
+def create_scheduler(scan_fn, send_fn=None, nse_data=None):
     if not settings.enable_scheduler or BackgroundScheduler is None:
         return None
 
@@ -75,4 +90,12 @@ def create_scheduler(scan_fn, send_fn=None):
         "cron", day_of_week="mon-fri", hour=15, minute=20,
         id="eod_scan",
     )
+    # Price monitor — every 2 min during market hours (gate check is inside the job)
+    if nse_data is not None and IntervalTrigger is not None:
+        scheduler.add_job(
+            _make_monitor_job(nse_data, _send),
+            IntervalTrigger(minutes=2, timezone=IST),
+            id="price_monitor",
+        )
+        logger.info("Price monitor scheduled (every 2 min, market hours only)")
     return scheduler
