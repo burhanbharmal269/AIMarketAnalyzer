@@ -264,8 +264,10 @@ def get_journal_analytics() -> dict:
             ).fetchall()
 
         all_pnls   = [float(r["pnl_r"]) for r in rows]
-        paper_pnls = [float(r["pnl_r"]) for r in rows if r["status"] in ("paper", "closed") and r["pnl_r"] is not None]
-        live_pnls  = [float(r["pnl_r"]) for r in rows if r["status"] == "open"]
+        paper_pnls = [float(r["pnl_r"]) for r in rows if r["status"] == "paper"]
+        # "open" = live trade still active (no pnl_r yet); closed live trades keep status "open"
+        # so we identify closed live trades by status=="open" AND pnl_r present
+        live_pnls  = [float(r["pnl_r"]) for r in rows if r["status"] == "open" and r["pnl_r"] is not None]
 
         return {
             **_calc_analytics(all_pnls),

@@ -904,10 +904,15 @@ class NSEDataSource:
         for mpc in _RBI_MPC_DATES:
             _add("RBI MPC Announcement", mpc, "high", hour=10, minute=0)
 
-        # Weekly expiry: every Thursday (or nearest non-holiday)
-        d = today
-        for _ in range(10):   # look up to 10 days ahead
-            if d.weekday() == 3 and d not in _ALL_HOLIDAYS:  # Thursday
+        # Weekly expiry: next Thursday (or nearest non-holiday).
+        # Start from tomorrow if today's Thursday has already expired (after 15:30 IST)
+        # so the calendar always shows a future expiry, not an already-passed one.
+        thursday_start = today
+        if today.weekday() == 3 and now_ist.hour >= 15 and now_ist.minute >= 30:
+            thursday_start = today + td(days=1)
+        d = thursday_start
+        for _ in range(10):
+            if d.weekday() == 3 and d not in _ALL_HOLIDAYS:
                 _add("NSE Weekly Expiry", d, "medium", hour=15, minute=30)
                 break
             d += td(days=1)

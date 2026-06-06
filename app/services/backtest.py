@@ -209,11 +209,17 @@ def run_backtest() -> dict:
     strategy_rows: list[dict] = []
 
     for symbol, yf_sym in _BT_SYMBOLS.items():
+        fetched_from_cache = False
+        if symbol:
+            from app.services.storage import get_ohlcv_cache
+            fetched_from_cache = get_ohlcv_cache(symbol, min_rows=100, max_stale_days=7) is not None
+
         df = _load(yf_sym, nse_symbol=symbol)
         if df is None:
             logger.info("Backtest: no data for %s, skipping", symbol)
             continue
-        time.sleep(0.5)  # small gap only when yfinance was actually called
+        if not fetched_from_cache:
+            time.sleep(0.5)  # rate-limit yfinance; skip when data came from SQLite cache
 
         df = _add_indicators(df)
         trades: list[dict] = []
