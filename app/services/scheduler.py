@@ -45,11 +45,31 @@ def create_scheduler(scan_fn, send_fn=None):
     _send = send_fn or (lambda msg: logger.info("Scheduler alert (no Telegram): %s", msg[:80]))
 
     scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+    # 10:05 — first clean scan after opening volatility gate clears (gate = 9:15–10:00)
     scheduler.add_job(
         _make_market_open_job(scan_fn, _send),
-        "cron", day_of_week="mon-fri", hour=9, minute=20,
-        id="market_open_scan",
+        "cron", day_of_week="mon-fri", hour=10, minute=5,
+        id="morning_scan",
     )
+    # 11:15 — peak liquidity window; trends confirmed, highest option volumes
+    scheduler.add_job(
+        _make_market_open_job(scan_fn, _send),
+        "cron", day_of_week="mon-fri", hour=11, minute=15,
+        id="midmorning_scan",
+    )
+    # 13:05 — post-lunch re-entry check; new setups that develop after 12:30 drift
+    scheduler.add_job(
+        _make_market_open_job(scan_fn, _send),
+        "cron", day_of_week="mon-fri", hour=13, minute=5,
+        id="afternoon_scan",
+    )
+    # 14:15 — last entry window before closing gate (14:45); 30-min buffer to close
+    scheduler.add_job(
+        _make_market_open_job(scan_fn, _send),
+        "cron", day_of_week="mon-fri", hour=14, minute=15,
+        id="final_scan",
+    )
+    # 15:20 — EOD summary after market close
     scheduler.add_job(
         _make_eod_job(scan_fn, _send),
         "cron", day_of_week="mon-fri", hour=15, minute=20,

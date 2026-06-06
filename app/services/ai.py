@@ -1,6 +1,11 @@
 import logging
+from datetime import date
 
 from app.config import settings
+
+# ── explanation cache ─────────────────────────────────────────────────────────
+# Keyed by (instrument, score_bucket, date). Cleared naturally each new trading day.
+_EXPLANATION_CACHE: dict = {}
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +102,14 @@ def _call(system: str, user: str, max_tokens: int = 400) -> str | None:
 # ── public functions ──────────────────────────────────────────────────────────
 
 def generate_trade_explanation(candidate: dict, score: dict, market: dict) -> str:
-    """Per-trade AI analysis with live news context. Falls back to rule-based text."""
+    """Per-trade AI analysis with live news context. Falls back to rule-based text.
+
+    AI is only invoked for high-confidence signals (score >= 80). Lower-scoring
+    signals that still passed the 72 floor use the rule-based text — they are
+    borderline setups and don't need expensive AI analysis.
+    Results are cached per (instrument, score_bucket, date) to avoid duplicate
+    calls when the same setup appears across multiple scans in one day.
+    """
     from app.data_sources.news import get_headlines
 
     rule_text = (
@@ -108,45 +120,47 @@ def generate_trade_explanation(candidate: dict, score: dict, market: dict) -> st
         "holds the entry structure and event risk does not change."
     )
 
-    if not openai_enabled():
+    # Only use AI for top-tier signals — borderline signals (72–79) use rule text
+    if not openai_enabled() or score["total"] < 80:
         return rule_text
 
-    # Fetch live headlines for this instrument
+    # Cache key: same instrument + score band + calendar date = same analysis
+    score_bucket = (score["total"] // 5) * 5   # bucket into 5-point bands: 80,85,90…
+    cache_key = (candidate["instrument"], score_bucket, date.today().isoformat())
+    if cache_key in _EXPLANATION_CACHE:
+        logger.debug("AI explanation cache hit: %s", cache_key)
+        return _EXPLANATION_CACHE[cache_key]
+
     underlying = candidate.get("underlying", candidate["instrument"])
-    headlines = get_headlines(underlying)
+    headlines  = get_headlines(underlying)
     news_block = (
         "\nLatest news:\n" + "\n".join(f"  - {h}" for h in headlines)
-        if headlines else "\nNo recent headlines found."
+        if headlines else ""
     )
 
     system = (
         "You are a professional Indian options trader assistant. "
-        "Provide concise, factual trade analysis. Be direct. Maximum 280 words. "
-        "No financial advice. Incorporate the provided news headlines into your analysis."
+        "Concise, factual analysis only. No financial advice."
     )
+    # Rounded values reduce token count without losing signal
     user = (
-        f"Analyse this F&O trade setup:\n"
-        f"Instrument: {candidate['instrument']}  Underlying: {underlying}\n"
-        f"Direction: {candidate['direction']}\n"
-        f"Entry: {candidate['entry']}  SL: {candidate['stopLoss']}  "
-        f"Targets: {candidate['targets']}\n"
-        f"EMA20={candidate['ema20']}  EMA50={candidate['ema50']}  EMA200={candidate['ema200']}\n"
-        f"Supertrend={'Bullish' if candidate.get('supertrendBullish') else 'Bearish'}  "
-        f"PDH Breakout={'Yes' if candidate.get('pdBreakout') else 'No'}\n"
-        f"RSI={candidate['rsi']}  ADX={candidate['adx']}  "
-        f"MACD={candidate['macd']} vs Signal={candidate['macdSignal']}\n"
-        f"OI Change={candidate['oiChangePct']}%  PCR={candidate['pcr']}  "
-        f"ATM IV={candidate.get('atmIV', 'N/A')}%  Rel Vol={candidate['relativeVolume']}\n"
-        f"India VIX={market['indiaVix']}  Market: {market['regime']}\n"
-        f"Confidence Score: {score['total']}/100"
+        f"F&O setup: {candidate['instrument']} | {candidate['direction']} | Score {score['total']}/100\n"
+        f"Entry {candidate['entry']}  SL {candidate['stopLoss']}  Targets {candidate['targets']}\n"
+        f"EMA20={round(candidate['ema20'])}  EMA50={round(candidate['ema50'])}  EMA200={round(candidate['ema200'])}\n"
+        f"Supertrend={'Bull' if candidate.get('supertrendBullish') else 'Bear'}  "
+        f"PDH={'Y' if candidate.get('pdBreakout') else 'N'}  "
+        f"RSI={round(candidate['rsi'],1)}  ADX={round(candidate['adx'],1)}\n"
+        f"OI%={candidate['oiChangePct']}  PCR={candidate['pcr']}  "
+        f"IV={candidate.get('atmIV','?')}%  RelVol={candidate['relativeVolume']}\n"
+        f"VIX={market['indiaVix']}  Market: {market['regime']}"
         f"{news_block}\n\n"
-        "Respond in exactly 3 labelled sections:\n"
-        "WHY THIS TRADE: (2-3 lines — reference news if relevant)\n"
-        "WHY IT COULD FAIL: (2-3 lines)\n"
-        "KEY RISKS: (2-3 bullet points)"
+        "3 sections (2-3 lines each):\n"
+        "WHY THIS TRADE:\nWHY IT COULD FAIL:\nKEY RISKS:"
     )
-    result = _call(system, user, max_tokens=380)
-    return result if result else rule_text
+    result = _call(system, user, max_tokens=300)
+    text = result if result else rule_text
+    _EXPLANATION_CACHE[cache_key] = text
+    return text
 
 
 def generate_market_summary(scan: dict, market: dict) -> dict:
