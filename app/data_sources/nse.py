@@ -39,11 +39,15 @@ _HEADERS = {
     "Connection": "keep-alive",
 }
 
-# Only indices need a special yfinance mapping; all stocks auto-resolve as SYMBOL.NS
-_INDEX_YF_MAP = {
+# yfinance ticker overrides — indices and symbols whose NSE name ≠ Yahoo Finance ticker.
+# All other symbols auto-resolve as SYMBOL.NS (e.g. RELIANCE → RELIANCE.NS).
+_YF_TICKER_MAP = {
     "NIFTY":     "^NSEI",
     "BANKNIFTY": "^NSEBANK",
     "FINNIFTY":  "NIFTY_FIN_SERVICE.NS",
+    # TATAMOTORS demerged Oct 2025
+    "TMPV":      "TMPV.NS",   # Tata Motors Passenger Vehicles
+    "TMCV":      "TMCV.NS",   # Tata Motors Commercial Vehicles
 }
 
 # Fallback lot sizes used when the live bhavcopy CSV is unavailable.
@@ -55,7 +59,10 @@ _LOT_SIZE_FALLBACK = {
     "RELIANCE": 250, "HDFCBANK": 550, "ICICIBANK": 700,
     "INFY": 300, "TCS": 150, "AXISBANK": 1200, "SBIN": 1500,
     "KOTAKBANK": 400, "LT": 375, "WIPRO": 2400,
-    "BAJFINANCE": 125, "TATAMOTORS": 1425,
+    "BAJFINANCE": 125,
+    # TATAMOTORS demerged Oct 2025 → two successor entities
+    "TMPV": 1425,   # Tata Motors Passenger Vehicles (JLR + cars)
+    "TMCV": 2800,   # Tata Motors Commercial Vehicles
     # Mid/large-cap additions for a wider scan universe
     "BHARTIARTL": 950, "HCLTECH": 700, "TECHM": 600,
     "MARUTI": 15,  "M&M": 700,      "EICHERMOT": 100,
@@ -247,7 +254,7 @@ class NSEDataSource:
     def _to_yf_symbol(symbol: str) -> str:
         """Convert NSE symbol to yfinance ticker.
         Indices need explicit mapping; all F&O stocks are simply SYMBOL.NS."""
-        return _INDEX_YF_MAP.get(symbol, f"{symbol}.NS")
+        return _YF_TICKER_MAP.get(symbol, f"{symbol}.NS")
 
     def get_lot_sizes(self) -> dict[str, int]:
         """Fetch current F&O lot sizes from the NSE bhavcopy CSV.

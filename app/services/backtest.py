@@ -1,5 +1,6 @@
 import logging
 import statistics
+import time
 
 import pandas as pd
 
@@ -32,13 +33,24 @@ _ATR_STOP_MULT = 1.5
 
 # ── data loading ──────────────────────────────────────────────────────────────
 
-def _load(yf_sym: str):
-    try:
-        df = yf.Ticker(yf_sym).history(period=_LOOKBACK, interval=_INTERVAL)
-        return df if not df.empty and len(df) >= 60 else None
-    except Exception as exc:
-        logger.warning("yfinance %s failed: %s", yf_sym, exc)
-        return None
+def _load(yf_sym: str) -> "pd.DataFrame | None":
+    """Fetch historical OHLCV with one retry on rate-limit (429)."""
+    for attempt in range(2):
+        try:
+            df = yf.Ticker(yf_sym).history(period=_LOOKBACK, interval=_INTERVAL)
+            if not df.empty and len(df) >= 60:
+                return df
+            return None
+        except Exception as exc:
+            msg = str(exc)
+            if "429" in msg or "Too Many Requests" in msg or "Rate limit" in msg:
+                if attempt == 0:
+                    logger.warning("yfinance %s rate-limited, retrying in 3s", yf_sym)
+                    time.sleep(3)
+                    continue
+            logger.warning("yfinance %s failed: %s", yf_sym, exc)
+            return None
+    return None
 
 
 def _add_indicators(df):
@@ -182,6 +194,7 @@ def run_backtest() -> dict:
 
     for symbol, yf_sym in _BT_SYMBOLS.items():
         df = _load(yf_sym)
+        time.sleep(1)  # stay under yfinance 3 req/sec rate limit
         if df is None:
             logger.info("Backtest: no data for %s, skipping", symbol)
             continue
