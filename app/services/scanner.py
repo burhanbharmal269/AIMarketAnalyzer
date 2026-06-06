@@ -172,10 +172,20 @@ def option_chain_score(candidate):
 
 def sentiment_score(candidate, market):
     score = candidate.get("marketSentiment", 0)
-    if market["indiaVix"] <= 16:
-        score += 2
-    elif market["indiaVix"] > 20:
-        score -= 3
+    vix = market["indiaVix"]
+    # Progressive VIX penalty — calm markets get a bonus, elevated markets lose points.
+    # This works in tandem with the VIX-adjusted SL in nse.py: high VIX already widens
+    # the SL (reducing RR and lots), so the scoring penalty adds a second filter layer.
+    if vix <= 14:
+        score += 3    # very calm trending environment
+    elif vix <= 16:
+        score += 1    # normal
+    elif vix <= 18:
+        score += 0    # neutral — no bonus, no penalty
+    elif vix <= 20:
+        score -= 2    # elevated — trade only high-conviction setups
+    else:             # 20–22  (above 22 = hard gate, never reaches here)
+        score -= 4    # high risk environment — very few signals should pass
     if market["breadth"] > 1.2:
         score += 1
     return clamp(score, 0, CATEGORY_MAX["sentiment"])

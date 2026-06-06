@@ -583,12 +583,27 @@ class NSEDataSource:
         if not entry or entry < 1:
             return None
 
-        # ── stop / targets on option premium (ATM delta ≈ 0.5) ─────────────
+        # ── VIX-adjusted stop distance ───────────────────────────────────────
+        # On high-VIX days normal candle noise is wider, so a tight SL gets
+        # clipped by random wicks before the trade can work.  We widen both
+        # the ATR fraction and the minimum premium % with the VIX level.
+        # A wider SL → higher per-unit risk → fewer lots (position_sizing auto-
+        # adjusts) → lower RR → signals that no longer meet RR ≥ 2 are rejected.
+        # This means high-VIX days naturally produce fewer, more conservative signals.
+        if vix < 15:
+            atr_mult, pct_floor = 0.35, 0.15   # calm — tight SL, max lots
+        elif vix < 18:
+            atr_mult, pct_floor = 0.45, 0.18   # normal
+        elif vix < 20:
+            atr_mult, pct_floor = 0.55, 0.22   # elevated — SL breathing room
+        else:                                   # 20–22 (above 22 = hard gate)
+            atr_mult, pct_floor = 0.65, 0.26   # high — wide SL, far fewer signals pass
+
         underlying_atr   = ind.get("atr", 0)
-        option_stop_dist = round(max(underlying_atr * 0.35, entry * 0.15), 1)
+        option_stop_dist = round(max(underlying_atr * atr_mult, entry * pct_floor), 1)
         stop_loss        = round(entry - option_stop_dist, 1)
         if stop_loss < 1:
-            stop_loss        = round(entry * 0.80, 1)
+            stop_loss        = round(entry * (1 - pct_floor), 1)
             option_stop_dist = entry - stop_loss
 
         t1 = round(entry + option_stop_dist,     1)
