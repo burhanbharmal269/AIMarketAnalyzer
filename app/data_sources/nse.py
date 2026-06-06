@@ -323,17 +323,74 @@ class NSEDataSource:
         return ordered
 
     def get_ohlcv_daily(self, symbol: str, period: str = "200d"):
-        """200-day daily OHLCV from yfinance — used for EMA200, ADX, ATR, relative volume.
-        Daily data is fine with a 15-min delay because these indicators barely move intraday."""
+        """200-day daily OHLCV — SQLite cache first, yfinance as fetch source.
+
+        Cache hit:  instant, zero network calls, safe on rate-limited days.
+        Cache miss: fetch from yfinance with exponential backoff, store result.
+        Stale fallback: if yfinance fails but cache is <10 days old, serve it
+                        so a temporary Yahoo outage doesn't break every scan.
+        """
+        import time
+        import pandas as pd
+        from app.services.storage import get_ohlcv_cache, set_ohlcv_cache
+
+        def _rows_to_df(rows: list[dict]) -> pd.DataFrame:
+            df = pd.DataFrame(rows)
+            df["date"] = pd.to_datetime(df["date"])
+            return df.set_index("date").rename_axis("Date")
+
+        # ── 1. Fresh cache ───────────────────────────────────────────────────
+        cached = get_ohlcv_cache(symbol)
+        if cached is not None:
+            logger.debug("OHLCV cache hit: %s (%d rows)", symbol, len(cached))
+            return _rows_to_df(cached)
+
+        # ── 2. Fetch from yfinance with retry/backoff ────────────────────────
         if not _YFINANCE:
             return None
+
         yf_sym = self._to_yf_symbol(symbol)
-        try:
-            df = yf.Ticker(yf_sym).history(period=period, interval="1d")
-            return df if not df.empty else None
-        except Exception as exc:
-            logger.debug("yfinance daily %s failed: %s", symbol, exc)
+        df = None
+        for attempt in range(3):
+            try:
+                df = yf.Ticker(yf_sym).history(period=period, interval="1d")
+                if not df.empty and len(df) >= 60:
+                    break
+                df = None
+                break
+            except Exception as exc:
+                msg = str(exc)
+                if ("429" in msg or "Too Many Requests" in msg or "Rate limit" in msg) and attempt < 2:
+                    wait = 2 ** (attempt + 1)   # 2s → 4s
+                    logger.debug("yfinance rate-limited for %s, retry in %ds", symbol, wait)
+                    time.sleep(wait)
+                    continue
+                logger.debug("yfinance daily %s failed: %s", symbol, exc)
+                # ── 3. Serve stale cache as emergency fallback ───────────────
+                stale = get_ohlcv_cache(symbol, min_rows=60, max_stale_days=10)
+                if stale:
+                    logger.warning("OHLCV stale cache fallback: %s", symbol)
+                    return _rows_to_df(stale)
+                return None
+
+        if df is None or df.empty:
             return None
+
+        # ── 4. Persist to cache ──────────────────────────────────────────────
+        rows = [
+            {
+                "date":   str(idx.date()),
+                "Open":   float(row["Open"]),
+                "High":   float(row["High"]),
+                "Low":    float(row["Low"]),
+                "Close":  float(row["Close"]),
+                "Volume": float(row["Volume"]),
+            }
+            for idx, row in df.iterrows()
+        ]
+        set_ohlcv_cache(symbol, rows)
+        logger.debug("OHLCV cached: %s (%d rows)", symbol, len(rows))
+        return df
 
     def get_intraday_closes(self, symbol: str):
         """Real-time intraday 1-min close prices from NSE chart API.

@@ -33,9 +33,25 @@ _ATR_STOP_MULT = 1.5
 
 # ── data loading ──────────────────────────────────────────────────────────────
 
-def _load(yf_sym: str) -> "pd.DataFrame | None":
-    """Fetch historical OHLCV with one retry on rate-limit (429)."""
-    for attempt in range(2):
+def _load(yf_sym: str, nse_symbol: str = "") -> "pd.DataFrame | None":
+    """SQLite cache first, yfinance with backoff as fallback.
+
+    nse_symbol (e.g. 'NIFTY') is used to look up the shared OHLCV cache
+    that the live scanner also writes to — avoids redundant yfinance calls
+    when the scanner has already fetched data today.
+    """
+    from app.services.storage import get_ohlcv_cache
+
+    # ── 1. Try shared SQLite cache ───────────────────────────────────────────
+    if nse_symbol:
+        cached = get_ohlcv_cache(nse_symbol, min_rows=100, max_stale_days=7)
+        if cached is not None:
+            df = pd.DataFrame(cached)
+            df["date"] = pd.to_datetime(df["date"])
+            return df.set_index("date").rename_axis("Date")
+
+    # ── 2. Fetch from yfinance with retry/backoff ────────────────────────────
+    for attempt in range(3):
         try:
             df = yf.Ticker(yf_sym).history(period=_LOOKBACK, interval=_INTERVAL)
             if not df.empty and len(df) >= 60:
@@ -43,11 +59,11 @@ def _load(yf_sym: str) -> "pd.DataFrame | None":
             return None
         except Exception as exc:
             msg = str(exc)
-            if "429" in msg or "Too Many Requests" in msg or "Rate limit" in msg:
-                if attempt == 0:
-                    logger.warning("yfinance %s rate-limited, retrying in 3s", yf_sym)
-                    time.sleep(3)
-                    continue
+            if ("429" in msg or "Too Many Requests" in msg or "Rate limit" in msg) and attempt < 2:
+                wait = 2 ** (attempt + 1)
+                logger.warning("yfinance %s rate-limited, retry in %ds", yf_sym, wait)
+                time.sleep(wait)
+                continue
             logger.warning("yfinance %s failed: %s", yf_sym, exc)
             return None
     return None
@@ -193,11 +209,11 @@ def run_backtest() -> dict:
     strategy_rows: list[dict] = []
 
     for symbol, yf_sym in _BT_SYMBOLS.items():
-        df = _load(yf_sym)
-        time.sleep(1)  # stay under yfinance 3 req/sec rate limit
+        df = _load(yf_sym, nse_symbol=symbol)
         if df is None:
             logger.info("Backtest: no data for %s, skipping", symbol)
             continue
+        time.sleep(0.5)  # small gap only when yfinance was actually called
 
         df = _add_indicators(df)
         trades: list[dict] = []

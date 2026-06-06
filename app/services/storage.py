@@ -1,7 +1,7 @@
 import json
 import logging
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.config import settings
@@ -78,6 +78,16 @@ def init_db():
                 date    TEXT    NOT NULL,
                 iv_pct  REAL    NOT NULL,
                 UNIQUE(symbol, date)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_ohlcv (
+                symbol  TEXT NOT NULL,
+                date    TEXT NOT NULL,
+                open    REAL, high REAL, low REAL, close REAL, volume REAL,
+                PRIMARY KEY (symbol, date)
             )
             """
         )
@@ -335,6 +345,61 @@ def update_alert_status(alert_id: int, status: str, attempts: int, next_retry: s
         conn.execute(
             "UPDATE pending_alerts SET status = ?, attempts = ?, next_retry = COALESCE(?, next_retry) WHERE id = ?",
             (status, attempts, next_retry, alert_id),
+        )
+
+
+# ── Daily OHLCV cache ─────────────────────────────────────────────────────────
+
+def get_ohlcv_cache(symbol: str, min_rows: int = 150, max_stale_days: int = 5) -> list[dict] | None:
+    """Return cached daily OHLCV rows for symbol, or None if missing/stale.
+
+    Freshness rule: last stored date must be within max_stale_days of today IST.
+    Covers weekends (2 days) + public holidays (1–2 days) with room to spare.
+    """
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT date, open, high, low, close, volume "
+            "FROM daily_ohlcv WHERE symbol = ? ORDER BY date ASC",
+            (symbol,),
+        ).fetchall()
+
+    if not rows or len(rows) < min_rows:
+        return None
+
+    last_date = date.fromisoformat(rows[-1]["date"])
+    staleness = (datetime.now(IST).date() - last_date).days
+    if staleness > max_stale_days:
+        return None
+
+    return [
+        {
+            "date":   r["date"],
+            "Open":   r["open"],
+            "High":   r["high"],
+            "Low":    r["low"],
+            "Close":  r["close"],
+            "Volume": r["volume"],
+        }
+        for r in rows
+    ]
+
+
+def set_ohlcv_cache(symbol: str, rows: list[dict]) -> None:
+    """Upsert daily OHLCV rows for a symbol. Each row must have keys:
+    date (YYYY-MM-DD), Open, High, Low, Close, Volume."""
+    if not rows:
+        return
+    with get_connection() as conn:
+        conn.executemany(
+            """INSERT INTO daily_ohlcv (symbol, date, open, high, low, close, volume)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(symbol, date) DO UPDATE SET
+                 open=excluded.open, high=excluded.high, low=excluded.low,
+                 close=excluded.close, volume=excluded.volume""",
+            [
+                (symbol, r["date"], r["Open"], r["High"], r["Low"], r["Close"], r["Volume"])
+                for r in rows
+            ],
         )
 
 
