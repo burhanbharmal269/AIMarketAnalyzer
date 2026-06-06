@@ -146,9 +146,25 @@
 
   // ── signal cards ──────────────────────────────────────────────────────────
 
+  function isSignalExpired(validUntilStr) {
+    // validUntil is like "10:21 AM" — parse against today's date in IST
+    try {
+      var now   = new Date();
+      var parts = validUntilStr.match(/(\d+):(\d+)\s*(AM|PM)/i);
+      if (!parts) return false;
+      var h = parseInt(parts[1], 10);
+      var m = parseInt(parts[2], 10);
+      if (parts[3].toUpperCase() === "PM" && h !== 12) h += 12;
+      if (parts[3].toUpperCase() === "AM" && h === 12) h = 0;
+      var expiry = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0);
+      return now > expiry;
+    } catch (_) { return false; }
+  }
+
   function renderApprovedCard(item) {
-    const c = item.candidate;
-    const logBtn = apiAvailable
+    const c       = item.candidate;
+    const expired = isSignalExpired(item.validUntil);
+    const logBtn  = apiAvailable && !expired
       ? "<button class=\"log-trade-btn\" data-instrument=\"" + escapeHtml(c.instrument) +
         "\" data-direction=\"" + escapeHtml(c.direction) +
         "\" data-entry=\""    + c.entry +
@@ -157,9 +173,13 @@
         "\" data-score=\""    + item.score.total +
         "\">Log Trade</button>"
       : "";
+    const expiredBanner = expired
+      ? "<div class=\"expired-banner\">SIGNAL EXPIRED — do not enter at this price. Run a new scan.</div>"
+      : "";
 
     return [
-      "<article class=\"signal-card\">",
+      "<article class=\"signal-card" + (expired ? " expired" : "") + "\">",
+      expiredBanner,
       "<div class=\"signal-head\">",
       "<div><h3>" + escapeHtml(c.instrument) + "</h3><span>" + escapeHtml(c.style) + "</span></div>",
       "<div style=\"display:flex;gap:8px;align-items:center\">",

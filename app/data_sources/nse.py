@@ -115,11 +115,15 @@ def _supertrend_direction(high, low, close, period: int = 7, multiplier: float =
 class NSEDataSource:
     """Live NSE data source with 5-minute cache and graceful fallbacks."""
 
+    # Cache TTLs — option chain prices move every second; indicators are slow
+    _TTL_OPTION_CHAIN = 90    # 90 sec — option prices stale fast, especially near expiry
+    _TTL_INTRADAY     = 60    # 60 sec — real-time closes for RSI/MACD
+    _TTL_SLOW         = 300   # 5 min  — VIX, breadth, lot sizes, watchlist
+
     def __init__(self):
         self._session: requests.Session | None = None
         self._session_at: float = 0.0
         self._cache: dict = {}
-        self._ttl: int = 300  # 5 minutes
         self._session_lock = threading.Lock()  # one thread initialises the session at a time
 
     # ── HTTP session ──────────────────────────────────────────────────────────
@@ -153,9 +157,10 @@ class NSEDataSource:
                 self._session = None
         return None
 
-    def _cached(self, key: str, fetch_fn):
+    def _cached(self, key: str, fetch_fn, ttl: int | None = None):
+        effective_ttl = ttl if ttl is not None else self._TTL_SLOW
         entry = self._cache.get(key)
-        if entry and time.time() - entry["ts"] < self._ttl:
+        if entry and time.time() - entry["ts"] < effective_ttl:
             return entry["data"]
         data = fetch_fn()
         if data is not None:
@@ -187,7 +192,7 @@ class NSEDataSource:
             endpoint = "option-chain-indices" if symbol in INDEX_SYMBOLS else "option-chain-equities"
             return self._get(endpoint, params={"symbol": nse_symbol})
 
-        return self._cached(f"oc_{symbol}", fetch)
+        return self._cached(f"oc_{symbol}", fetch, ttl=self._TTL_OPTION_CHAIN)
 
     # ── dynamic helpers ───────────────────────────────────────────────────────
 
@@ -305,7 +310,7 @@ class NSEDataSource:
                 logger.debug("NSE chart %s failed: %s", symbol, exc)
                 return None
 
-        return self._cached(f"intraday_{symbol}", fetch)
+        return self._cached(f"intraday_{symbol}", fetch, ttl=self._TTL_INTRADAY)
 
     # ── technical indicators ──────────────────────────────────────────────────
 

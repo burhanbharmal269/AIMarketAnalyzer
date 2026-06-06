@@ -671,6 +671,29 @@ textarea {
   transform: translateY(-2px);
 }
 
+.signal-card.expired {
+  opacity: 0.55;
+  filter: grayscale(40%);
+  pointer-events: none;
+}
+
+.signal-card.expired:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.expired-banner {
+  background: #7f1d1d;
+  color: #fca5a5;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  padding: 8px 14px;
+  border-radius: 6px 6px 0 0;
+  margin: -1px -1px 12px -1px;
+  text-align: center;
+}
+
 /* ── Metric panel highlight on update ───────────────────────────────────── */
 
 @keyframes metric-pop {
