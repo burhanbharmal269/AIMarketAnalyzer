@@ -190,38 +190,47 @@
       ? "<div class=\"expired-banner\">SIGNAL EXPIRED — do not enter at this price. Run a new scan.</div>"
       : "";
 
+    const total = item.score.total;
+    const scoreClass = total >= 85 ? "score-high" : total >= 72 ? "score-mid" : "score-low";
+    const isBuy = c.direction === "BUY";
+    const cardClass = "signal-card" + (isBuy ? " approved" : " sell-card") + (expired ? " expired" : "");
+
     return [
-      "<article class=\"signal-card" + (expired ? " expired" : "") + "\">",
+      "<article class=\"" + cardClass + "\">",
       expiredBanner,
       "<div class=\"signal-head\">",
-      "<div><h3>" + escapeHtml(c.instrument) + "</h3><span>" + escapeHtml(c.style) + "</span></div>",
-      "<div style=\"display:flex;gap:8px;align-items:center\">",
-      "<span class=\"badge " + (c.direction === "BUY" ? "buy" : "sell") + "\">" +
-        (c.direction === "BUY" ? "BULLISH" : "BEARISH") +
-        " | Confidence " + item.score.total + "/100</span>",
+      "<div>",
+      "<div style=\"display:flex;align-items:center;gap:8px;margin-bottom:4px\">",
+      "<span class=\"badge " + (isBuy ? "buy" : "sell") + "\">" + (isBuy ? "▲ BUY CE" : "▼ SELL PE") + "</span>",
       logBtn,
       "</div>",
+      "<h3>" + escapeHtml(c.instrument) + "</h3>",
+      "<span style=\"font-size:0.78rem;color:var(--muted)\">" + escapeHtml(c.style) + "</span>",
       "</div>",
+      "<div class=\"score-badge " + scoreClass + "\">",
+      "<span class=\"score-num\">" + total + "</span>",
+      "<span class=\"score-label\">/ 100</span>",
+      "</div>",
+      "</div>",
+      // Valid until bar
+      "<div class=\"valid-until-bar\">Valid until " + escapeHtml(item.validUntil || "—") +
+        " &nbsp;·&nbsp; " + item.sizing.lots + " lot(s) &nbsp;·&nbsp; RR 1:" + c.rr + "</div>",
       "<div class=\"trade-levels\">",
-      "<div><span>Entry</span><strong>"          + c.entry          + "</strong></div>",
-      "<div><span>Stop Loss</span><strong>"      + c.stopLoss       + "</strong></div>",
-      "<div><span>Target 1</span><strong>"       + c.targets[0]     + "</strong></div>",
-      "<div><span>Target 2</span><strong>"       + c.targets[1]     + "</strong></div>",
-      "<div><span>Target 3</span><strong>"       + c.targets[2]     + "</strong></div>",
-      "<div><span>Risk Reward</span><strong>1:"  + c.rr             + "</strong></div>",
-      "<div><span>Confidence</span><strong>"     + item.score.total + "/100</strong></div>",
-      "<div><span>Valid Until</span><strong>"    + item.validUntil  + "</strong></div>",
-      "<div><span>Expiry</span><strong>"         + escapeHtml(c.expiry) + (c.dte != null ? " (" + c.dte + "d)" : "") + "</strong></div>",
-      "<div><span>Position Size</span><strong>"  + item.sizing.lots + " lot(s)</strong></div>",
+      "<div class=\"level-entry\"><span>Entry</span><strong>₹" + c.entry + "</strong></div>",
+      "<div class=\"level-sl\"><span>Stop Loss</span><strong>₹" + c.stopLoss + "</strong></div>",
+      "<div class=\"level-t1\"><span>Target 1</span><strong>₹" + c.targets[0] + "</strong></div>",
+      "<div class=\"level-t2\"><span>Target 2</span><strong>₹" + c.targets[1] + "</strong></div>",
+      "<div class=\"level-t3\"><span>Target 3</span><strong>₹" + c.targets[2] + "</strong></div>",
+      "<div><span>Expiry</span><strong>" + escapeHtml(c.expiry) + (c.dte != null ? " (" + c.dte + "d)" : "") + "</strong></div>",
       "</div>",
-      // Greeks row — Delta/Theta/Vega from Black-Scholes
+      // Greeks row
       (c.delta != null ? [
         "<div class=\"greeks-row\">",
         "<span>Delta<strong>" + (c.delta >= 0 ? "+" : "") + c.delta.toFixed(3) + "</strong></span>",
-        "<span>Theta<strong>" + c.theta.toFixed(2) + "/day</strong></span>",
+        "<span>Theta<strong>" + c.theta.toFixed(2) + "/d</strong></span>",
         "<span>Vega<strong>+" + c.vega.toFixed(2) + "</strong></span>",
         "<span>ATM IV<strong>" + (c.atmIV || "—") + "%</strong></span>",
-        "<span>DTE<strong>" + (c.dte != null ? c.dte + (c.dte === 1 ? " day" : " days") : "—") + "</strong></span>",
+        "<span>DTE<strong>" + (c.dte != null ? c.dte + "d" : "—") + "</strong></span>",
         (c.ivRank != null
           ? "<span class=\"iv-rank iv-rank--" + (c.ivRank < 35 ? "low" : c.ivRank > 65 ? "high" : "mid") + "\">IV Rank<strong>" + c.ivRank + "</strong></span>"
           : ""),
@@ -242,16 +251,23 @@
   function renderRejectedCard(item) {
     const c = item.candidate;
     return [
-      "<article class=\"signal-card\">",
+      "<article class=\"signal-card rejected-card\">",
       "<div class=\"signal-head\">",
-      "<div><h3>" + escapeHtml(c.instrument) + "</h3><span>" + escapeHtml(c.style) + "</span></div>",
-      "<span class=\"badge rejected\">Rejected | " + item.score.total + "/100</span>",
+      "<div>",
+      "<div style=\"margin-bottom:4px\"><span class=\"badge rejected\">✕ Rejected</span></div>",
+      "<h3>" + escapeHtml(c.instrument) + "</h3>",
+      "<span style=\"font-size:0.78rem;color:var(--muted)\">" + escapeHtml(c.style) + "</span>",
+      "</div>",
+      "<div class=\"score-badge score-low\">",
+      "<span class=\"score-num\">" + item.score.total + "</span>",
+      "<span class=\"score-label\">/ 100</span>",
+      "</div>",
       "</div>",
       "<div class=\"trade-levels\">",
-      "<div><span>Entry</span><strong>"  + c.entry      + "</strong></div>",
-      "<div><span>SL</span><strong>"     + c.stopLoss   + "</strong></div>",
-      "<div><span>RR</span><strong>1:"   + c.rr         + "</strong></div>",
-      "<div><span>Spread</span><strong>" + c.spreadPct  + "%</strong></div>",
+      "<div class=\"level-entry\"><span>Entry</span><strong>₹" + c.entry + "</strong></div>",
+      "<div class=\"level-sl\"><span>Stop Loss</span><strong>₹" + c.stopLoss + "</strong></div>",
+      "<div><span>Risk Reward</span><strong>1:" + c.rr + "</strong></div>",
+      "<div><span>Spread</span><strong>" + c.spreadPct + "%</strong></div>",
       "</div>",
       "<div class=\"score-block\">" + scoreRows(item) + "</div>",
       "<div class=\"text-block\">",
