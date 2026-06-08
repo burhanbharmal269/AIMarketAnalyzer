@@ -182,12 +182,12 @@ def _get_cached_scan() -> dict | None:
 # ── scan helpers ──────────────────────────────────────────────────────────────
 
 def _live_data():
-    """Fetch live candidates and market snapshot from NSE. Raises on any failure."""
+    """Fetch live candidates and market snapshot from NSE. Raises only on hard failures."""
     from app.data_sources.nse import nse_data
     market     = nse_data.get_market_snapshot()
     candidates = nse_data.get_live_candidates()
-    if not candidates:
-        raise RuntimeError("NSE returned zero candidates — market may be closed or session expired")
+    # Empty candidates is valid — it means no symbols passed the trend-alignment filter
+    # today (mixed market). Do NOT treat this as an error; scanner returns 0 approved.
     return candidates, market
 
 

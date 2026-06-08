@@ -9,6 +9,12 @@ from zoneinfo import ZoneInfo
 import requests
 
 try:
+    from jugaad_data.nse import NSELive as _NSELive
+    _JUGAAD = True
+except ImportError:
+    _JUGAAD = False
+
+try:
     import yfinance as yf
     _YFINANCE = True
 except ImportError:
@@ -27,17 +33,32 @@ _NSE_BASE = "https://www.nseindia.com"
 _NSE_API = f"{_NSE_BASE}/api"
 
 _HEADERS = {
+    "Host": "www.nseindia.com",
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Windows NT 11.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/134.0.6998.166 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.nseindia.com/",
+    "Accept": "*/*",
+    "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate",
+    "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=SBIN",
+    "X-Requested-With": "XMLHttpRequest",
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "Sec-CH-UA": '"Google Chrome";v="134", "Chromium";v="134", "Not?A_Brand";v="99"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Sec-CH-UA-Platform": '"Windows"',
+    "DNT": "1",
+    "Cache-Control": "no-cache",
     "Connection": "keep-alive",
 }
+
+# Warmup page: visit a working NSE page to acquire session cookies.
+# The main homepage (nseindia.com) is Akamai-protected and returns 403 for automated clients.
+# The get-quotes page is less restricted and successfully sets nsit/nseappid cookies.
+_NSE_WARMUP_URL = "https://www.nseindia.com/get-quotes/equity?symbol=LT"
 
 # yfinance ticker overrides — indices and symbols whose NSE name ≠ Yahoo Finance ticker.
 # All other symbols auto-resolve as SYMBOL.NS (e.g. RELIANCE → RELIANCE.NS).
@@ -170,7 +191,7 @@ class NSEDataSource:
     """Live NSE data source with 5-minute cache and graceful fallbacks."""
 
     # Cache TTLs — option chain prices move every second; indicators are slow
-    _TTL_OPTION_CHAIN = 90    # 90 sec — option prices stale fast, especially near expiry
+    _TTL_OPTION_CHAIN = 60    # 60 sec — serial NSE fetches; fresh enough for manual scans
     _TTL_INTRADAY     = 60    # 60 sec — real-time closes for RSI/MACD
     _TTL_SLOW         = 300   # 5 min  — VIX, breadth, lot sizes, watchlist
 
@@ -179,6 +200,7 @@ class NSEDataSource:
         self._session_at: float = 0.0
         self._cache: dict = {}
         self._session_lock = threading.Lock()  # one thread initialises the session at a time
+        self._jugaad: object | None = None      # jugaad-data NSELive client (lazy init)
 
     # ── HTTP session ──────────────────────────────────────────────────────────
 
@@ -191,7 +213,9 @@ class NSEDataSource:
                 s = requests.Session()
                 s.headers.update(_HEADERS)
                 try:
-                    s.get(_NSE_BASE, timeout=10)
+                    # Warmup via get-quotes page (sets nsit/nseappid cookies).
+                    # The main homepage returns 403 for automated clients (Akamai-protected).
+                    s.get(_NSE_WARMUP_URL, timeout=15)
                     time.sleep(0.3)
                 except Exception as exc:
                     logger.debug("NSE session warmup failed: %s", exc)
@@ -243,6 +267,26 @@ class NSEDataSource:
         nse_symbol = "NIFTY FIN SERVICE" if symbol == "FINNIFTY" else symbol
 
         def fetch():
+            # jugaad-data handles Akamai session cookies that plain requests can't obtain.
+            # Uses original NSE ticker (e.g. "FINNIFTY"), not the API display name.
+            # Caller resets self._jugaad = None before each symbol so every call
+            # gets a fresh session — prevents NSE from flagging a shared session.
+            if _JUGAAD:
+                try:
+                    if self._jugaad is None:
+                        self._jugaad = _NSELive()
+                    client = self._jugaad
+                    if symbol in INDEX_SYMBOLS:
+                        data = client.index_option_chain(symbol)
+                    else:
+                        data = client.equities_option_chain(symbol)
+                    if data and data.get("records", {}).get("data"):
+                        return data
+                    self._jugaad = None
+                except Exception as exc:
+                    logger.debug("jugaad-data option chain %s failed: %s", symbol, exc)
+                    self._jugaad = None
+            # Fallback: direct requests (works if NSE session cookies are valid)
             endpoint = "option-chain-indices" if symbol in INDEX_SYMBOLS else "option-chain-equities"
             return self._get(endpoint, params={"symbol": nse_symbol})
 
@@ -322,7 +366,7 @@ class NSEDataSource:
                 ordered.append(sym)
         return ordered
 
-    def get_ohlcv_daily(self, symbol: str, period: str = "200d"):
+    def get_ohlcv_daily(self, symbol: str, period: str = "1y"):
         """200-day daily OHLCV — SQLite cache first, yfinance as fetch source.
 
         Cache hit:  instant, zero network calls, safe on rate-limited days.
@@ -527,24 +571,40 @@ class NSEDataSource:
 
     # ── option chain parsing ──────────────────────────────────────────────────
 
-    def _parse_option_chain(self, oc_data: dict, symbol: str, direction: str, spot: float) -> dict | None:
+    def _parse_option_chain(self, oc_data: dict, symbol: str, direction: str, spot: float,
+                            strike_offset: int = 0) -> dict | None:
+        """Parse option chain and return data for one strike.
+
+        strike_offset positions relative to ATM in the sorted strikes array:
+          For CE (bullish):  -1 = ITM (lower strike),  0 = ATM,  +1 = OTM (higher strike)
+          For PE (bearish):  +1 = ITM (higher strike), 0 = ATM,  -1 = OTM (lower strike)
+        """
         try:
             records    = oc_data.get("records", {})
             expiries   = records.get("expiryDates", [])
             if not expiries:
                 return None
             nearest    = expiries[0]
-            rows       = [r for r in records.get("data", []) if r.get("expiryDate") == nearest]
+            # jugaad-data uses "expiryDates" (plural) per row; NSE direct API uses "expiryDate"
+            rows = [
+                r for r in records.get("data", [])
+                if r.get("expiryDate") == nearest or r.get("expiryDates") == nearest
+            ]
             if not rows:
                 return None
 
-            # Compute strike interval from the live chain (difference between consecutive strikes)
+            # Compute strike interval and ATM
             all_strikes = sorted({r.get("strikePrice", 0) for r in rows if r.get("strikePrice")})
             if len(all_strikes) >= 2:
                 interval = all_strikes[1] - all_strikes[0]
             else:
-                interval = 50  # safe fallback if chain has only one strike
+                interval = 50
             atm_strike = round(spot / interval) * interval
+
+            # Apply strike offset — clamp to available strikes
+            atm_idx    = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - atm_strike))
+            target_idx = max(0, min(len(all_strikes) - 1, atm_idx + strike_offset))
+            target_strike = all_strikes[target_idx]
 
             # PCR from filtered totals
             filt       = oc_data.get("filtered", {})
@@ -552,10 +612,12 @@ class NSEDataSource:
             tot_pe_oi  = filt.get("PE", {}).get("totOI", 0)
             pcr        = round(tot_pe_oi / tot_ce_oi, 2)
 
-            # ATM row
-            atm_row    = min(rows, key=lambda r: abs(r.get("strikePrice", 0) - atm_strike))
+            # Target strike row
+            target_row = min(rows, key=lambda r: abs(r.get("strikePrice", 0) - target_strike))
+            # Use target_strike as atm_strike downstream (for max-pain distance calc)
+            atm_strike = target_strike
             opt_key    = "CE" if direction == "BUY" else "PE"
-            opt        = atm_row.get(opt_key) or {}
+            opt        = target_row.get(opt_key) or {}
 
             last_price  = float(opt.get("lastPrice") or 0)
             bid         = float(opt.get("bidprice") or last_price * 0.995)
@@ -609,6 +671,7 @@ class NSEDataSource:
                 "atmIV":             round(atm_iv, 1),
                 "dte":               dte,
                 "optType":           opt_key,   # "CE" or "PE"
+                "strikeOffset":      strike_offset,
             }
         except Exception as exc:
             logger.warning("Option chain parse failed [%s]: %s", symbol, exc)
@@ -616,7 +679,8 @@ class NSEDataSource:
 
     # ── candidate builder ─────────────────────────────────────────────────────
 
-    def _build_candidate(self, symbol: str, ind: dict, opt: dict, vix: float, lot_size: int = 50) -> dict | None:
+    def _build_candidate(self, symbol: str, ind: dict, opt: dict, vix: float, lot_size: int = 50,
+                         strike_type: str = "ATM") -> dict | None:
         ema20, ema50, ema200 = ind["ema20"], ind["ema50"], ind["ema200"]
         bullish = ema20 > ema50 > ema200
         bearish = ema20 < ema50 < ema200
@@ -717,8 +781,9 @@ class NSEDataSource:
         )
 
         return {
-            "id":               f"{symbol.lower()}-{opt_type.lower()}-{strike}",
+            "id":               f"{symbol.lower()}-{opt_type.lower()}-{strike}-{strike_type.lower()}",
             "instrument":       instrument,
+            "strikeType":       strike_type,   # ITM / ATM / OTM
             "underlying":       symbol,
             "direction":        direction,
             "style":            "Intraday trend continuation" if adx >= 20 else "Intraday momentum setup",
@@ -765,53 +830,89 @@ class NSEDataSource:
 
     # ── public API ────────────────────────────────────────────────────────────
 
-    def _fetch_candidate(self, symbol: str, vix: float, lot_sizes: dict) -> dict | None:
-        """Build one candidate. Runs inside a thread-pool worker."""
+    def _fetch_candidate(self, symbol: str, vix: float, lot_sizes: dict) -> list[dict]:
+        """Build ITM / ATM / OTM candidates for one symbol. Runs inside a thread-pool worker."""
         try:
             df_d     = self.get_ohlcv_daily(symbol)
             intraday = self.get_intraday_closes(symbol)
             ind      = self._compute_indicators(df_d, intraday)
             if not ind:
                 logger.info("Skip %s: indicators unavailable", symbol)
-                return None
+                return []
 
+            # Direction determines offset semantics:
+            # BUY (CE): -1=ITM, 0=ATM, +1=OTM   (lower strike = deeper ITM for calls)
+            # SELL (PE): +1=ITM, 0=ATM, -1=OTM   (higher strike = deeper ITM for puts)
             direction = "BUY" if ind["ema20"] > ind["ema200"] else "SELL"
+            offsets   = [(-1, "ITM"), (0, "ATM"), (1, "OTM")] if direction == "BUY" \
+                        else [(1, "ITM"), (0, "ATM"), (-1, "OTM")]
+
             oc = self.get_option_chain(symbol)
             if not oc:
                 logger.info("Skip %s: option chain unavailable", symbol)
-                return None
+                return []
 
-            opt = self._parse_option_chain(oc, symbol, direction, ind["spotPrice"])
-            if not opt:
-                return None
-
-            lot = lot_sizes.get(symbol, 50)
-            return self._build_candidate(symbol, ind, opt, vix, lot_size=lot)
+            lot        = lot_sizes.get(symbol, 50)
+            candidates = []
+            for offset, strike_type in offsets:
+                opt = self._parse_option_chain(oc, symbol, direction, ind["spotPrice"],
+                                               strike_offset=offset)
+                if not opt:
+                    continue
+                cand = self._build_candidate(symbol, ind, opt, vix, lot_size=lot,
+                                             strike_type=strike_type)
+                if cand:
+                    candidates.append(cand)
+            return candidates
         except Exception as exc:
             logger.warning("Candidate build failed [%s]: %s", symbol, exc)
-            return None
+            return []
+
+    # Default scan list for NSE scraping mode.
+    # Verified reliable via jugaad-data (~4s each). HDFCBANK and FINNIFTY excluded (return empty/timeout).
+    # Full F&O universe unlocks automatically once Angel One API is configured.
+    _NSE_DEFAULT_SYMBOLS = [
+        # Indices (most liquid, always included)
+        "NIFTY", "BANKNIFTY",
+        # Top F&O stocks verified working ~4s each
+        "RELIANCE", "ICICIBANK", "SBIN", "INFY", "TCS",
+        "AXISBANK", "KOTAKBANK", "LT", "WIPRO",
+    ]
 
     def get_live_candidates(self, scan_list: list[str] | None = None, top_n: int = 40) -> list[dict]:
-        """Scan top_n F&O instruments in parallel and return all valid candidates.
+        """Scan F&O instruments and return all valid candidates.
 
-        Uses a ThreadPoolExecutor so I/O for different symbols (yfinance + NSE)
-        overlaps rather than running sequentially. 6 workers = ~6× faster vs serial.
-        Hard gate filtering and scoring happen in scanner.py, not here.
+        NSE scraping mode: NIFTY + BANKNIFTY only (other symbols time out).
+        Broker API mode (Angel One / Upstox): full F&O universe once configured.
+
+        Option chains are pre-fetched sequentially — NSE rate-limits concurrent calls.
+        Each symbol gets a fresh jugaad-data session to avoid session flagging.
+        OHLCV + indicator computation then runs in parallel (reads from SQLite cache).
         """
-        instruments = scan_list if scan_list else self.get_fo_watchlist(top_n=top_n)
+        instruments = scan_list if scan_list else self._NSE_DEFAULT_SYMBOLS
         vix         = self.get_india_vix()
         lot_sizes   = self.get_lot_sizes()
 
+        # ── Phase 1: fetch option chains sequentially ──────────────────────────
+        # Fresh jugaad-data session per symbol prevents NSE from flagging the session.
+        # Results go into _cache so Phase 2 never hits NSE concurrently.
+        for sym in instruments:
+            self._jugaad = None          # force fresh session for each symbol
+            try:
+                self.get_option_chain(sym)
+            except Exception as exc:
+                logger.warning("Option chain pre-fetch failed [%s]: %s", sym, exc)
+
+        # ── Phase 2: indicators + candidate build (parallel, cache-only) ───────
+        # Each symbol produces up to 3 candidates (ITM/ATM/OTM). Flatten results.
         candidates: list[dict] = []
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(instruments), 6)) as pool:
             futures = {
                 pool.submit(self._fetch_candidate, sym, vix, lot_sizes): sym
                 for sym in instruments
             }
             for fut in as_completed(futures):
-                result = fut.result()
-                if result:
-                    candidates.append(result)
+                candidates.extend(fut.result())
 
         logger.info("Scanned %d instruments → %d candidates", len(instruments), len(candidates))
         return candidates
