@@ -96,8 +96,26 @@ def _send_alert(send_fn, label: str, instrument: str,
         logger.debug("Telegram send skipped (not configured?): %s", exc)
 
 
+def _resolve_signal_id(journal_entry: dict) -> int | None:
+    """Return signal_log.id linked to a journal entry, if any."""
+    try:
+        from app.services.storage import get_recent_signals
+        sig_id = journal_entry.get("signal_id")
+        if sig_id:
+            return int(sig_id)
+        # Fallback: find the most recent open signal for this instrument
+        instrument = journal_entry.get("instrument", "")
+        signals = get_recent_signals(limit=100)
+        for s in signals:
+            if s["instrument"] == instrument and s["outcome"] is None:
+                return s["id"]
+    except Exception:
+        pass
+    return None
+
+
 def _check_positions(nse_data, send_fn) -> None:
-    from app.services.storage import get_journal_entries, update_journal_entry
+    from app.services.storage import get_journal_entries, update_journal_entry, update_signal_outcome
 
     entries = get_journal_entries(limit=100)
     active  = [e for e in entries if e.get("status") in ("open", "paper")]
@@ -122,16 +140,24 @@ def _check_positions(nse_data, send_fn) -> None:
         def _pnl(price):
             return round((price - entry_px) / risk, 2) if risk > 0 else 0.0
 
+        sig_id = _resolve_signal_id(entry)
+
         # SL hit — auto-close as loss
         if sl_px > 0 and current <= sl_px and (eid, "sl") not in _alerted:
             _alerted.add((eid, "sl"))
             pnl_r = _pnl(current)
+            final_pnl = max(pnl_r, -3.0)
             update_journal_entry(eid, {
                 "status":     "closed",
                 "outcome":    "loss",
                 "exit_price": current,
-                "pnl_r":      max(pnl_r, -3.0),
+                "pnl_r":      final_pnl,
             })
+            if sig_id:
+                try:
+                    update_signal_outcome(sig_id, "loss", current, final_pnl, "sl_hit")
+                except Exception as exc:
+                    logger.debug("signal_log outcome update failed: %s", exc)
             _send_alert(send_fn, "SL HIT — AUTO CLOSED", instrument, entry_px, current, sl_px, pnl_r)
 
         # T3 hit — auto-close as full win (check before T2 so we don't double-fire)
@@ -139,12 +165,18 @@ def _check_positions(nse_data, send_fn) -> None:
             for lvl in ("t1", "t2", "t3"):
                 _alerted.add((eid, lvl))
             pnl_r = _pnl(current)
+            final_pnl = min(pnl_r, 5.0)
             update_journal_entry(eid, {
                 "status":     "closed",
                 "outcome":    "win",
                 "exit_price": current,
-                "pnl_r":      min(pnl_r, 5.0),
+                "pnl_r":      final_pnl,
             })
+            if sig_id:
+                try:
+                    update_signal_outcome(sig_id, "win", current, final_pnl, "t3_hit")
+                except Exception as exc:
+                    logger.debug("signal_log outcome update failed: %s", exc)
             _send_alert(send_fn, "T3 HIT — AUTO CLOSED", instrument, entry_px, current, t3_px, pnl_r)
 
         # T2 hit — auto-close as win (conservative paper-trade exit)
@@ -152,12 +184,18 @@ def _check_positions(nse_data, send_fn) -> None:
             _alerted.add((eid, "t1"))
             _alerted.add((eid, "t2"))
             pnl_r = _pnl(current)
+            final_pnl = min(pnl_r, 5.0)
             update_journal_entry(eid, {
                 "status":     "closed",
                 "outcome":    "win",
                 "exit_price": current,
-                "pnl_r":      min(pnl_r, 5.0),
+                "pnl_r":      final_pnl,
             })
+            if sig_id:
+                try:
+                    update_signal_outcome(sig_id, "win", current, final_pnl, "t2_hit")
+                except Exception as exc:
+                    logger.debug("signal_log outcome update failed: %s", exc)
             _send_alert(send_fn, "T2 HIT — AUTO CLOSED", instrument, entry_px, current, t2_px, pnl_r)
 
         # T1 hit — alert only, let trade run toward T2/T3

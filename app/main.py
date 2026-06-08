@@ -19,8 +19,13 @@ from app.services.storage import (
     compute_risk_state,
     get_journal_analytics,
     get_journal_entries,
+    get_recent_signals,
+    get_signal_analytics,
     init_db,
+    link_signal_to_journal,
+    prune_scan_audit,
     recent_scans,
+    record_approved_signals,
     record_scan,
     update_journal_entry,
 )
@@ -211,17 +216,22 @@ def _notify_scan_failure(reason: str) -> None:
         logger.error("Could not queue scan failure alert: %s", exc)
 
 
-def _auto_paper_trade(item: dict) -> None:
-    """Log an approved signal as a paper trade if not already open for that instrument."""
-    from app.services.storage import get_journal_entries
+def _auto_paper_trade(item: dict, signal_id: int | None = None) -> None:
+    """Log an approved signal as a paper trade if not already open for that instrument.
+    Links trade_journal row ↔ signal_log row via signal_id."""
     c = item["candidate"]
     instrument = c.get("instrument", "")
-    # Skip if already have an open/paper entry for this instrument
     existing = [e for e in get_journal_entries(limit=50)
                 if e["instrument"] == instrument and e["status"] in ("open", "paper")]
     if existing:
+        # Still link the signal to the existing journal entry if not yet linked
+        if signal_id and not existing[0].get("signal_id"):
+            try:
+                link_signal_to_journal(signal_id, existing[0]["id"])
+            except Exception:
+                pass
         return
-    add_journal_entry({
+    journal_id = add_journal_entry({
         "instrument":      instrument,
         "direction":       c.get("direction", "BUY"),
         "entry":           c.get("entry", 0),
@@ -229,9 +239,14 @@ def _auto_paper_trade(item: dict) -> None:
         "targets":         c.get("targets", [0, 0, 0]),
         "confidenceScore": item.get("score", {}).get("total", 0),
         "status":          "paper",
-        "notes":           f"Auto-logged by scanner. Score: {item.get('score', {}).get('total', 0)}/100",
+        "notes":           f"Auto-logged. Score: {item.get('score', {}).get('total', 0)}/100",
     })
-    logger.info("Auto-paper-trade logged: %s", instrument)
+    if signal_id and journal_id:
+        try:
+            link_signal_to_journal(signal_id, journal_id)
+        except Exception:
+            pass
+    logger.info("Auto-paper-trade logged: %s (signal_id=%s)", instrument, signal_id)
 
 
 def build_scan(settings_payload: dict | None = None, persist: bool = True) -> dict:
@@ -261,12 +276,25 @@ def build_scan(settings_payload: dict | None = None, persist: bool = True) -> di
               "lossStreak": journal_streak, **scan}
 
     if persist:
+        # Persist scan summary and prune old audit rows (keep 30 days)
         record_scan(scan)
+        try:
+            prune_scan_audit(keep_days=30)
+        except Exception as exc:
+            logger.debug("scan_audit prune skipped: %s", exc)
+
         _cache_scan(result)
-        # Auto-log every approved signal as a paper trade
-        for item in scan["approved"]:
+
+        # Record every approved signal with full context, then auto-journal
+        signal_ids: list[int] = []
+        try:
+            signal_ids = record_approved_signals(None, scan["approved"], market)
+        except Exception as exc:
+            logger.warning("record_approved_signals failed: %s", exc)
+
+        for item, sig_id in zip(scan["approved"], signal_ids or [None] * len(scan["approved"])):
             try:
-                _auto_paper_trade(item)
+                _auto_paper_trade(item, signal_id=sig_id)
             except Exception as exc:
                 logger.warning("Auto-paper-trade failed for %s: %s",
                                item.get("candidate", {}).get("instrument"), exc)
@@ -441,6 +469,43 @@ def journal_update(entry_id: int, update: JournalUpdate):
     if not success:
         raise HTTPException(status_code=400, detail="No valid fields to update.")
     return {"updated": True}
+
+
+# ── API: signal log & accuracy analytics ─────────────────────────────────────
+
+@app.get("/api/signals")
+def signals_list(limit: int = 50, outcome: Optional[str] = None):
+    """Recent signal_log rows. outcome filter: win / loss / None (all)."""
+    return {"items": get_recent_signals(limit=limit, outcome_filter=outcome)}
+
+
+@app.get("/api/signals/analytics")
+def signals_analytics():
+    """Accuracy analytics sliced by score bucket, VIX, data source, flags etc.
+    Becomes meaningful after ~20+ closed signals."""
+    return get_signal_analytics()
+
+
+@app.get("/api/signals/export")
+def signals_export():
+    """Download full signal_log as CSV for external analysis."""
+    import csv, io
+    from fastapi.responses import StreamingResponse
+    rows = get_recent_signals(limit=100000)
+    if not rows:
+        raise HTTPException(status_code=404, detail="No signal data yet.")
+    fields = list(rows[0].keys())
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    buf.seek(0)
+    filename = f"signals_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
 
 
 # ── static fallback ───────────────────────────────────────────────────────────

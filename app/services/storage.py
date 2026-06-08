@@ -91,6 +91,106 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at       TEXT    NOT NULL,
+                scan_id          INTEGER,          -- FK to scan_audit
+                journal_id       INTEGER,          -- FK to trade_journal (set when auto-journaled)
+
+                -- Instrument
+                instrument       TEXT    NOT NULL,
+                underlying       TEXT    NOT NULL DEFAULT '',
+                direction        TEXT    NOT NULL,
+                strike_type      TEXT,             -- ITM / ATM / OTM
+                expiry           TEXT,             -- Weekly / Monthly
+                dte              INTEGER,
+
+                -- Entry plan
+                entry            REAL    NOT NULL,
+                stop_loss        REAL    NOT NULL,
+                target_1         REAL    NOT NULL DEFAULT 0,
+                target_2         REAL    NOT NULL DEFAULT 0,
+                target_3         REAL    NOT NULL DEFAULT 0,
+                rr               REAL,
+                lot_size         INTEGER,
+
+                -- Scores
+                score_total      INTEGER NOT NULL,
+                score_trend      INTEGER,
+                score_momentum   INTEGER,
+                score_volume     INTEGER,
+                score_oc         INTEGER,
+                score_sentiment  INTEGER,
+                score_rr         INTEGER,
+
+                -- Technical context at signal time
+                spot_price       REAL,
+                ema20            REAL,
+                ema50            REAL,
+                ema200           REAL,
+                rsi              REAL,
+                adx              REAL,
+                macd             REAL,
+                macd_signal      REAL,
+                atr              REAL,
+                rel_volume       REAL,
+                data_age         TEXT,             -- angel-5min / nse-1min / daily-fallback
+                supertrend_bull  INTEGER,          -- 0 / 1
+                pd_breakout      INTEGER,
+                tf15_aligned     INTEGER,
+                vwap             REAL,
+                vwap_confirmed   INTEGER,
+                gap_up           INTEGER,
+                gap_down         INTEGER,
+                gap_pct          REAL,
+                sr_breakout      INTEGER,
+                near_resistance  INTEGER,
+                near_support     INTEGER,
+                resistance       REAL,
+                support          REAL,
+
+                -- Option chain context
+                atm_iv           REAL,
+                iv_rank          REAL,
+                pcr              REAL,
+                oi_change_pct    REAL,
+                option_volume    INTEGER,
+                spread_pct       REAL,
+                max_pain_dist    REAL,
+
+                -- Greeks
+                delta            REAL,
+                theta            REAL,
+                vega             REAL,
+
+                -- Market context at signal time
+                india_vix        REAL,
+                market_regime    TEXT,
+                breadth          REAL,
+                nifty_direction  TEXT,             -- BUY / SELL (NIFTY master direction)
+
+                -- Outcome (filled in later by monitor or manually)
+                outcome          TEXT,             -- win / loss / breakeven / expired
+                exit_price       REAL,
+                pnl_r            REAL,
+                exit_at          TEXT,
+                exit_reason      TEXT              -- sl_hit / t1_hit / t2_hit / t3_hit / manual / expired
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_log_created ON signal_log(created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_log_instrument ON signal_log(instrument)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signal_log_outcome ON signal_log(outcome)"
+        )
+        # Migrate trade_journal to add signal_id link if not present
+        _add_column_if_missing(conn, "trade_journal", "signal_id", "INTEGER")
 
 
 def _add_column_if_missing(conn, table: str, column: str, col_def: str):
@@ -403,6 +503,339 @@ def set_ohlcv_cache(symbol: str, rows: list[dict]) -> None:
                 for r in rows
             ],
         )
+
+
+# ── signal log ────────────────────────────────────────────────────────────────
+
+def record_approved_signals(scan_id: int | None, approved: list[dict], market: dict) -> list[int]:
+    """Insert one row per approved signal into signal_log. Returns list of inserted IDs.
+
+    Called immediately after record_scan() so every approved signal has a permanent
+    record with full technical context. Outcomes are filled in later by the monitor.
+    """
+    init_db()
+    inserted_ids: list[int] = []
+    nifty_dir = market.get("niftyDirection")  # set by get_live_candidates if available
+
+    for item in approved:
+        c  = item.get("candidate", {})
+        sc = item.get("score", {})
+        scores = sc.get("scores", {})
+        targets = c.get("targets", [0, 0, 0])
+
+        try:
+            with get_connection() as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO signal_log (
+                        created_at, scan_id,
+                        instrument, underlying, direction, strike_type, expiry, dte,
+                        entry, stop_loss, target_1, target_2, target_3, rr, lot_size,
+                        score_total, score_trend, score_momentum, score_volume,
+                        score_oc, score_sentiment, score_rr,
+                        spot_price, ema20, ema50, ema200, rsi, adx, macd, macd_signal,
+                        atr, rel_volume, data_age, supertrend_bull,
+                        pd_breakout, tf15_aligned, vwap, vwap_confirmed,
+                        gap_up, gap_down, gap_pct,
+                        sr_breakout, near_resistance, near_support, resistance, support,
+                        atm_iv, iv_rank, pcr, oi_change_pct, option_volume, spread_pct,
+                        max_pain_dist, delta, theta, vega,
+                        india_vix, market_regime, breadth, nifty_direction
+                    ) VALUES (
+                        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                    )
+                    """,
+                    (
+                        datetime.now(timezone.utc).isoformat(),
+                        scan_id,
+                        c.get("instrument", ""),
+                        c.get("underlying", ""),
+                        c.get("direction", ""),
+                        c.get("strikeType"),
+                        c.get("expiry"),
+                        c.get("dte"),
+                        float(c.get("entry") or 0),
+                        float(c.get("stopLoss") or 0),
+                        float(targets[0]) if len(targets) > 0 else 0.0,
+                        float(targets[1]) if len(targets) > 1 else 0.0,
+                        float(targets[2]) if len(targets) > 2 else 0.0,
+                        c.get("rr"),
+                        c.get("lotSize"),
+                        sc.get("total", 0),
+                        scores.get("trend"),
+                        scores.get("momentum"),
+                        scores.get("volume"),
+                        scores.get("optionChain"),
+                        scores.get("sentiment"),
+                        scores.get("riskReward"),
+                        c.get("spotPrice") or c.get("ema20"),
+                        c.get("ema20"),
+                        c.get("ema50"),
+                        c.get("ema200"),
+                        c.get("rsi"),
+                        c.get("adx"),
+                        c.get("macd"),
+                        c.get("macdSignal"),
+                        c.get("atr"),
+                        c.get("relativeVolume"),
+                        c.get("dataAge"),
+                        1 if c.get("supertrendBullish") else 0,
+                        1 if c.get("pdBreakout") else 0,
+                        1 if c.get("tf15Aligned") else 0,
+                        c.get("vwap"),
+                        1 if c.get("vwapConfirmed") else 0,
+                        1 if c.get("gapUp") else 0,
+                        1 if c.get("gapDown") else 0,
+                        c.get("gapPct"),
+                        1 if c.get("srBreakout") else 0,
+                        1 if c.get("nearResistance") else 0,
+                        1 if c.get("nearSupport") else 0,
+                        c.get("resistance"),
+                        c.get("support"),
+                        c.get("atmIV"),
+                        c.get("ivRank"),
+                        c.get("pcr"),
+                        c.get("oiChangePct"),
+                        c.get("optionVolume"),
+                        c.get("spreadPct"),
+                        c.get("maxPainDistancePct"),
+                        c.get("delta"),
+                        c.get("theta"),
+                        c.get("vega"),
+                        market.get("indiaVix"),
+                        market.get("regime"),
+                        market.get("breadth"),
+                        nifty_dir,
+                    ),
+                )
+                inserted_ids.append(cursor.lastrowid)
+        except Exception as exc:
+            logger.warning("signal_log insert failed [%s]: %s", c.get("instrument"), exc)
+
+    return inserted_ids
+
+
+def update_signal_outcome(
+    signal_id: int,
+    outcome: str,
+    exit_price: float,
+    pnl_r: float,
+    exit_reason: str,
+) -> None:
+    """Fill in the outcome for a signal. Called by the price monitor on SL/T1/T2/T3 hit."""
+    init_db()
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE signal_log
+               SET outcome = ?, exit_price = ?, pnl_r = ?, exit_at = ?, exit_reason = ?
+               WHERE id = ? AND outcome IS NULL""",
+            (
+                outcome,
+                exit_price,
+                pnl_r,
+                datetime.now(timezone.utc).isoformat(),
+                exit_reason,
+                signal_id,
+            ),
+        )
+
+
+def link_signal_to_journal(signal_id: int, journal_id: int) -> None:
+    """Link a signal_log row to its trade_journal row (and vice versa)."""
+    init_db()
+    with get_connection() as conn:
+        conn.execute("UPDATE signal_log SET journal_id = ? WHERE id = ?", (journal_id, signal_id))
+        conn.execute("UPDATE trade_journal SET signal_id = ? WHERE id = ?", (signal_id, journal_id))
+
+
+def get_signal_analytics() -> dict:
+    """Aggregate signal_log into analysis-ready stats.
+
+    Slices outcome data by: score bucket, VIX regime, data_age,
+    direction, strike_type, gap/vwap/sr flags, expiry type.
+    Only rows with a filled outcome are included.
+    """
+    init_db()
+    try:
+        with get_connection() as conn:
+            # ── Overall stats ────────────────────────────────────────────────
+            total = conn.execute("SELECT COUNT(*) FROM signal_log").fetchone()[0]
+            closed = conn.execute(
+                "SELECT COUNT(*) FROM signal_log WHERE outcome IS NOT NULL"
+            ).fetchone()[0]
+            wins = conn.execute(
+                "SELECT COUNT(*) FROM signal_log WHERE outcome = 'win'"
+            ).fetchone()[0]
+            avg_pnl = conn.execute(
+                "SELECT ROUND(AVG(pnl_r),2) FROM signal_log WHERE pnl_r IS NOT NULL"
+            ).fetchone()[0]
+            best = conn.execute(
+                "SELECT ROUND(MAX(pnl_r),2) FROM signal_log WHERE pnl_r IS NOT NULL"
+            ).fetchone()[0]
+            worst = conn.execute(
+                "SELECT ROUND(MIN(pnl_r),2) FROM signal_log WHERE pnl_r IS NOT NULL"
+            ).fetchone()[0]
+
+            # ── By score bucket (70-74, 75-79, 80-84, 85-89, 90+) ──────────
+            score_rows = conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN score_total >= 90 THEN '90+'
+                        WHEN score_total >= 85 THEN '85-89'
+                        WHEN score_total >= 80 THEN '80-84'
+                        WHEN score_total >= 75 THEN '75-79'
+                        ELSE '70-74'
+                    END AS bucket,
+                    COUNT(*)                           AS total,
+                    SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                    ROUND(AVG(pnl_r), 2)               AS avg_pnl
+                FROM signal_log WHERE outcome IS NOT NULL
+                GROUP BY bucket ORDER BY bucket DESC
+                """
+            ).fetchall()
+
+            # ── By VIX regime ────────────────────────────────────────────────
+            vix_rows = conn.execute(
+                """
+                SELECT
+                    CASE
+                        WHEN india_vix < 14  THEN '<14 calm'
+                        WHEN india_vix < 18  THEN '14-18 normal'
+                        WHEN india_vix < 22  THEN '18-22 elevated'
+                        ELSE '22+ high'
+                    END AS regime,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                    ROUND(AVG(pnl_r),2) AS avg_pnl
+                FROM signal_log WHERE outcome IS NOT NULL AND india_vix IS NOT NULL
+                GROUP BY regime
+                """
+            ).fetchall()
+
+            # ── By data source (angel-5min vs daily-fallback) ─────────────
+            age_rows = conn.execute(
+                """
+                SELECT data_age,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                    ROUND(AVG(pnl_r),2) AS avg_pnl
+                FROM signal_log WHERE outcome IS NOT NULL AND data_age IS NOT NULL
+                GROUP BY data_age
+                """
+            ).fetchall()
+
+            # ── By condition flags ────────────────────────────────────────
+            def _flag_stats(flag_col: str) -> list[dict]:
+                rows = conn.execute(
+                    f"""
+                    SELECT {flag_col} AS flag,
+                        COUNT(*) AS total,
+                        SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                        ROUND(AVG(pnl_r),2) AS avg_pnl
+                    FROM signal_log WHERE outcome IS NOT NULL AND {flag_col} IS NOT NULL
+                    GROUP BY {flag_col}
+                    """
+                ).fetchall()
+                return [{"flag": bool(r[0]), "total": r[1], "wins": r[2], "avg_pnl": r[3]}
+                        for r in rows]
+
+            # ── By expiry type ────────────────────────────────────────────
+            expiry_rows = conn.execute(
+                """
+                SELECT expiry,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                    ROUND(AVG(pnl_r),2) AS avg_pnl
+                FROM signal_log WHERE outcome IS NOT NULL AND expiry IS NOT NULL
+                GROUP BY expiry
+                """
+            ).fetchall()
+
+            # ── By strike type ────────────────────────────────────────────
+            strike_rows = conn.execute(
+                """
+                SELECT strike_type,
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN outcome='win' THEN 1 ELSE 0 END) AS wins,
+                    ROUND(AVG(pnl_r),2) AS avg_pnl
+                FROM signal_log WHERE outcome IS NOT NULL AND strike_type IS NOT NULL
+                GROUP BY strike_type
+                """
+            ).fetchall()
+
+            # ── Exit reason breakdown ─────────────────────────────────────
+            exit_rows = conn.execute(
+                """
+                SELECT exit_reason,
+                    COUNT(*) AS total,
+                    ROUND(AVG(pnl_r),2) AS avg_pnl
+                FROM signal_log WHERE exit_reason IS NOT NULL
+                GROUP BY exit_reason ORDER BY total DESC
+                """
+            ).fetchall()
+
+            def _rows(rs) -> list[dict]:
+                return [dict(r) for r in rs]
+
+        return {
+            "overview": {
+                "totalSignals":  total,
+                "closedSignals": closed,
+                "openSignals":   total - closed,
+                "wins":          wins,
+                "losses":        closed - wins,
+                "winRate":       round(wins / closed * 100, 1) if closed > 0 else None,
+                "avgPnlR":       avg_pnl,
+                "bestTradeR":    best,
+                "worstTradeR":   worst,
+            },
+            "byScoreBucket":   _rows(score_rows),
+            "byVixRegime":     _rows(vix_rows),
+            "byDataAge":       _rows(age_rows),
+            "byVwapConfirmed": _flag_stats("vwap_confirmed"),
+            "byGapSignal":     _flag_stats("gap_up"),
+            "bySrBreakout":    _flag_stats("sr_breakout"),
+            "byTf15Aligned":   _flag_stats("tf15_aligned"),
+            "byPdBreakout":    _flag_stats("pd_breakout"),
+            "byExpiryType":    _rows(expiry_rows),
+            "byStrikeType":    _rows(strike_rows),
+            "byExitReason":    _rows(exit_rows),
+        }
+    except Exception as exc:
+        logger.warning("signal_analytics error: %s", exc)
+        return {"overview": {}, "error": str(exc)}
+
+
+def prune_scan_audit(keep_days: int = 30) -> int:
+    """Delete scan_audit rows older than keep_days. Returns number of rows deleted."""
+    init_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "DELETE FROM scan_audit WHERE created_at < ?", (cutoff,)
+        )
+        deleted = cursor.rowcount
+    if deleted:
+        logger.info("scan_audit pruned: %d rows older than %d days removed", deleted, keep_days)
+    return deleted
+
+
+def get_recent_signals(limit: int = 50, outcome_filter: str | None = None) -> list[dict]:
+    """Return recent signal_log rows, newest first."""
+    init_db()
+    with get_connection() as conn:
+        if outcome_filter:
+            rows = conn.execute(
+                "SELECT * FROM signal_log WHERE outcome = ? ORDER BY id DESC LIMIT ?",
+                (outcome_filter, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM signal_log ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+    return [dict(r) for r in rows]
 
 
 _JOURNAL_UPDATABLE = {"exit_price", "outcome", "pnl_r", "status", "notes"}
