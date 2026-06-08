@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 
 
 CATEGORY_MAX = {
-    "trend": 25,
+    "trend": 30,   # +5 headroom for S/R breakout and gap scoring
     "momentum": 20,
     "volume": 15,
     "optionChain": 20,
@@ -75,6 +75,21 @@ def trend_score(candidate):
     # 15-min EMA9/21 short-term confluence
     if candidate.get("tf15Aligned"):
         score += 3
+
+    # S/R breakout — spot cleared a former swing-high resistance (confirmed by daily OHLCV)
+    # Near-support for BUY or near-resistance for SELL scores lower (approaching friction)
+    if candidate.get("srBreakout"):
+        score += 3
+    if candidate["direction"] == "BUY" and candidate.get("nearResistance"):
+        score -= 2   # approaching overhead supply — exit risk
+    if candidate["direction"] == "SELL" and candidate.get("nearSupport"):
+        score -= 2   # approaching demand zone — bounce risk
+
+    # Opening gap in trade direction — institutional overnight positioning confirms move
+    if candidate["direction"] == "BUY"  and candidate.get("gapUp"):
+        score += 2
+    if candidate["direction"] == "SELL" and candidate.get("gapDown"):
+        score += 2
 
     # Price action
     price_action = candidate["priceAction"].lower()

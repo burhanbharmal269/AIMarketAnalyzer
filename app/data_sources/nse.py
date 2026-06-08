@@ -591,14 +591,19 @@ class NSEDataSource:
 
     # ── technical indicators ──────────────────────────────────────────────────
 
-    def _compute_indicators(self, df_daily, intraday_closes=None, symbol: str = "") -> dict | None:
-        """Blend real-time NSE intraday closes with daily OHLCV.
+    def _compute_indicators(self, df_daily, intraday_closes=None,
+                            symbol: str = "", angel_candles=None) -> dict | None:
+        """Compute all technical indicators from daily OHLCV + intraday data.
 
-        Split rationale:
-          Real-time (NSE chart API) → EMA20, EMA50, RSI, MACD, spot price
-          Daily / slow (yfinance)   → EMA200, ADX, ATR, relative volume
-        EMA200 and ADX move so slowly that a 15-min lag on daily data is irrelevant.
-        RSI and MACD on intraday closes must be current or signals are stale.
+        Data source priority:
+          Fast indicators (EMA20/50, RSI, MACD, VWAP, 15m):
+            1. Angel One 5-min candles (passed in as angel_candles — already fetched)
+            2. NSE chart 1-min closes (intraday_closes fallback)
+            3. Daily OHLCV (last resort — stale but better than nothing)
+          Slow indicators (EMA200, ADX, ATR, RelVol): always daily OHLCV
+
+        Consolidating into angel_candles eliminates the separate NSE chart API
+        call and the separate VWAP fetch — one Angel One call per symbol covers all.
         """
         if not _TA or df_daily is None or len(df_daily) < 52:
             return None
@@ -609,37 +614,41 @@ class NSEDataSource:
             high_d  = df_daily["High"]
             low_d   = df_daily["Low"]
 
-            # ── slow indicators from daily OHLCV (yfinance, fine with 15-min lag) ──
-            ema200  = (
+            # ── Slow indicators — daily OHLCV (15-min lag irrelevant for these) ──
+            ema200 = (
                 ta.trend.EMAIndicator(close_d, window=200).ema_indicator().iloc[-1]
                 if len(close_d) >= 200 else
                 ta.trend.EMAIndicator(close_d, window=50).ema_indicator().iloc[-1]
             )
-            adx_val = ta.trend.ADXIndicator(high_d, low_d, close_d).adx().iloc[-1]
-            atr_val = ta.volatility.AverageTrueRange(high_d, low_d, close_d).average_true_range().iloc[-1]
+            adx_val     = ta.trend.ADXIndicator(high_d, low_d, close_d).adx().iloc[-1]
+            atr_val     = ta.volatility.AverageTrueRange(high_d, low_d, close_d).average_true_range().iloc[-1]
             avg_vol_raw = df_daily["Volume"].rolling(20).mean().iloc[-1]
-            avg_vol = float(avg_vol_raw) if pd.notna(avg_vol_raw) else 0.0
-            last_vol = float(df_daily["Volume"].iloc[-1])
-            rel_vol = round(last_vol / avg_vol, 2) if avg_vol > 0 and pd.notna(last_vol) else 1.0
+            avg_vol     = float(avg_vol_raw) if pd.notna(avg_vol_raw) else 0.0
+            last_vol    = float(df_daily["Volume"].iloc[-1])
+            rel_vol     = round(last_vol / avg_vol, 2) if avg_vol > 0 and pd.notna(last_vol) else 1.0
+            prev_high   = float(high_d.iloc[-2]) if len(high_d) >= 2 else float(high_d.iloc[-1])
+            prev_low    = float(low_d.iloc[-2])  if len(low_d)  >= 2 else float(low_d.iloc[-1])
+            prev_close  = float(close_d.iloc[-2]) if len(close_d) >= 2 else float(close_d.iloc[-1])
 
-            # ── Previous day high / low for breakout detection ──
-            prev_high = float(high_d.iloc[-2]) if len(high_d) >= 2 else float(high_d.iloc[-1])
-            prev_low  = float(low_d.iloc[-2])  if len(low_d)  >= 2 else float(low_d.iloc[-1])
+            # ── Fast source selection: Angel 5-min > NSE 1-min > daily ──────────
+            # Angel One 5-min candles are fetched once in _fetch_candidate and passed
+            # here — no extra API call. Close series used for EMA/RSI/MACD.
+            fast_src = None
+            data_age = "daily-fallback"
 
-            # ── fast indicators from real-time NSE intraday closes ──
-            # Use intraday if we have ≥ 26 bars (enough for MACD slow EMA); else fall back to daily.
-            if intraday_closes is not None and len(intraday_closes) >= 26:
+            if angel_candles is not None and len(angel_candles) >= 10:
+                fast_src = angel_candles.set_index("datetime")["close"]
+                data_age = "angel-5min"
+            elif intraday_closes is not None and len(intraday_closes) >= 26:
                 fast_src = intraday_closes
-                data_age = "real-time"
-            else:
+                data_age = "nse-1min"
+
+            if fast_src is None or len(fast_src) < 14:
                 fast_src = close_d
                 data_age = "daily-fallback"
 
-            ema20    = ta.trend.EMAIndicator(fast_src, window=20).ema_indicator().iloc[-1]
-            ema50_   = ta.trend.EMAIndicator(fast_src, window=50).ema_indicator().iloc[-1] if len(fast_src) >= 50 else ema20
-
-            # ── Supertrend direction from daily data (period=7, multiplier=3) ──
-            # Falls back to EMA direction — ema20 must be computed first.
+            ema20  = ta.trend.EMAIndicator(fast_src, window=20).ema_indicator().iloc[-1]
+            ema50_ = ta.trend.EMAIndicator(fast_src, window=50).ema_indicator().iloc[-1] if len(fast_src) >= 50 else ema20
             st_dir = _supertrend_direction(high_d, low_d, close_d)
             if st_dir is None:
                 st_dir = 1 if float(ema20) > float(ema200) else -1
@@ -648,41 +657,52 @@ class NSEDataSource:
             macd_val = macd_i.macd().iloc[-1]
             macd_sig = macd_i.macd_signal().iloc[-1]
             spot     = float(fast_src.iloc[-1])
+            logger.debug("Indicators [%s] source=%s spot=%s", symbol, data_age, round(spot))
 
-            if data_age == "real-time":
-                logger.debug("Indicators for spot=%s use real-time NSE chart data", round(spot))
-            else:
-                logger.debug("Indicators using daily fallback (NSE chart unavailable)")
-
-            # ── 15-min confluence — resample 1-min data, no extra API call ──
+            # ── 15-min EMA confluence — resample fast source ──────────────────
+            # 5-min → 15-min (3 bars); 1-min → 15-min (15 bars). Same resample call.
             tf15_bull = False
             tf15_bear = False
-            if intraday_closes is not None and len(intraday_closes) >= 30:
+            resample_src = angel_candles.set_index("datetime")["close"] if angel_candles is not None \
+                           else intraday_closes
+            if resample_src is not None and len(resample_src) >= 9:
                 try:
-                    import pandas as pd
-                    c15 = intraday_closes.resample("15min").last().dropna()
+                    c15 = resample_src.resample("15min").last().dropna()
                     if len(c15) >= 9:
-                        ema9_15  = c15.ewm(span=9,  adjust=False).mean()
-                        ema21_15 = c15.ewm(span=21, adjust=False).mean()
+                        ema9_15   = c15.ewm(span=9,  adjust=False).mean()
+                        ema21_15  = c15.ewm(span=21, adjust=False).mean()
                         tf15_bull = float(ema9_15.iloc[-1]) > float(ema21_15.iloc[-1])
                         tf15_bear = float(ema9_15.iloc[-1]) < float(ema21_15.iloc[-1])
                 except Exception as exc:
-                    logger.debug("15-min resample failed: %s", exc)
+                    logger.debug("15-min resample failed [%s]: %s", symbol, exc)
 
-            # ── VWAP from Angel One 5-min candles ────────────────────────────
+            # ── VWAP from Angel One candles (already fetched — no extra call) ──
             vwap = None
             vwap_bullish = None
-            try:
-                from app.data_sources.angel import (
-                    get_intraday_candles, compute_vwap, ANGEL_AVAILABLE,
-                )
-                if ANGEL_AVAILABLE and symbol:
-                    candles = get_intraday_candles(symbol, interval="FIVE_MINUTE")
-                    vwap = compute_vwap(candles)
+            if angel_candles is not None:
+                try:
+                    from app.data_sources.angel import compute_vwap
+                    vwap = compute_vwap(angel_candles)
                     if vwap and spot > 0:
                         vwap_bullish = spot > vwap
-            except Exception as exc:
-                logger.debug("VWAP fetch failed [%s]: %s", symbol, exc)
+                except Exception as exc:
+                    logger.debug("VWAP compute failed [%s]: %s", symbol, exc)
+
+            # ── Opening gap vs previous day close ──────────────────────────────
+            gap_up = gap_down = False
+            gap_pct = 0.0
+            today_open = None
+            try:
+                if angel_candles is not None and len(angel_candles) > 0:
+                    today_open = float(angel_candles["open"].iloc[0])
+                else:
+                    today_open = float(df_daily["Open"].iloc[-1])
+                if today_open and prev_close:
+                    gap_pct   = round((today_open - prev_close) / prev_close * 100, 2)
+                    gap_up    = gap_pct >= 0.5
+                    gap_down  = gap_pct <= -0.5
+            except Exception:
+                pass
 
             return {
                 "ema20":             round(float(ema20), 2),
@@ -699,6 +719,11 @@ class NSEDataSource:
                 "supertrendBullish": st_dir == 1,
                 "prevDayHigh":       round(prev_high, 2),
                 "prevDayLow":        round(prev_low, 2),
+                "prevClose":         round(prev_close, 2),
+                "todayOpen":         round(today_open, 2) if today_open else None,
+                "gapUp":             gap_up,
+                "gapDown":           gap_down,
+                "gapPct":            gap_pct,
                 "tf15Bull":          tf15_bull,
                 "tf15Bear":          tf15_bear,
                 "vwap":              vwap,
@@ -707,6 +732,54 @@ class NSEDataSource:
         except Exception as exc:
             logger.warning("Indicator computation failed: %s", exc)
             return None
+
+    def _compute_support_resistance(self, df_daily, spot: float) -> dict:
+        """Find nearest S/R levels using swing highs/lows from last 60 trading days.
+
+        A swing high is a bar whose high is the highest in a ±5-bar window.
+        A swing low  is a bar whose low  is the lowest  in a ±5-bar window.
+        Returns nearest resistance above spot and nearest support below spot.
+        """
+        _empty = {"resistance": None, "support": None,
+                  "nearResistance": False, "nearSupport": False, "srBreakout": False}
+        if df_daily is None or len(df_daily) < 15 or spot <= 0:
+            return _empty
+        try:
+            highs = df_daily["High"].tail(60).values
+            lows  = df_daily["Low"].tail(60).values
+            window = 5
+
+            swing_highs, swing_lows = [], []
+            for i in range(window, len(highs) - window):
+                if highs[i] == max(highs[i - window: i + window + 1]):
+                    swing_highs.append(round(highs[i], 1))
+                if lows[i]  == min(lows[i  - window: i + window + 1]):
+                    swing_lows.append(round(lows[i], 1))
+
+            resistances = sorted(h for h in swing_highs if h > spot * 1.001)
+            supports    = sorted((l for l in swing_lows  if l < spot * 0.999), reverse=True)
+
+            nearest_r = resistances[0] if resistances else None
+            nearest_s = supports[0]    if supports    else None
+
+            # "Near": within 0.75% of spot — approaching key level
+            near_r = bool(nearest_r and (nearest_r - spot) / spot <= 0.0075)
+            near_s = bool(nearest_s and (spot - nearest_s) / spot <= 0.0075)
+
+            # S/R breakout: spot just cleared a former resistance (now within 1%)
+            former_resist = [h for h in swing_highs if spot * 0.999 <= h <= spot * 1.01]
+            sr_breakout   = len(former_resist) > 0
+
+            return {
+                "resistance":    nearest_r,
+                "support":       nearest_s,
+                "nearResistance": near_r,
+                "nearSupport":   near_s,
+                "srBreakout":    sr_breakout,
+            }
+        except Exception as exc:
+            logger.debug("S/R computation failed: %s", exc)
+            return _empty
 
     # ── option chain parsing ──────────────────────────────────────────────────
 
@@ -819,7 +892,7 @@ class NSEDataSource:
     # ── candidate builder ─────────────────────────────────────────────────────
 
     def _build_candidate(self, symbol: str, ind: dict, opt: dict, vix: float, lot_size: int = 50,
-                         strike_type: str = "ATM") -> dict | None:
+                         strike_type: str = "ATM", sr: dict | None = None) -> dict | None:
         ema20, ema50, ema200 = ind["ema20"], ind["ema50"], ind["ema200"]
         bullish = ema20 > ema50 > ema200
         bearish = ema20 < ema50 < ema200
@@ -982,6 +1055,18 @@ class NSEDataSource:
             "delta":         greeks["delta"],
             "theta":         greeks["theta"],
             "vega":          greeks["vega"],
+            # S/R levels from swing-high/low analysis of last 60 daily bars
+            "resistance":        (sr or {}).get("resistance"),
+            "support":           (sr or {}).get("support"),
+            "nearResistance":    (sr or {}).get("nearResistance", False),
+            "nearSupport":       (sr or {}).get("nearSupport", False),
+            "srBreakout":        (sr or {}).get("srBreakout", False),
+            # Opening gap vs previous day close
+            "prevClose":         ind.get("prevClose"),
+            "todayOpen":         ind.get("todayOpen"),
+            "gapUp":             ind.get("gapUp", False),
+            "gapDown":           ind.get("gapDown", False),
+            "gapPct":            ind.get("gapPct", 0.0),
             "notes":         [f"Live data. Spot: {ind['spotPrice']:.0f}. DTE: {dte}."
                               + (f" VWAP: {vwap:.0f}." if vwap else "")],
         }
@@ -991,12 +1076,31 @@ class NSEDataSource:
     def _fetch_candidate(self, symbol: str, vix: float, lot_sizes: dict) -> list[dict]:
         """Build ITM / ATM / OTM candidates for one symbol. Runs inside a thread-pool worker."""
         try:
-            df_d     = self.get_ohlcv_daily(symbol)
-            intraday = self.get_intraday_closes(symbol)
-            ind      = self._compute_indicators(df_d, intraday, symbol=symbol)
+            df_d = self.get_ohlcv_daily(symbol)
+
+            # Fetch Angel One 5-min candles when available — single call covers
+            # EMA20/50, RSI, MACD, VWAP, 15-min confluence, and opening gap.
+            # Falls back to NSE 1-min chart API when Angel One is not configured.
+            angel_candles = None
+            intraday      = None
+            try:
+                from app.data_sources.angel import (
+                    get_intraday_candles as _angel_candles, ANGEL_AVAILABLE,
+                )
+                if ANGEL_AVAILABLE:
+                    angel_candles = _angel_candles(symbol, interval="FIVE_MINUTE")
+                else:
+                    intraday = self.get_intraday_closes(symbol)
+            except Exception as exc:
+                logger.debug("Angel candles unavailable [%s]: %s — falling back to NSE chart", symbol, exc)
+                intraday = self.get_intraday_closes(symbol)
+
+            ind = self._compute_indicators(df_d, intraday, symbol=symbol, angel_candles=angel_candles)
             if not ind:
                 logger.info("Skip %s: indicators unavailable", symbol)
                 return []
+
+            sr = self._compute_support_resistance(df_d, ind["spotPrice"])
 
             # Direction determines offset semantics:
             # BUY (CE): -1=ITM, 0=ATM, +1=OTM   (lower strike = deeper ITM for calls)
@@ -1018,7 +1122,7 @@ class NSEDataSource:
                 if not opt:
                     continue
                 cand = self._build_candidate(symbol, ind, opt, vix, lot_size=lot,
-                                             strike_type=strike_type)
+                                             strike_type=strike_type, sr=sr)
                 if cand:
                     candidates.append(cand)
             return candidates
@@ -1103,6 +1207,32 @@ class NSEDataSource:
 
             logger.info("Phase 1 complete: %d/%d option chains fetched (NSE jugaad)", fetched, len(instruments))
 
+        # ── Phase 1.5: NIFTY direction as master market filter ───────────────────
+        # When NIFTY indicators are computable, stock signals that trade against
+        # the NIFTY trend are suppressed — they fight the macro tape.
+        # Indices are still scanned independently (their own option signals).
+        nifty_direction: str | None = None
+        try:
+            df_nifty = self.get_ohlcv_daily("NIFTY")
+            intraday_nifty = None
+            angel_nifty    = None
+            try:
+                from app.data_sources.angel import get_intraday_candles as _ac, ANGEL_AVAILABLE
+                if ANGEL_AVAILABLE:
+                    angel_nifty = _ac("NIFTY", interval="FIVE_MINUTE")
+                else:
+                    intraday_nifty = self.get_intraday_closes("NIFTY")
+            except Exception:
+                intraday_nifty = self.get_intraday_closes("NIFTY")
+            ind_nifty = self._compute_indicators(df_nifty, intraday_nifty,
+                                                  symbol="NIFTY", angel_candles=angel_nifty)
+            if ind_nifty:
+                nifty_direction = "BUY" if ind_nifty["ema20"] > ind_nifty["ema200"] else "SELL"
+                logger.info("NIFTY master direction: %s (EMA20=%.0f EMA200=%.0f)",
+                            nifty_direction, ind_nifty["ema20"], ind_nifty["ema200"])
+        except Exception as exc:
+            logger.debug("NIFTY master filter unavailable: %s", exc)
+
         # ── Phase 2: indicators + VWAP + candidate build (parallel) ──────────────
         candidates: list[dict] = []
         with ThreadPoolExecutor(max_workers=min(len(instruments), 8)) as pool:
@@ -1112,6 +1242,20 @@ class NSEDataSource:
             }
             for fut in as_completed(futures):
                 candidates.extend(fut.result())
+
+        # ── Phase 2.5: suppress stock signals against NIFTY macro direction ─────
+        # Indices (NIFTY, BANKNIFTY, FINNIFTY, etc.) are never filtered — they own
+        # their direction. Only stocks get screened against the master tape.
+        if nifty_direction is not None:
+            pre_filter = len(candidates)
+            candidates = [
+                c for c in candidates
+                if c.get("underlying") in INDEX_SYMBOLS
+                or c.get("direction") == nifty_direction
+            ]
+            suppressed = pre_filter - len(candidates)
+            if suppressed:
+                logger.info("NIFTY filter: suppressed %d contra-trend stock signal(s)", suppressed)
 
         logger.info("Scan complete: %d instruments -> %d candidates", len(instruments), len(candidates))
         return candidates
