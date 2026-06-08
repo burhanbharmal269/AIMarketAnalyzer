@@ -6,6 +6,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as _date, datetime
 from zoneinfo import ZoneInfo
 
+# Max seconds to wait for a single option chain fetch before skipping that symbol.
+# At 15s, a 12-symbol scan completes in ≤180s worst-case; most symbols finish in 5-10s.
+_OC_TIMEOUT_SECS = 15
+
 import requests
 
 try:
@@ -63,12 +67,14 @@ _NSE_WARMUP_URL = "https://www.nseindia.com/get-quotes/equity?symbol=LT"
 # yfinance ticker overrides — indices and symbols whose NSE name ≠ Yahoo Finance ticker.
 # All other symbols auto-resolve as SYMBOL.NS (e.g. RELIANCE → RELIANCE.NS).
 _YF_TICKER_MAP = {
-    "NIFTY":     "^NSEI",
-    "BANKNIFTY": "^NSEBANK",
-    "FINNIFTY":  "NIFTY_FIN_SERVICE.NS",
+    "NIFTY":       "^NSEI",
+    "BANKNIFTY":   "^NSEBANK",
+    "FINNIFTY":    "NIFTY_FIN_SERVICE.NS",
+    "MIDCPNIFTY":  "NIFTY_MIDCAP_SELECT.NS",
+    "NIFTYNXT50":  "NIFTY_NEXT_50.NS",
     # TATAMOTORS demerged Oct 2025
-    "TMPV":      "TMPV.NS",   # Tata Motors Passenger Vehicles
-    "TMCV":      "TMCV.NS",   # Tata Motors Commercial Vehicles
+    "TMPV":        "TMPV.NS",   # Tata Motors Passenger Vehicles
+    "TMCV":        "TMCV.NS",   # Tata Motors Commercial Vehicles
 }
 
 # Fallback lot sizes used when the live bhavcopy CSV is unavailable.
@@ -76,6 +82,7 @@ _YF_TICKER_MAP = {
 _LOT_SIZE_FALLBACK = {
     # Indices
     "NIFTY": 75, "BANKNIFTY": 15, "FINNIFTY": 40,
+    "MIDCPNIFTY": 75, "NIFTYNXT50": 25,
     # Large-cap F&O — most liquid, highest daily option turnover
     "RELIANCE": 250, "HDFCBANK": 550, "ICICIBANK": 700,
     "INFY": 300, "TCS": 150, "AXISBANK": 1200, "SBIN": 1500,
@@ -97,9 +104,11 @@ _LOT_SIZE_FALLBACK = {
     "DIVISLAB": 200, "PIDILITIND": 200,
 }
 
-# Always included regardless of live ranking (highest liquidity indices)
-INDEX_SYMBOLS    = {"NIFTY", "BANKNIFTY", "FINNIFTY"}
-_FIXED_WATCHLIST = list(INDEX_SYMBOLS)  # prepended to any dynamic list
+# Controls jugaad-data routing: index_option_chain vs equities_option_chain.
+# FINNIFTY uses index routing but is excluded from _NSE_DEFAULT_SYMBOLS (NSE scraping ~124s).
+# MIDCPNIFTY / NIFTYNXT50 can be added to _NSE_DEFAULT_SYMBOLS when verified reliable.
+INDEX_SYMBOLS    = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
+_FIXED_WATCHLIST = ["NIFTY", "BANKNIFTY"]  # always first in any dynamic list
 
 # URL for NSE's official F&O lot-size file (updated each expiry cycle)
 _LOT_SIZE_CSV_URL = "https://archives.nseindia.com/content/fo/fo_mktlots.csv"
@@ -299,6 +308,107 @@ class NSEDataSource:
         """Convert NSE symbol to yfinance ticker.
         Indices need explicit mapping; all F&O stocks are simply SYMBOL.NS."""
         return _YF_TICKER_MAP.get(symbol, f"{symbol}.NS")
+
+    @staticmethod
+    def _nearest_expiry(expiries: list[str]) -> str:
+        """Return the nearest expiry that is today or later.
+        Falls back to expiries[0] if none parse or all are in the past."""
+        today = _date.today()
+        for exp in expiries:
+            try:
+                if datetime.strptime(exp, "%d-%b-%Y").date() >= today:
+                    return exp
+            except ValueError:
+                continue
+        return expiries[0]
+
+    def _fetch_index_constituents(self) -> list[str]:
+        """Pull stock symbols from major NSE index pages.
+        Returns a ranked list ordered by totalTradedValue (highest first)."""
+        indices = [
+            "NIFTY 50", "NIFTY BANK", "NIFTY FINANCIAL SERVICES",
+            "NIFTY MIDCAP SELECT", "NIFTY IT", "NIFTY NEXT 50",
+        ]
+        seen: set[str] = set()
+        ranked: list[tuple[float, str]] = []
+        for idx_name in indices:
+            try:
+                data = self._get("equity-stockIndices", params={"index": idx_name})
+                if not data:
+                    continue
+                for row in data.get("data", []):
+                    sym = row.get("symbol", "")
+                    if not sym or sym in seen or sym in INDEX_SYMBOLS:
+                        continue
+                    # Skip index summary rows (no series or priceBand field)
+                    if not row.get("series") and not row.get("priceBand"):
+                        continue
+                    seen.add(sym)
+                    val = float(row.get("totalTradedValue") or 0)
+                    ranked.append((val, sym))
+            except Exception as exc:
+                logger.debug("Index constituent fetch [%s] failed: %s", idx_name, exc)
+
+        if ranked:
+            ranked.sort(reverse=True)
+            logger.info("Index constituents fetched: %d symbols", len(ranked))
+            return [sym for _, sym in ranked]
+        return []
+
+    def _fetch_most_active_fo(self) -> list[str]:
+        """Return F&O symbols ranked by current OI build-up (OI spurts).
+        Uses NSE live-analysis endpoint; gracefully returns [] on failure."""
+        symbols: list[str] = []
+        for index_type in ("OPTSTK", "OPTIDX"):
+            try:
+                data = self._get(
+                    "live-analysis-variations",
+                    params={"index": index_type, "type": "OiGainers"},
+                )
+                if not data:
+                    continue
+                for row in (data.get("data") or []):
+                    sym = row.get("symbol") or row.get("underlying", "")
+                    if sym and sym not in symbols:
+                        symbols.append(sym)
+            except Exception as exc:
+                logger.debug("Most-active F&O [%s] failed: %s", index_type, exc)
+        return symbols
+
+    def _build_dynamic_universe(self, max_symbols: int = 12) -> list[str]:
+        """Build live scan universe: index constituents + OI spurts + lot-size filter.
+        Falls back to _NSE_DEFAULT_SYMBOLS when NSE endpoints are unreachable."""
+        def fetch():
+            lot_syms = set(self.get_lot_sizes().keys())
+
+            # Pull OI-spurt symbols first (highest conviction for a scanner)
+            oi_active = [s for s in self._fetch_most_active_fo() if s in lot_syms]
+
+            # Pull index constituents ranked by traded value
+            constituents = [s for s in self._fetch_index_constituents() if s in lot_syms]
+
+            # Merge: OI-spurt symbols first, then highest-value constituents
+            seen: set[str] = set()
+            merged: list[str] = []
+            for s in oi_active + constituents:
+                if s not in seen:
+                    seen.add(s)
+                    merged.append(s)
+
+            if merged:
+                # Always pin NIFTY + BANKNIFTY first, then top stocks by traded value
+                stocks = [s for s in merged if s not in set(_FIXED_WATCHLIST)]
+                n_stocks = max_symbols - len(_FIXED_WATCHLIST)
+                return _FIXED_WATCHLIST + stocks[:n_stocks]
+            return None
+
+        result = self._cached("dynamic_universe", fetch, ttl=1800)  # refresh every 30 min
+        if result:
+            return result
+
+        logger.info("Dynamic universe unavailable — using static fallback (%d symbols)",
+                    len(self._NSE_DEFAULT_SYMBOLS))
+        return list(self._NSE_DEFAULT_SYMBOLS[:max_symbols])
 
     def get_lot_sizes(self) -> dict[str, int]:
         """Fetch current F&O lot sizes from the NSE bhavcopy CSV.
@@ -584,7 +694,7 @@ class NSEDataSource:
             expiries   = records.get("expiryDates", [])
             if not expiries:
                 return None
-            nearest    = expiries[0]
+            nearest    = self._nearest_expiry(expiries)
             # jugaad-data uses "expiryDates" (plural) per row; NSE direct API uses "expiryDate"
             rows = [
                 r for r in records.get("data", [])
@@ -868,43 +978,68 @@ class NSEDataSource:
             logger.warning("Candidate build failed [%s]: %s", symbol, exc)
             return []
 
-    # Default scan list for NSE scraping mode.
-    # Verified reliable via jugaad-data (~4s each). HDFCBANK and FINNIFTY excluded (return empty/timeout).
-    # Full F&O universe unlocks automatically once Angel One API is configured.
+    # Static fallback scan list — used when NSE index constituent endpoints are unreachable.
+    # Ordered by historical reliability with jugaad-data. Angel One expands this to full F&O.
     _NSE_DEFAULT_SYMBOLS = [
-        # Indices (most liquid, always included)
+        # Indices — always pinned, most liquid
         "NIFTY", "BANKNIFTY",
-        # Top F&O stocks verified working ~4s each
-        "RELIANCE", "ICICIBANK", "SBIN", "INFY", "TCS",
-        "AXISBANK", "KOTAKBANK", "LT", "WIPRO",
+        # Large-cap F&O stocks — highest option turnover, reliable session
+        "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
+        "AXISBANK", "KOTAKBANK", "SBIN", "LT",
+        # Mid/large additions — included if within per-symbol timeout
+        "WIPRO", "BHARTIARTL", "HCLTECH", "BAJFINANCE",
     ]
 
-    def get_live_candidates(self, scan_list: list[str] | None = None, top_n: int = 40) -> list[dict]:
-        """Scan F&O instruments and return all valid candidates.
+    def get_live_candidates(self, scan_list: list[str] | None = None, top_n: int = 14) -> list[dict]:
+        """Scan F&O instruments and return all valid option candidates.
 
-        NSE scraping mode: NIFTY + BANKNIFTY only (other symbols time out).
-        Broker API mode (Angel One / Upstox): full F&O universe once configured.
+        Workflow:
+          Phase 0 — Build universe: dynamic (NSE index constituents + OI spurts) or static fallback.
+          Phase 1 — Serial option-chain pre-fetch (one at a time, fresh jugaad session per symbol,
+                    with a per-symbol timeout so slow symbols don't stall the scan).
+          Phase 2 — Parallel OHLCV + indicator computation (reads SQLite cache, never hits NSE).
 
-        Option chains are pre-fetched sequentially — NSE rate-limits concurrent calls.
-        Each symbol gets a fresh jugaad-data session to avoid session flagging.
-        OHLCV + indicator computation then runs in parallel (reads from SQLite cache).
+        Angel One SmartAPI integration will replace Phase 0-1 with a single fast API call,
+        unlocking the full 150+ F&O universe once credentials are available.
         """
-        instruments = scan_list if scan_list else self._NSE_DEFAULT_SYMBOLS
-        vix         = self.get_india_vix()
-        lot_sizes   = self.get_lot_sizes()
+        if scan_list:
+            instruments = scan_list
+        else:
+            instruments = self._build_dynamic_universe(max_symbols=top_n)
 
-        # ── Phase 1: fetch option chains sequentially ──────────────────────────
-        # Fresh jugaad-data session per symbol prevents NSE from flagging the session.
-        # Results go into _cache so Phase 2 never hits NSE concurrently.
+        vix       = self.get_india_vix()
+        lot_sizes = self.get_lot_sizes()
+
+        # ── Phase 1: serial option-chain pre-fetch with per-symbol timeout ──────
+        # jugaad-data NSELive session is reset before each symbol (prevents session
+        # flagging when NSE detects multiple rapid requests from the same client).
+        # If a symbol's option chain doesn't arrive within _OC_TIMEOUT_SECS, we skip
+        # it for this scan — it's excluded from Phase 2 naturally (cache miss → None).
+        fetched = 0
         for sym in instruments:
-            self._jugaad = None          # force fresh session for each symbol
-            try:
-                self.get_option_chain(sym)
-            except Exception as exc:
-                logger.warning("Option chain pre-fetch failed [%s]: %s", sym, exc)
+            self._jugaad = None          # fresh jugaad session per symbol
+            _ev = threading.Event()
 
-        # ── Phase 2: indicators + candidate build (parallel, cache-only) ───────
-        # Each symbol produces up to 3 candidates (ITM/ATM/OTM). Flatten results.
+            def _oc_task(s=sym, ev=_ev):
+                try:
+                    self.get_option_chain(s)
+                except Exception as exc:
+                    logger.warning("OC pre-fetch failed [%s]: %s", s, exc)
+                finally:
+                    ev.set()
+
+            _t = threading.Thread(target=_oc_task, daemon=True)
+            _t.start()
+            if _ev.wait(timeout=_OC_TIMEOUT_SECS):
+                fetched += 1
+            else:
+                logger.warning("OC pre-fetch timeout [%s] after %ds — skipping", sym, _OC_TIMEOUT_SECS)
+            self._jugaad = None          # clean slate for next symbol regardless
+
+        logger.info("Phase 1 complete: %d/%d option chains fetched", fetched, len(instruments))
+
+        # ── Phase 2: indicators + candidate build (parallel, reads cache only) ──
+        # Each symbol produces up to 3 candidates (ITM / ATM / OTM). Flatten all.
         candidates: list[dict] = []
         with ThreadPoolExecutor(max_workers=min(len(instruments), 6)) as pool:
             futures = {
@@ -914,7 +1049,7 @@ class NSEDataSource:
             for fut in as_completed(futures):
                 candidates.extend(fut.result())
 
-        logger.info("Scanned %d instruments → %d candidates", len(instruments), len(candidates))
+        logger.info("Scan complete: %d instruments -> %d candidates", len(instruments), len(candidates))
         return candidates
 
     # ── event calendar ────────────────────────────────────────────────────────
