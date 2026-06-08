@@ -1140,26 +1140,51 @@ class NSEDataSource:
         for mpc in _RBI_MPC_DATES:
             _add("RBI MPC Announcement", mpc, "high", hour=10, minute=0)
 
-        # Weekly expiry: next Thursday (or nearest non-holiday).
-        # Start from tomorrow if today's Thursday has already expired (after 15:30 IST)
-        # so the calendar always shows a future expiry, not an already-passed one.
-        thursday_start = today
-        if today.weekday() == 3 and now_ist.hour >= 15 and now_ist.minute >= 30:
-            thursday_start = today + td(days=1)
-        d = thursday_start
-        for _ in range(10):
-            if d.weekday() == 3 and d not in _ALL_HOLIDAYS:
-                _add("NSE Weekly Expiry", d, "medium", hour=15, minute=30)
-                break
-            d += td(days=1)
+        # Expiries: read actual dates from cached NIFTY option chain (authoritative).
+        # NSE has changed expiry days multiple times; hardcoding Thursday is unreliable.
+        # Falls back to Thursday-based search only if the option chain isn't cached yet.
+        live_expiries: list[date] = []
+        oc_cached = self._cache.get("oc_NIFTY")
+        if oc_cached:
+            raw_dates = oc_cached["data"].get("records", {}).get("expiryDates", [])
+            for raw in raw_dates:
+                try:
+                    d = datetime.strptime(raw, "%d-%b-%Y").date()
+                    if d >= today:
+                        live_expiries.append(d)
+                except ValueError:
+                    pass
 
-        # Monthly expiry: last Thursday of each upcoming month
-        for delta_months in range(3):
-            month = (today.month - 1 + delta_months) % 12 + 1
-            year  = today.year + (today.month - 1 + delta_months) // 12
-            lt = _last_thursday(year, month)
-            if lt >= today:
-                _add("NSE Monthly Expiry", lt, "high", hour=15, minute=30)
+        if live_expiries:
+            # Use real expiry dates from NSE. Within 5 days = weekly, beyond = monthly.
+            shown = 0
+            for exp_date in sorted(live_expiries):
+                days_away = (exp_date - today).days
+                if days_away > 8:   # >8 days away = not the nearest weekly
+                    label, sev = "NSE Monthly Expiry", "high"
+                else:
+                    label, sev = "NSE Weekly Expiry", "medium"
+                _add(label, exp_date, sev, hour=15, minute=30)
+                shown += 1
+                if shown >= 3:   # show at most 3 upcoming expiries
+                    break
+        else:
+            # Fallback: scan forward for next Thursday (pre-cache warm-up only)
+            d = today
+            if today.weekday() == 3 and now_ist.hour >= 15 and now_ist.minute >= 30:
+                d = today + td(days=1)
+            for _ in range(10):
+                if d.weekday() == 3 and d not in _ALL_HOLIDAYS:
+                    _add("NSE Weekly Expiry", d, "medium", hour=15, minute=30)
+                    break
+                d += td(days=1)
+            # Monthly fallback: last Thursday of upcoming months
+            for delta_months in range(3):
+                month = (today.month - 1 + delta_months) % 12 + 1
+                year  = today.year + (today.month - 1 + delta_months) // 12
+                lt = _last_thursday(year, month)
+                if lt >= today:
+                    _add("NSE Monthly Expiry", lt, "high", hour=15, minute=30)
 
         # Sort by minutesAway ascending
         events.sort(key=lambda e: e["minutesAway"])
