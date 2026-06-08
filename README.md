@@ -1,26 +1,26 @@
-# Indian Options Research Desk
+# AI Market Analyzer — NSE F&O Options Scanner
 
-A live-data-only research platform for NSE F&O options trading.
-Scans 40 liquid instruments in parallel, applies 12 hard risk gates, scores each setup
-across 6 categories, surfaces high-confidence BUY (CE) and SELL (PE) signals,
-monitors open positions in real time, and auto-logs paper trades for analytics.
+A live-data research platform for NSE F&O options trading.
+Scans **14 liquid F&O instruments** in real time, applies 12 hard risk gates, scores each setup
+across 6 categories using directional PCR + OI analysis, surfaces high-confidence
+BUY (CE) and SELL (PE) signals, monitors open positions, and auto-logs paper trades.
 
-**Personal use only. Manual execution. No broker integration.**
+**Personal use only. Manual execution. No automatic order placement.**
 
 ---
 
 ## Quick Start
 
-### 1. Start the server (recommended — auto-restarts on crash)
+### 1. Start the server
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+Or with auto-restart on crash:
 
 ```powershell
 .\start.ps1
-```
-
-Or directly without auto-restart:
-
-```powershell
-py -m uvicorn app.main:app --port 8000
 ```
 
 ### 2. Open the dashboard
@@ -29,14 +29,27 @@ py -m uvicorn app.main:app --port 8000
 http://localhost:8000
 ```
 
-### 3. Click Run Scan
+### 3. Set your capital and click Run Scan
 
-The scanner fetches live NSE data for 40 instruments in parallel.
-Takes **10–20 seconds**. A progress bar appears while scanning.
+Set **Account Capital** to your actual trading capital (minimum ₹1 lakh recommended for F&O).
+The scanner fetches live NSE data for 14 instruments. Takes **25–60 seconds**.
 
 > **The app never uses sample or fake data for scans.**
-> If NSE is unreachable, the scan fails with a red error banner.
-> Do not trade without a successful live scan.
+> If NSE is unreachable the scan fails with a clear error. Do not trade on a failed scan.
+
+---
+
+## Minimum Capital for F&O Trading
+
+| Capital | What you can trade |
+|---|---|
+| ₹30,000 | Too small — can't fund even 1 lot at 2% risk for most F&O |
+| ₹1,00,000 (default) | NIFTY (1 lot), BANKNIFTY (5 lots), liquid stocks |
+| ₹2,00,000+ | Full scan universe — all 14 instruments |
+| ₹5,00,000+ | Comfortable sizing across all instruments |
+
+NSE F&O lot sizes range from 15 (BANKNIFTY, MARUTI) to 5,500+ (TATASTEEL).
+At 2% risk per trade, position sizing is the binding constraint, not the premium.
 
 ---
 
@@ -46,26 +59,24 @@ Takes **10–20 seconds**. A progress bar appears while scanning.
 
 | Requirement | Details |
 |---|---|
-| Python | 3.11 or higher — use `py` launcher on Windows |
+| Python | 3.11 or higher |
 | Internet | Live connection to nseindia.com and finance.yahoo.com |
-| AI analysis | Azure OpenAI key (optional but recommended) |
-| News headlines | NewsAPI.org free key — 100 req/day (optional) |
-| Telegram alerts | Bot token + Chat ID (optional) |
+| jugaad-data | Auto-installed via requirements.txt — bypasses NSE Akamai protection |
+| Azure OpenAI | Optional — enables AI trade rationale (gpt-4.1-mini) |
+| Telegram | Optional — real-time SL/target alerts |
 
-### Step 1 — Clone / open the project folder
+### Step 1 — Clone / open the project
 
 ```powershell
-cd "C:\Users\bharm\Documents\AI Stock Market Tool"
+cd d:\AIMarketAnalyzer
 ```
 
 ### Step 2 — Create virtual environment
 
 ```powershell
-py -m venv .venv
+python -m venv .venv
 .venv\Scripts\Activate.ps1
 ```
-
-You should see `(.venv)` in your prompt.
 
 ### Step 3 — Install dependencies
 
@@ -79,168 +90,96 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
-Open `.env` and fill in:
+Fill in `.env`:
 
 ```env
-# NewsAPI — free key at https://newsapi.org/register
-NEWS_API_KEY=your_key_here
-
-# Azure OpenAI — Azure AI Foundry → Resource → Keys and Endpoint
-AZURE_OPENAI_API_KEY=your_azure_key
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
+# Azure OpenAI (optional — enables AI trade rationale)
+AZURE_OPENAI_API_KEY=your_key
+AZURE_OPENAI_ENDPOINT=https://your-resource.services.ai.azure.com
 AZURE_OPENAI_DEPLOYMENT=gpt-4.1-mini
 AZURE_OPENAI_API_VERSION=2025-01-01-preview
 
-# Standard OpenAI (only if Azure fields above are blank)
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4.1-mini
-
-# Telegram alerts (optional but strongly recommended for live use)
+# Telegram (optional — SL/target push alerts)
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 
-# Auto-scan at 9:20 AM and 3:20 PM IST
+# Scheduler — auto-scan at 9:20 AM and 3:20 PM IST
 ENABLE_SCHEDULER=false
 ```
 
-> **Azure endpoint**: Use the **OpenAI** URL (`*.openai.azure.com`), not the Project URL (`*.services.ai.azure.com`).
-> In Azure AI Foundry: Resource → Keys and Endpoint → copy the "OpenAI" URL.
-
 ---
 
-## Starting the Server
+## How the Scanner Works
 
-### Recommended: `start.ps1` (auto-restart)
+### Data sources
 
-```powershell
-.\start.ps1
-```
+| Source | Used for | Method |
+|---|---|---|
+| NSE via jugaad-data | Option chains (all 14 symbols) | Bypasses Akamai bot protection |
+| NSE allIndices API | India VIX, market breadth | Direct — no auth needed |
+| NSE archives CSV | F&O lot sizes (live, quarterly) | Public file |
+| yfinance + SQLite cache | 1-year daily OHLCV → EMA200, ADX, ATR | Cached — survives rate limits |
+| NSE chart API | Real-time 1-min intraday closes | Falls back to daily on failure |
 
-- Shows a startup banner with the dashboard URL
-- Activates `.venv` automatically if present
-- Restarts the server automatically if it crashes
-- Shows timestamp and restart count on each boot
-- Press **Ctrl+C** to stop
+### Expiry schedule (NSE changed effective 2025-09-01)
 
-### Alternative: direct uvicorn
+| Instrument | Weekly | Monthly |
+|---|---|---|
+| NIFTY 50 | Every **Tuesday** | Last Tuesday |
+| BANKNIFTY | No weekly | Last Tuesday |
+| F&O stocks | No weekly | Last Tuesday |
 
-```powershell
-py -m uvicorn app.main:app --port 8000 --log-level info
-```
+### Scan universe (14 instruments, dynamic)
 
-### Logs
-
-All server output is written to `logs/app.log` with automatic rotation (10 MB per file, 5 files kept).
-Check this file when diagnosing issues.
-
-On startup you will see clear validation lines:
+Default list (used when NSE index constituent endpoints are blocked):
 
 ```
-STARTUP OK   — NSE reachable, VIX 14.23
-STARTUP OK   — Database accessible
-STARTUP OK   — Telegram configured
-STARTUP WARN — Azure OpenAI not configured (AI explanations disabled)
+NIFTY, BANKNIFTY,
+RELIANCE, HDFCBANK, ICICIBANK, INFY, TCS,
+AXISBANK, KOTAKBANK, SBIN, LT,
+WIPRO, BHARTIARTL, HCLTECH
 ```
 
----
+When NSE `equity-stockIndices` and OI-spurt endpoints are reachable, the universe
+is built dynamically from index constituents ranked by traded value + OI build-up.
+Refreshed every 30 minutes.
 
-## How to Use
+**Angel One SmartAPI integration** (pending account approval) will expand this to
+the full 150+ F&O universe with a single fast API call.
 
-### Running a scan
+### Scan flow
 
-1. Open **http://localhost:8000**
-2. Set **Account Capital** in the Risk Controls section
-3. Set **Risk %** (default 2% — do not exceed 3% for live trading)
-4. Click **Run Scan**
+```
+Phase 0 — Build universe
+  Live: NSE index constituents (NIFTY50 / BANK / FIN / MIDCAP / IT / NEXT50)
+        + OI-spurt symbols from NSE live-analysis endpoint
+        + lot-size CSV filter
+  Fallback: static 14-symbol list
 
-> **Loss streak is auto-computed from your journal.** You do not need to set it manually.
-> The system reads your recent trade outcomes and applies the stricter of journal-computed vs manual.
+Phase 1 — Serial option chain fetch (one at a time)
+  jugaad-data NSELive() per symbol, fresh session each time
+  15-second timeout per symbol — slow symbols skipped gracefully
+  Results cached 60 seconds
 
-### Understanding signal cards
+Phase 2 — Parallel indicator computation (6 workers, reads cache only)
+  Per symbol: 1-yr OHLCV → EMA200 / ADX / ATR / RelVol / PrevDayHigh
+              Intraday 1-min → EMA20/50 / RSI / MACD / Supertrend / 15-min confluence
+              Option chain → ATM strike, entry, OI%, PCR, IV, max pain, Greeks
 
-| Element | Meaning |
-|---|---|
-| Green card (BUY/SELL badge) | Passed all 12 hard gates, scored ≥ 72/100 |
-| **BUY** | Bullish setup — buy a CE (Call Option) |
-| **SELL** | Bearish setup — buy a PE (Put Option) |
-| Confidence score | Sum of 6 category scores out of 100 |
-| Valid Until | Time by which price must hold — do not enter after this |
-| Lots | Maximum position size within your account risk |
-| Delta / Theta / Vega | Black-Scholes Greeks at ATM strike |
-| IV Rank badge | Green = cheap IV (good for buyers), Red = expensive |
-| 15m badge | ✓ = 15-min EMA confirms daily trend, ✗ = no confirmation |
-| DTE | Days to expiry |
-| Red card (collapsed) | Rejected — click to see which gate(s) failed |
-| No Trade Mode banner | Zero signals passed — preserve capital |
+Phase 3 — Scanner scoring (app/services/scanner.py)
+  12 hard gates (all must pass)
+  6-category score (must total >= 70/100)
+  Position sizing (lots = floor(rupeeRisk / lotRisk))
 
-### Auto paper trade logging
-
-When a scan produces approved signals, **they are automatically logged as paper trades**
-in the journal. You do not need to click "Log Trade" unless you want to add notes or
-log a trade that was not from the scanner.
-
-### Logging a manual trade
-
-Click **Log Trade** on any approved signal card to pre-fill the journal form.
-Fill in Entry, Stop Loss, T1/T2/T3, then click **Save Trade**.
-
-### Updating a trade outcome
-
-After closing a position, click on the trade in the journal table and update:
-- **Exit Price**
-- **Outcome** (win / loss)
-- **P&L (R)** — e.g. 1.0 means you made 1R profit
-
-The risk state (daily/weekly/monthly drawdown) is computed from these real outcomes.
-
-### Exporting trades
-
-Click **Export CSV** in the journal section header to download all trades as a CSV file.
-Filename: `journal_YYYYMMDD_HHMM.csv`.
-
----
-
-## Background Services
-
-Three daemon threads run automatically after server startup:
-
-### Price Monitor (every 60 seconds, market hours only)
-
-Checks all open/paper journal entries against live NSE option prices.
-
-| Event | Action |
-|---|---|
-| T1 hit | Telegram alert: "T1 HIT — Trail stop to entry" |
-| T2 hit | Auto-close entry as **win**, Telegram alert |
-| T3 hit | Auto-close entry as **win**, Telegram alert |
-| SL hit | Auto-close entry as **loss**, Telegram alert |
-
-Market hours: 09:15–15:30 IST only.
-
-### NSE Session Watchdog (every 15 minutes, market hours only)
-
-Validates the NSE HTTP session by fetching India VIX.
-If dead: forces a session reset and attempts reconnection.
-Sends a Telegram alert if the session stays dead after reconnection attempt.
-This ensures SL alerts do not silently stop firing during the trading day.
-
-### Telegram Retry Queue (every 15 seconds, always on)
-
-All Telegram messages are queued in SQLite before sending.
-If a send fails (network glitch), the system retries up to **3 times**:
-- Attempt 2: 30 seconds later
-- Attempt 3: 120 seconds later
-- After 3 failures: marked as failed and logged
-
-Critical SL alerts are never lost to a momentary network issue.
+Phase 4 — AI enrichment (Azure OpenAI)
+  News + context → 1-2 sentence trade rationale per approved signal
+```
 
 ---
 
 ## Signal Quality System
 
-### Hard Gates — 12 rules, NEVER relaxed
-
-All 12 must pass. Failing even one rejects the signal completely.
+### Hard Gates — 12 rules, never relaxed
 
 | Gate | Threshold |
 |---|---|
@@ -250,123 +189,122 @@ All 12 must pass. Failing even one rejects the signal completely.
 | Monthly drawdown | < 15% |
 | Risk/Reward | ≥ 1:2 |
 | EMA trend alignment | EMA20 > EMA50 > EMA200 (BUY) or reverse (SELL) |
-| Option volume | ≥ 20,000 |
-| Bid-ask spread | ≤ 3% |
-| Event risk | No high-severity event within 120 min |
+| Option volume | ≥ 25,000 contracts (filters illiquid monthly strikes) |
+| Bid-ask spread | ≤ 1.5% (configurable) |
+| Event risk | No high-severity event within 60 min |
 | India VIX | < 22 |
-| Time gate (open) | Outside 09:15–09:30 IST |
+| Time gate (open) | Outside 9:15–9:30 IST (price discovery window) |
 | Time gate (close) | Outside 14:45–15:30 IST |
+| Expiry day | No new weekly long entries after 11:00 IST on Tuesday |
 
-### Scoring — 6 categories, minimum 72/100
+### Scoring — 6 categories, minimum 70/100
 
 | Category | Max | Key factors |
 |---|---|---|
-| Trend | 25 | EMA alignment, Supertrend, PDH/PDL breakout, 15-min confluence |
-| Momentum | 20 | RSI zone, MACD crossover, ADX strength |
-| Volume | 15 | Relative volume, option volume |
-| Option Chain | 20 | OI change%, PCR, max pain, spread, IV level, IV Rank |
-| Sentiment | 10 | Market breadth, VIX level |
+| Trend | 25 | EMA20/50/200 alignment, Supertrend, PDH/PDL breakout, 15-min EMA9/21 confluence |
+| Momentum | 20 | RSI zone (55–70 BUY / 30–45 SELL), MACD crossover direction, ADX strength |
+| Volume | 15 | Relative volume vs 20-day avg, option contract volume |
+| Option Chain | 20 | OI build-up direction, directional PCR, max pain distance, spread, IV level, IV Rank |
+| Sentiment | 10 | India VIX level, market breadth (advance/decline ratio) |
 | Risk/Reward | 10 | RR ≥ 2.0 → 6pts, ≥ 2.5 → 8pts, ≥ 3.0 → 10pts |
+
+### Directional PCR scoring (key improvement)
+
+PCR (Put-Call Ratio) is now scored based on trade direction:
+
+- **BUY (CE)**: PCR > 1.2 = institutions writing puts = bullish = +6pts
+- **SELL (PE)**: PCR < 0.7 = institutions writing calls = bearish = +6pts
+- Contra-direction PCR gets a penalty (-2pts)
+
+### VIX-adjusted stop loss
+
+Stop distance automatically widens with VIX to match real market noise:
+
+| VIX | ATR multiplier | Min premium % |
+|---|---|---|
+| < 15 | 0.35× | 15% |
+| 15–18 | 0.45× | 18% |
+| 18–20 | 0.55× | 22% |
+| > 20 | 0.65× | 26% |
+
+This means high-VIX days naturally produce fewer signals — wider SL → worse RR → most setups fail the ≥ 1:2 gate automatically.
 
 ### IV Rank
 
-IV Rank is a 0–100 percentile of current ATM IV vs stored history.
-- **< 20** (green): historically cheap IV — ideal for option buyers
-- **20–65** (neutral): normal range
-- **> 65** (red): historically expensive — premium cost erodes edge
+IV Rank is a percentile of current ATM IV vs 52-week stored history.
 
-> IV Rank requires **20+ trading days** of stored history to be reliable.
-> It shows as blank on the first few weeks of use.
+- **< 20** (green): historically cheap IV — ideal for option buyers
+- **20–55**: normal range
+- **> 75** (red): historically expensive — IV crush risk for buyers
+
+IV Rank requires 20+ trading days of stored readings to be reliable.
+Readings are stored automatically on every scan.
 
 ### 15-Minute Confluence
 
-The 1-min intraday data is resampled to 15-min candles (no extra API call).
-EMA9 vs EMA21 on 15-min determines short-term momentum direction.
-When 15-min confirms the daily EMA trend: `+3` to trend score.
-Shown as **15m ✓** (green) or **15m ✗** (red) on each signal card.
+1-min intraday closes are resampled to 15-min candles (no extra API call).
+EMA9 vs EMA21 on 15-min determines short-term direction.
+When 15-min confirms the daily EMA trend: +3 to trend score.
 
 ---
 
-## Scan Flow
+## Understanding Signal Cards
 
-```
-USER CLICKS "Run Scan"
-        │
-        ▼
-┌─────────────────────────────────────┐
-│  Browser  (src/app.js)              │
-│  1. Disable button, show spinner    │
-│  2. POST /api/scan  { settings }    │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  FastAPI  (app/main.py)  ──  build_scan()                       │
-│                                                                  │
-│  A. Read risk state from journal  (compute_risk_state)          │
-│     - Daily / weekly / monthly drawdown %                       │
-│     - Auto-computed consecutive loss streak                     │
-│     - Loss streak = max(journal, manual input)                  │
-│                                                                  │
-│  B. Fetch live NSE data  ─── fails? ──▶  HTTP 503 + Telegram    │
-│     No sample data. No silent fallback. Scan stops.             │
-└──────────────┬──────────────────────────────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  NSEDataSource.get_live_candidates()  (app/data_sources/nse.py) │
-│                                                                  │
-│  1. India VIX  (NSE /api/allIndices)                            │
-│  2. F&O lot sizes  (NSE archives CSV)                           │
-│  3. Top-40 liquid F&O symbols  (NSE equity-stockIndices)        │
-│                                                                  │
-│  4. For each symbol — PARALLEL  (6 workers):                    │
-│     a) yfinance → 200-day OHLCV                                 │
-│        EMA200, ADX, ATR, RelVol, PrevDayHigh/Low               │
-│     b) NSE chart API → real-time 1-min closes                   │
-│        EMA20/50, RSI, MACD, Supertrend                          │
-│        Resample → 15-min EMA9/21 confluence                     │
-│     c) NSE option chain → nearest expiry                        │
-│        ATM strike, entry, bid/ask, OI%, PCR, ATM IV, volume     │
-│        Max pain (two-pass), DTE, Greeks (Black-Scholes)         │
-│     d) Build candidate dict                                     │
-│        Store IV reading → compute IV Rank percentile           │
-│        Reject: entry < ₹1, mixed EMA, zero-DTE after 14:00     │
-└──────────────┬──────────────────────────────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  scan_market()  (app/services/scanner.py)                       │
-│                                                                  │
-│  1. Hard gate check  (12 gates — all must pass)                 │
-│  2. Score  (6 categories → must total ≥ 72)                     │
-│  3. Position sizing  (lots = floor(rupeeRisk / lotRisk))        │
-│  4. Sort approved by score DESC, cap at 5                       │
-└──────────────┬──────────────────────────────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  AI enrichment  (app/services/ai.py)  — if key configured       │
-│  NewsAPI headlines → Azure OpenAI → 1-2 sentence rationale      │
-└──────────────┬──────────────────────────────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Record scan to SQLite  (scan_audit table)                      │
-│  Cache result for 15 min  (used by /api/summary)                │
-│  Auto-log approved signals as paper trades  (trade_journal)     │
-└──────────────┬──────────────────────────────────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Browser renders result                                         │
-│  - Approved signal cards with Greeks, IV Rank, 15m badge       │
-│  - Rejected cards (collapsed, with gate failure reasons)        │
-│  - Market regime, VIX, breadth, drawdown panel                  │
-│  - Loss streak auto-synced from journal response                │
-│  - Analytics bar refreshed                                      │
-└─────────────────────────────────────────────────────────────────┘
-```
+| Element | Meaning |
+|---|---|
+| Green card (BUY/SELL) | Passed all 12 hard gates AND scored ≥ 70/100 |
+| **BUY** | Bullish — buy a CE (Call Option) |
+| **SELL** | Bearish — buy a PE (Put Option) |
+| Score | Sum of 6 category scores |
+| Valid Until | Time by which price must hold entry — do not enter after this |
+| Lots | Maximum lots within your 2% account risk |
+| Strike badge | ITM / ATM / OTM — each candidate generates all 3 |
+| Delta / Theta / Vega | Black-Scholes Greeks at the selected strike |
+| IV Rank | Green = cheap IV, Red = expensive |
+| 15m badge | ✓ = 15-min EMA confirms daily direction |
+| DTE | Days to expiry |
+| Red card (collapsed) | Rejected — click to see which gate(s) failed |
+| No Trade Mode | Zero signals passed — preserve capital |
+
+---
+
+## Live Trading Workflow
+
+1. **Before 9:15 IST**: Start server with `.\start.ps1`
+2. **9:20–9:30 IST**: Wait for price discovery — time gate blocks scans in this window
+3. **9:30 IST onwards**: Click **Run Scan** (or enable `ENABLE_SCHEDULER=true` for auto)
+4. **Review signals**: Check score, IV Rank, 15m badge, DTE, Valid Until
+5. **Execute manually** at your broker — scanner does NOT place orders
+6. **Update journal**: Set paper trade → open once executed
+7. **Monitor Telegram**: SL/T1/T2/T3 alerts fire automatically
+8. **T1 hit**: Trail stop to entry manually in your broker
+9. **T2/T3**: Auto-closed in journal — verify with broker
+10. **End of day**: Review analytics — win rate, P&L (R), equity curve
+
+---
+
+## Background Services
+
+### Price Monitor (60 seconds, market hours only)
+
+Checks open/paper journal entries against live NSE option prices.
+
+| Event | Action |
+|---|---|
+| T1 hit | Telegram: "T1 HIT — trail stop to entry" |
+| T2 hit | Auto-close as win, Telegram alert |
+| T3 hit | Auto-close as win, Telegram alert |
+| SL hit | Auto-close as loss, Telegram alert |
+
+### NSE Session Watchdog (15 minutes, market hours)
+
+Validates session by fetching India VIX.
+Forces reconnect if dead. Sends Telegram alert if session stays dead after reconnect.
+
+### Telegram Retry Queue (15 seconds, always on)
+
+All Telegram messages are queued in SQLite. Failed sends retry 3 times.
+Critical SL alerts are never lost to a momentary network issue.
 
 ---
 
@@ -374,47 +312,35 @@ USER CLICKS "Run Scan"
 
 ```
 ├── app/
-│   ├── main.py               FastAPI routes, scan orchestration, log rotation
+│   ├── main.py               FastAPI routes, scan orchestration, startup validation
 │   ├── config.py             Settings from .env
-│   ├── sample_data.py        Backtest fallback only (never used for live scans)
 │   ├── data_sources/
-│   │   ├── nse.py            NSE live data, parallel fetch, option chain, event calendar
-│   │   └── news.py           NewsAPI headlines with 15-min cache
+│   │   ├── nse.py            NSE live data — jugaad-data option chains, dynamic universe,
+│   │   │                     _nearest_expiry, per-symbol timeout, yfinance OHLCV cache,
+│   │   │                     intraday closes, Black-Scholes Greeks, event calendar
+│   │   └── news.py           NewsAPI headlines (15-min cache)
 │   └── services/
-│       ├── scanner.py        Hard gates, 6-category scoring, position sizing
-│       ├── storage.py        SQLite — scan audit, journal, risk state, IV history, alert queue
-│       ├── monitor.py        Price monitor (60s), NSE watchdog (15min)
-│       ├── ai.py             Azure/OpenAI trade rationale generation
+│       ├── scanner.py        12 hard gates, 6-category scoring (directional PCR/OI),
+│       │                     position sizing, VIX-adjusted SL, expiry day gate (Tuesday)
+│       ├── storage.py        SQLite — scan audit, journal, IV history, OHLCV cache, alerts
+│       ├── monitor.py        Price monitor (60s), NSE session watchdog (15min)
+│       ├── ai.py             Azure OpenAI trade rationale
 │       ├── backtest.py       Historical win-rate / profit-factor stats
-│       ├── telegram.py       Alert formatting, send with retry queue
+│       ├── telegram.py       Alert formatting, retry queue
 │       └── scheduler.py      APScheduler — 9:20 AM and 3:20 PM auto-scans
 ├── src/
 │   ├── app.js                Browser UI — rendering and event handling
-│   ├── engine.js             Client-side scoring mirror (synced with Python)
-│   └── data.js               Static sample data (UI development only)
+│   └── engine.js             Client-side scoring mirror
 ├── logs/
-│   └── app.log               Rotating server log (10 MB × 5 files, auto-created)
+│   └── app.log               Rotating log (10 MB × 5 files)
 ├── data/
-│   └── research.db           SQLite database (auto-created on first run)
+│   └── research.db           SQLite database (auto-created)
 ├── index.html                Dashboard
 ├── styles.css                UI styles
-├── start.ps1                 Auto-restart launcher (recommended for live use)
+├── start.ps1                 Auto-restart launcher
 ├── requirements.txt          Python dependencies
-└── .env.example              Environment variable template
+└── .env.example              Environment template
 ```
-
----
-
-## SQLite Database Tables
-
-| Table | Purpose |
-|---|---|
-| `scan_audit` | Full JSON of every scan run |
-| `trade_journal` | All logged trades — paper and live |
-| `iv_history` | Daily ATM IV per symbol (builds IV Rank over time) |
-| `pending_alerts` | Telegram retry queue |
-
-Database location: `data/research.db` (auto-created on first start).
 
 ---
 
@@ -422,17 +348,17 @@ Database location: `data/research.db` (auto-created on first start).
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/` | Dashboard HTML |
-| GET | `/api/health` | Server health + AI/Telegram status |
+| GET | `/` | Dashboard |
+| GET | `/api/health` | Server health, AI/Telegram status |
 | GET | `/api/data-status` | NSE connectivity, VIX, last scan time |
-| POST | `/api/scan` | Run live scan with settings |
-| GET | `/api/scan` | Run live scan with defaults |
+| POST | `/api/scan` | Live scan with custom settings |
+| GET | `/api/scan` | Live scan with defaults |
 | GET | `/api/backtest` | Historical backtest metrics |
-| GET | `/api/summary` | AI market summary (uses cached scan) |
+| GET | `/api/summary` | AI market summary (uses scan cache) |
 | GET | `/api/audit/recent` | Last 10 scan records |
 | POST | `/api/journal` | Log a trade |
 | GET | `/api/journal` | List journal entries |
-| PATCH | `/api/journal/{id}` | Update exit price / outcome / P&L |
+| PATCH | `/api/journal/{id}` | Update exit / outcome / P&L |
 | GET | `/api/journal/analytics` | Win rate, profit factor, equity curve |
 | GET | `/api/journal/export` | Download all trades as CSV |
 | POST | `/api/telegram/send` | Send Telegram message |
@@ -442,53 +368,69 @@ Database location: `data/research.db` (auto-created on first start).
 
 ## Common Issues
 
-**Red error banner: "Live scan failed"**
-NSE session expired or server is unreachable. Check `logs/app.log`.
-The NSE watchdog attempts reconnection every 15 minutes automatically.
-You can also restart the server — it reconnects immediately on startup.
+**0 approved signals (No Trade Mode)**
 
-**`STARTUP WARN — NSE unreachable`**
-NSE blocks requests outside market hours or when cookies expire.
-During market hours (9:00–15:30 IST) scans should work reliably.
-Outside market hours, NSE returns 403 for option chain endpoints.
+Expand the red cards to see which gate failed. Most common causes:
+
+| Cause | Fix |
+|---|---|
+| Capital too low | Set Account Capital ≥ ₹1 lakh in the UI |
+| Market closed | Scan after 9:30 IST when option volumes are live |
+| EMA misalignment | Wait for clearer trend — mixed market is a valid no-trade |
+| VIX ≥ 22 | Hard gate — cannot override. Reduce exposure. |
+| Expiry day after 11 IST | Weekly options on Tuesday after 11am are blocked |
+
+**"Position size would exceed account risk"**
+
+The most common issue at low capital:
+- At ₹30K capital with 2% risk: budget = ₹600
+- NIFTY 1 lot risk ≈ ₹3,000 — needs ₹1.5L capital minimum
+- Solution: increase Account Capital in the Risk Controls panel
+
+**Option volume below threshold**
+
+- During market hours (9:15–15:30): volume builds — usually clears 25K by 10am
+- After close (15:30+): volumes frozen at day-end, monthly equity options often < 25K
+- NSE weekly NIFTY options always have millions in volume on expiry day
+
+**NSE data unavailable (startup warning)**
+
+NSE uses Akamai bot protection. jugaad-data library handles this automatically.
+If it fails, restart the server — it re-acquires cookies on each startup.
 
 **Azure OpenAI 404 / ResourceNotFound**
-Your `AZURE_OPENAI_ENDPOINT` is the Project endpoint (`services.ai.azure.com`).
-Change it to the OpenAI endpoint: `your-resource.openai.azure.com`
 
-**All signals rejected — No Trade Mode**
-Expand the red cards to see which gate failed. Most common:
-- India VIX ≥ 22 — market too volatile, cannot override
-- Time in opening chop window (9:15–9:30 IST)
-- Time in pre-close window (14:45–15:30 IST)
-- No clean EMA alignment across the watchlist today
+Your endpoint URL is the Project URL (services.ai.azure.com).
+Change to the OpenAI URL format: `https://your-resource.services.ai.azure.com` is correct
+if using the latest API format — verify the deployment name matches exactly.
 
 **IV Rank shows blank**
-Normal for first 3–4 weeks. IV Rank requires 20+ daily readings per symbol.
-Readings are stored automatically on every scan.
 
-**Loss streak field shows higher than expected**
-Correct behaviour — the system reads your actual recent trade outcomes from the journal
-and uses the stricter number. Review your recent closed trades in the journal.
-
-**`py` command not found**
-Install Python from python.org and check "Add to PATH". Verify with `py --version`.
-
-**Database permission errors**
-Move the project folder out of `C:\Program Files` or any UAC-protected location.
-The database is created in `data/research.db` relative to the project root.
+Normal for the first 3–4 weeks. 20+ daily readings per symbol needed.
+Stored automatically on every scan.
 
 ---
 
-## Live Trading Workflow
+## SQLite Database
 
-1. **Morning (before 9:15 IST)**: Start the server with `.\start.ps1`
-2. **9:20 IST**: Click **Run Scan** (or enable `ENABLE_SCHEDULER=true` for auto-scan)
-3. **Review approved signals**: Check score, Greeks, IV Rank, 15m badge, Valid Until
-4. **Execute manually**: Enter position through your broker at the signal's entry price
-5. **Update journal**: Change paper trade status to "open" once executed
-6. **Monitor alerts**: Telegram notifications fire at T1/T2/T3 and SL
-7. **T1 hit**: Trail stop to entry price manually in your broker
-8. **T2/T3 hit**: Position auto-closed in journal — verify broker execution
-9. **SL hit**: Exit immediately — journal auto-closes as loss
-10. **End of day (3:20 IST)**: Review analytics dashboard — win rate, P&L (R), equity curve
+| Table | Purpose |
+|---|---|
+| `scan_audit` | Full JSON of every scan run |
+| `trade_journal` | All logged trades — paper and live |
+| `iv_history` | Daily ATM IV per symbol (builds IV Rank over time) |
+| `daily_ohlcv` | 1-year OHLCV cache per symbol (survives yfinance rate limits) |
+| `pending_alerts` | Telegram retry queue |
+
+Location: `data/research.db` (auto-created on first start).
+
+---
+
+## Pending Improvements
+
+| Feature | Status | Impact |
+|---|---|---|
+| Angel One SmartAPI | Pending account approval | Full 150+ F&O universe, no scraping |
+| Dynamic universe (live) | Partially working | NSE index constituent endpoints often blocked |
+| VWAP intraday signal | Not yet implemented | +5–8 pts to score on confirmation |
+| Bollinger Band squeeze | Not yet implemented | Better entry timing |
+| Real-time WebSocket prices | Requires broker API | Eliminates 60s option chain lag |

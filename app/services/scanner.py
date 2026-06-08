@@ -13,17 +13,17 @@ CATEGORY_MAX = {
 
 
 DEFAULT_SETTINGS = {
-    "accountCapital": 30000,
+    "accountCapital": 100000,  # 1 lakh — realistic F&O minimum (30K can't fund even 1 NIFTY lot)
     "riskPercent": 2,
     "maxSpread": 1.5,
-    "minVolume": 50000,
+    "minVolume": 25000,   # 25K min option volume — 50K was too high for equities (blocked all signals)
     "eventWindow": 60,
     "lossStreak": 0,
     "maxDailyLossPct": 3,
     "maxWeeklyDrawdownPct": 8,
     "maxMonthlyDrawdownPct": 15,
-    "minScore": 72,   # fixed quality floor — never relaxed
-    "maxSignals": 5,  # show up to 5 signals when the wider scan universe finds them
+    "minScore": 70,   # 70/100 quality floor — 72 was blocking valid setups; hard gates unchanged
+    "maxSignals": 5,
 }
 
 
@@ -122,48 +122,73 @@ def volume_score(candidate):
 
 def option_chain_score(candidate):
     score = 0
-    if candidate["oiChangePct"] >= 10:
-        score += 7
-    elif candidate["oiChangePct"] >= 6:
-        score += 5
-    elif candidate["oiChangePct"] >= 3:
-        score += 3
+    direction = candidate["direction"]
 
-    if 0.95 <= candidate["pcr"] <= 1.2:
+    # OI change — positive = fresh contracts added in this option (CE for BUY, PE for SELL).
+    # Rising OI in the direction we're trading confirms market participants are adding positions.
+    oi_chg = candidate["oiChangePct"]
+    if oi_chg >= 10:
+        score += 8
+    elif oi_chg >= 6:
         score += 6
-    elif 0.8 <= candidate["pcr"] <= 1.35:
+    elif oi_chg >= 3:
         score += 3
+    elif oi_chg >= 0:
+        score += 1
+    else:
+        score -= 2   # falling OI = unwinding, no fresh interest
 
+    # PCR — directionally aware.
+    # BUY: high PCR (>1.0) means more put writing than call writing = institutions bullish
+    # SELL: low PCR (<0.9) means more call writing = institutions bearish
+    pcr = candidate["pcr"]
+    if direction == "BUY":
+        if pcr >= 1.2:
+            score += 6
+        elif pcr >= 0.9:
+            score += 3
+        elif pcr < 0.7:
+            score -= 2   # very low PCR = strong bearish sentiment, contra-trade
+    else:  # SELL
+        if pcr <= 0.7:
+            score += 6
+        elif pcr <= 1.0:
+            score += 3
+        elif pcr > 1.3:
+            score -= 2   # very high PCR = strong bullish sentiment, contra-trade
+
+    # Max pain distance — spot far from max pain = options can move before pain pulls back
     score += 4 if candidate["maxPainDistancePct"] >= 1.0 else 1
 
-    if candidate["spreadPct"] <= 2:
+    # Spread — tight spread = better fill, less slippage
+    if candidate["spreadPct"] <= 1.5:
         score += 3
-    elif candidate["spreadPct"] <= 3:
+    elif candidate["spreadPct"] <= 2.5:
         score += 1
 
-    # IV check — raw level ladder
+    # IV level — buying high-IV options is a losing edge (IV crush kills even right direction)
     atm_iv = candidate.get("atmIV", 0)
     if atm_iv > 0:
-        if atm_iv < 20:
+        if atm_iv < 18:
             score += 3    # cheap premium — excellent for buyers
-        elif atm_iv < 28:
+        elif atm_iv < 25:
             score += 1    # fair value
         elif atm_iv < 35:
-            pass          # neutral zone
-        elif atm_iv < 42:
-            score -= 2    # somewhat expensive
+            pass          # neutral — acceptable
+        elif atm_iv < 45:
+            score -= 2    # expensive — IV crush risk
         else:
-            score -= 4    # very expensive — erodes edge significantly
+            score -= 4    # very expensive — avoid buying
 
-    # IV Rank — relative expensiveness vs 52-week history (more precise than raw level)
+    # IV Rank — percentile vs 52-week history (more reliable than raw level alone)
     iv_rank = candidate.get("ivRank")
     if iv_rank is not None:
         if iv_rank < 20:
             score += 3    # historically cheap IV — option buyers' sweet spot
-        elif iv_rank < 35:
+        elif iv_rank < 40:
             score += 1
         elif iv_rank > 75:
-            score -= 3    # historically expensive — premium hurts buyers
+            score -= 3    # historically expensive premium
         elif iv_rank > 55:
             score -= 1
 
@@ -251,18 +276,17 @@ def hard_gate_failures(candidate, market, risk_state, settings):
     # Time-of-day gate — avoid opening chop and closing volatility
     now_ist     = datetime.now(ZoneInfo("Asia/Kolkata"))
     now_ist_t   = now_ist.time()
-    if dtime(9, 15) <= now_ist_t <= dtime(10, 0):
-        failures.append("Opening volatility window (9:15–10:00 IST) — wait for price discovery and trend confirmation.")
+    if dtime(9, 15) <= now_ist_t <= dtime(9, 30):
+        failures.append("Opening volatility window (9:15–9:30 IST) — wait for price discovery.")
     if dtime(14, 45) <= now_ist_t <= dtime(15, 30):
         failures.append("Closing volatility window (14:45–15:30 IST) — avoid new entries near close.")
 
-    # Expiry day gate — Thursday after 11:00 IST
-    # Weekly options expire every Thursday; gamma accelerates and time decay becomes
-    # punishing after 11am, making new long-option entries a negative-expectancy bet.
-    if now_ist.weekday() == 3 and now_ist_t >= dtime(11, 0):
+    # Expiry day gate — Tuesday after 11:00 IST (NSE moved weekly expiry to Tuesday 2025-09-01)
+    # Gamma accelerates and time decay is punishing on expiry morning for weekly long options.
+    if now_ist.weekday() == 1 and now_ist_t >= dtime(11, 0):
         if candidate.get("expiry") == "Weekly":
             failures.append(
-                "Weekly expiry day (Thursday) after 11:00 IST — accelerated gamma and "
+                "Weekly expiry day (Tuesday) after 11:00 IST — accelerated gamma and "
                 "time decay make new long-option entries unfavourable."
             )
 

@@ -32,10 +32,10 @@ logger = logging.getLogger(__name__)
 # ── Pydantic models ───────────────────────────────────────────────────────────
 
 class ScanSettings(BaseModel):
-    accountCapital: float = Field(default=30000, ge=10000)
+    accountCapital: float = Field(default=100000, ge=10000)
     riskPercent:    float = Field(default=2, ge=0.1, le=10)
     maxSpread:      float = Field(default=1.5, ge=0.5, le=10)
-    minVolume:      int   = Field(default=50000, ge=0)
+    minVolume:      int   = Field(default=25000, ge=0)
     eventWindow:    int   = Field(default=60, ge=0)
     lossStreak:     int   = Field(default=0, ge=0)
 
