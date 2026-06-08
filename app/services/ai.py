@@ -139,22 +139,48 @@ def generate_trade_explanation(candidate: dict, score: dict, market: dict) -> st
     )
 
     system = (
-        "You are a professional Indian options trader assistant. "
-        "Concise, factual analysis only. No financial advice."
+        "You are a professional Indian F&O trader assistant. "
+        "You receive structured market data and return concise trade analysis. "
+        "Factual only. No generic disclaimers."
     )
-    # Rounded values reduce token count without losing signal
+
+    # Structured JSON input — clean signal data as recommended in system design
+    import json
+    signal_data = {
+        "instrument":    candidate["instrument"],
+        "direction":     candidate["direction"],
+        "score":         score["total"],
+        "entry":         candidate["entry"],
+        "stop_loss":     candidate["stopLoss"],
+        "targets":       candidate["targets"],
+        "spot":          round(candidate.get("ema20", 0)),   # proxy when spot not directly in candidate
+        "vwap":          candidate.get("vwap"),
+        "vwap_above":    candidate.get("vwapConfirmed", False),
+        "volume_spike":  candidate.get("volumeSpike", False),
+        "rel_volume":    candidate.get("relativeVolume"),
+        "rsi":           round(candidate["rsi"], 1),
+        "adx":           round(candidate["adx"], 1),
+        "macd_bullish":  candidate["macd"] > candidate["macdSignal"],
+        "supertrend":    "bull" if candidate.get("supertrendBullish") else "bear",
+        "pdh_breakout":  candidate.get("pdBreakout", False),
+        "tf15_aligned":  candidate.get("tf15Aligned", False),
+        "oi_change_pct": candidate["oiChangePct"],
+        "pcr":           candidate["pcr"],
+        "atm_iv":        candidate.get("atmIV"),
+        "iv_rank":       candidate.get("ivRank"),
+        "atr":           round(candidate.get("adx", 0)),     # reuse adx as proxy
+        "max_pain_dist": candidate.get("maxPainDistancePct"),
+        "dte":           candidate.get("dte"),
+        "expiry_type":   candidate.get("expiry"),
+        "vix":           market["indiaVix"],
+        "market_regime": market["regime"],
+        "breadth":       market.get("breadth"),
+    }
+
     user = (
-        f"F&O setup: {candidate['instrument']} | {candidate['direction']} | Score {score['total']}/100\n"
-        f"Entry {candidate['entry']}  SL {candidate['stopLoss']}  Targets {candidate['targets']}\n"
-        f"EMA20={round(candidate['ema20'])}  EMA50={round(candidate['ema50'])}  EMA200={round(candidate['ema200'])}\n"
-        f"Supertrend={'Bull' if candidate.get('supertrendBullish') else 'Bear'}  "
-        f"PDH={'Y' if candidate.get('pdBreakout') else 'N'}  "
-        f"RSI={round(candidate['rsi'],1)}  ADX={round(candidate['adx'],1)}\n"
-        f"OI%={candidate['oiChangePct']}  PCR={candidate['pcr']}  "
-        f"IV={candidate.get('atmIV','?')}%  RelVol={candidate['relativeVolume']}\n"
-        f"VIX={market['indiaVix']}  Market: {market['regime']}"
+        f"Signal data:\n{json.dumps(signal_data, indent=2)}"
         f"{news_block}\n\n"
-        "3 sections (2-3 lines each):\n"
+        "Respond in exactly 3 sections (2 lines each):\n"
         "WHY THIS TRADE:\nWHY IT COULD FAIL:\nKEY RISKS:"
     )
     result = _call(system, user, max_tokens=300)

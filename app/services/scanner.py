@@ -64,10 +64,13 @@ def trend_score(candidate):
         score += 4
 
     # VWAP confirmation — intraday institutional bias (Angel One 5-min candles)
-    # BUY: spot > VWAP = buyers dominating all session = +4 pts
-    # SELL: spot < VWAP = sellers dominating all session = +4 pts
+    # BUY: spot > VWAP = buyers have dominated all session = +6 pts
+    # SELL: spot < VWAP = sellers have dominated all session = +6 pts
+    # Also bonus +2 if there's an explicit volume spike confirming the VWAP move
     if candidate.get("vwapConfirmed"):
-        score += 4
+        score += 6
+        if candidate.get("volumeSpike"):
+            score += 2
 
     # 15-min EMA9/21 short-term confluence
     if candidate.get("tf15Aligned"):
@@ -130,13 +133,23 @@ def momentum_score(candidate):
 
 def volume_score(candidate):
     score = 0
-    if candidate["relativeVolume"] >= 1.6:
-        score += 9
-    elif candidate["relativeVolume"] >= 1.3:
-        score += 6
-    elif candidate["relativeVolume"] >= 1.0:
+
+    # Relative equity volume vs 20-day average
+    rel_vol = candidate["relativeVolume"]
+    if rel_vol >= 2.0:
+        score += 9   # explicit volume spike — unusual participation
+    elif rel_vol >= 1.6:
+        score += 7
+    elif rel_vol >= 1.3:
+        score += 5
+    elif rel_vol >= 1.0:
         score += 3
 
+    # Volume spike bonus — 2× avg volume = institutions moving, not noise
+    if candidate.get("volumeSpike"):
+        score += 3
+
+    # Option contract liquidity
     if candidate["optionVolume"] >= 100000:
         score += 6
     elif candidate["optionVolume"] >= 50000:
@@ -257,8 +270,16 @@ def sentiment_score(candidate, market):
         score -= 2    # elevated — trade only high-conviction setups
     else:             # 20–22  (above 22 = hard gate, never reaches here)
         score -= 4    # high risk environment — very few signals should pass
-    if market["breadth"] > 1.2:
+    # Market breadth — when majority of stocks agree with direction, move is genuine
+    breadth = market.get("breadth", 1.0)
+    if breadth >= 1.5:
+        score += 3   # strongly broad-based move — highest conviction
+    elif breadth >= 1.2:
+        score += 2
+    elif breadth >= 1.0:
         score += 1
+    elif breadth < 0.8:
+        score -= 1   # narrow or contra-breadth — index move driven by few stocks
     return clamp(score, 0, CATEGORY_MAX["sentiment"])
 
 

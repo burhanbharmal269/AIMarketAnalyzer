@@ -905,6 +905,9 @@ class NSEDataSource:
             else:
                 price_action = "Bearish EMA alignment with downward pressure"
 
+        # Volume spike — 2× 20-day average = unusual institutional participation
+        volume_spike = ind.get("relativeVolume", 0) >= 2.0
+
         vix_penalty      = 0 if vix <= 16 else (2 if vix <= 20 else 4)
         market_sentiment = max(0, min(10, (7 if bullish else 6) - vix_penalty))
 
@@ -973,6 +976,7 @@ class NSEDataSource:
             "atmIV":         opt.get("atmIV", 0),
             "ivRank":        iv_rank,
             "tf15Aligned":   tf15_aligned,
+            "volumeSpike":   volume_spike,
             "vwap":          vwap,
             "vwapConfirmed": vwap_confirmed,
             "delta":         greeks["delta"],
