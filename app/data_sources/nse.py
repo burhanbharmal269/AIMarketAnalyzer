@@ -815,7 +815,8 @@ class NSEDataSource:
         else:
             signal_valid = 45 if symbol in INDEX_SYMBOLS else 60
 
-        expiry_label = "Monthly" if dte > 14 else "Weekly"
+        # NIFTY weekly ≤ 7 DTE (every Tue); stock/BANKNIFTY monthly ≥ 14 DTE (last Tue)
+        expiry_label = "Monthly" if dte > 8 else "Weekly"
 
         entry = opt.get("entry")
         if not entry or entry < 1:
@@ -1073,13 +1074,14 @@ class NSEDataSource:
                                 hour, minute, tzinfo=IST)
             return (event_dt - now_ist).total_seconds() / 60.0
 
-        def _last_thursday(year: int, month: int) -> date:
-            """Last Thursday of the given month."""
+        def _last_tuesday(year: int, month: int) -> date:
+            """Last Tuesday of the given month.
+            NSE moved all F&O expiry from Thursday to Tuesday on 2025-09-01."""
             import calendar
             last_day = calendar.monthrange(year, month)[1]
             d = date(year, month, last_day)
-            # weekday(): Monday=0 … Thursday=3
-            offset = (d.weekday() - 3) % 7
+            # weekday(): Monday=0, Tuesday=1
+            offset = (d.weekday() - 1) % 7
             return d - td(days=offset)
 
         def _add(name: str, event_date: date, severity: str, hour: int = 9, minute: int = 15):
@@ -1169,20 +1171,21 @@ class NSEDataSource:
                 if shown >= 3:   # show at most 3 upcoming expiries
                     break
         else:
-            # Fallback: scan forward for next Thursday (pre-cache warm-up only)
+            # Fallback: scan forward for next Tuesday (NSE expiry day since 2025-09-01)
+            # Only used before the NIFTY option chain is cached (cold boot).
             d = today
-            if today.weekday() == 3 and now_ist.hour >= 15 and now_ist.minute >= 30:
+            if today.weekday() == 1 and now_ist.hour >= 15 and now_ist.minute >= 30:
                 d = today + td(days=1)
             for _ in range(10):
-                if d.weekday() == 3 and d not in _ALL_HOLIDAYS:
+                if d.weekday() == 1 and d not in _ALL_HOLIDAYS:
                     _add("NSE Weekly Expiry", d, "medium", hour=15, minute=30)
                     break
                 d += td(days=1)
-            # Monthly fallback: last Thursday of upcoming months
+            # Monthly fallback: last Tuesday of upcoming months
             for delta_months in range(3):
                 month = (today.month - 1 + delta_months) % 12 + 1
                 year  = today.year + (today.month - 1 + delta_months) // 12
-                lt = _last_thursday(year, month)
+                lt = _last_tuesday(year, month)
                 if lt >= today:
                     _add("NSE Monthly Expiry", lt, "high", hour=15, minute=30)
 
