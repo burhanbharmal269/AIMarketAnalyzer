@@ -1,0 +1,569 @@
+"""
+Angel One SmartAPI data source.
+
+Primary data source for option chains, intraday candles (VWAP), and live LTP.
+nse.py uses this first and falls back to jugaad-data scraping if unavailable.
+
+Environment variables:
+    ANGEL_API_KEY      — SmartAPI app key (from smartapi.angelone.in)
+    ANGEL_CLIENT_ID    — Angel One login ID (e.g. A123456)
+    ANGEL_PIN          — 4-digit MPIN
+    ANGEL_TOTP_SECRET  — TOTP secret from the Angel One mobile app
+"""
+
+import logging
+import os
+import threading
+import time
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
+IST = ZoneInfo("Asia/Kolkata")
+
+# ── Credentials ───────────────────────────────────────────────────────────────
+ANGEL_API_KEY     = os.getenv("ANGEL_API_KEY", "")
+ANGEL_CLIENT_ID   = os.getenv("ANGEL_CLIENT_ID", "")
+ANGEL_PIN         = os.getenv("ANGEL_PIN", "")
+ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "")
+
+ANGEL_AVAILABLE = all([ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PIN, ANGEL_TOTP_SECRET])
+
+try:
+    from SmartApi import SmartConnect
+    _SMARTAPI = True
+except ImportError:
+    _SMARTAPI = False
+
+try:
+    import pyotp
+    _PYOTP = True
+except ImportError:
+    _PYOTP = False
+
+try:
+    import pandas as pd
+    _PANDAS = True
+except ImportError:
+    _PANDAS = False
+
+_SESSION_TTL = 23 * 3600   # refresh before 24h JWT expiry
+_RATE_LIMIT_SLEEP = 0.35   # Angel One allows ~3 req/sec
+
+
+# ── NSE index tokens (cash segment) ──────────────────────────────────────────
+# Used for getCandleData (OHLCV + intraday) and ltpData.
+# Keys = our symbol name, Values = (exchange, token)
+_INDEX_TOKENS: dict[str, tuple[str, str]] = {
+    "NIFTY":      ("NSE", "26000"),
+    "BANKNIFTY":  ("NSE", "26009"),
+    "FINNIFTY":   ("NSE", "26037"),
+    "MIDCPNIFTY": ("NSE", "26074"),
+    "NIFTYNXT50": ("NSE", "26013"),
+}
+
+# NSE cash-segment tokens for the 40 most liquid F&O stocks.
+# Source: Angel One instrument master (margincalculator.angelone.in/OpenAPI_File/files/OpenAPIScripMaster.json)
+# Update quarterly or call get_stock_token() to fetch dynamically.
+_STOCK_TOKENS: dict[str, tuple[str, str]] = {
+    "RELIANCE":    ("NSE", "2885"),
+    "HDFCBANK":    ("NSE", "1333"),
+    "ICICIBANK":   ("NSE", "4963"),
+    "INFY":        ("NSE", "1594"),
+    "TCS":         ("NSE", "11536"),
+    "AXISBANK":    ("NSE", "5900"),
+    "KOTAKBANK":   ("NSE", "1922"),
+    "SBIN":        ("NSE", "3045"),
+    "LT":          ("NSE", "11483"),
+    "WIPRO":       ("NSE", "3787"),
+    "BHARTIARTL":  ("NSE", "10604"),
+    "HCLTECH":     ("NSE", "7229"),
+    "BAJFINANCE":  ("NSE", "317"),
+    "BAJAJFINSV":  ("NSE", "16675"),
+    "MARUTI":      ("NSE", "10999"),
+    "SUNPHARMA":   ("NSE", "3351"),
+    "TECHM":       ("NSE", "13538"),
+    "TITAN":       ("NSE", "3506"),
+    "ASIANPAINT":  ("NSE", "236"),
+    "HINDUNILVR":  ("NSE", "1394"),
+    "ULTRACEMCO":  ("NSE", "11532"),
+    "NESTLEIND":   ("NSE", "17963"),
+    "POWERGRID":   ("NSE", "14977"),
+    "NTPC":        ("NSE", "11630"),
+    "ONGC":        ("NSE", "2475"),
+    "M&M":         ("NSE", "2031"),
+    "ADANIPORTS":  ("NSE", "15083"),
+    "JSWSTEEL":    ("NSE", "11723"),
+    "TATASTEEL":   ("NSE", "3499"),
+    "HINDALCO":    ("NSE", "1363"),
+    "GRASIM":      ("NSE", "1232"),
+    "DRREDDY":     ("NSE", "881"),
+    "CIPLA":       ("NSE", "694"),
+    "DIVISLAB":    ("NSE", "10940"),
+    "INDUSINDBK":  ("NSE", "5258"),
+    "HDFCLIFE":    ("NSE", "467"),
+    "EICHERMOT":   ("NSE", "910"),
+    "APOLLOHOSP":  ("NSE", "157"),
+    "TATACONSUM":  ("NSE", "3432"),
+}
+
+_INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
+
+_LOT_SIZES = {
+    "NIFTY": 75, "BANKNIFTY": 15, "FINNIFTY": 40,
+    "MIDCPNIFTY": 75, "NIFTYNXT50": 25,
+    "RELIANCE": 250, "HDFCBANK": 550, "ICICIBANK": 700,
+    "INFY": 300, "TCS": 150, "AXISBANK": 1200, "SBIN": 1500,
+    "KOTAKBANK": 400, "LT": 375, "WIPRO": 2400,
+    "BAJFINANCE": 125, "BAJAJFINSV": 125, "BHARTIARTL": 950,
+    "HCLTECH": 700, "TECHM": 600, "MARUTI": 15, "M&M": 700,
+    "SUNPHARMA": 700, "DRREDDY": 125, "CIPLA": 650,
+    "HINDUNILVR": 300, "ASIANPAINT": 200, "TITAN": 375,
+    "ADANIPORTS": 1250, "JSWSTEEL": 600, "TATASTEEL": 5500,
+    "HINDALCO": 2150, "NTPC": 3000, "ONGC": 3850,
+    "ULTRACEMCO": 100, "GRASIM": 475, "INDUSINDBK": 500,
+    "HDFCLIFE": 1100, "EICHERMOT": 100, "NESTLEIND": 50,
+    "POWERGRID": 4800, "DIVISLAB": 200, "APOLLOHOSP": 125,
+    "TATACONSUM": 1350,
+}
+
+
+# ── Session management ────────────────────────────────────────────────────────
+
+class AngelOneSession:
+    """Thread-safe SmartAPI session with automatic TOTP login and JWT refresh."""
+
+    def __init__(self):
+        self._obj: "SmartConnect | None" = None
+        self._logged_in_at: float = 0.0
+        self._lock = threading.Lock()
+        # Token cache: symbol -> (exchange, token)  populated via searchScrip
+        self._token_cache: dict[str, tuple[str, str]] = {}
+
+    def is_configured(self) -> bool:
+        return ANGEL_AVAILABLE and _SMARTAPI and _PYOTP
+
+    def login(self) -> bool:
+        if not self.is_configured():
+            return False
+        with self._lock:
+            try:
+                totp_code = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+                obj = SmartConnect(api_key=ANGEL_API_KEY)
+                resp = obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp_code)
+                if not resp or resp.get("status") is False:
+                    logger.error("Angel One login failed: %s",
+                                 resp.get("message", "no response") if resp else "no response")
+                    return False
+                self._obj = obj
+                self._logged_in_at = time.time()
+                logger.info("Angel One login OK — client %s", ANGEL_CLIENT_ID)
+                return True
+            except Exception as exc:
+                logger.error("Angel One login error: %s", exc)
+                self._obj = None
+                return False
+
+    def get_client(self) -> "SmartConnect | None":
+        age = time.time() - self._logged_in_at
+        if self._obj is None or age > _SESSION_TTL:
+            if not self.login():
+                return None
+        return self._obj
+
+    def get_token(self, symbol: str) -> tuple[str, str] | None:
+        """Return (exchange, token) for a symbol. Index → hardcoded; Stock → searchScrip."""
+        if symbol in _INDEX_TOKENS:
+            return _INDEX_TOKENS[symbol]
+        if symbol in _STOCK_TOKENS:
+            return _STOCK_TOKENS[symbol]
+        # Dynamic lookup via searchScrip for unknown symbols
+        if symbol in self._token_cache:
+            return self._token_cache[symbol]
+        client = self.get_client()
+        if not client:
+            return None
+        try:
+            time.sleep(_RATE_LIMIT_SLEEP)
+            resp = client.searchScrip("NSE", symbol)
+            if resp and resp.get("status") and resp.get("data"):
+                for row in resp["data"]:
+                    if row.get("tradingsymbol", "").upper() == symbol.upper():
+                        token = str(row.get("symboltoken", ""))
+                        if token:
+                            self._token_cache[symbol] = ("NSE", token)
+                            return ("NSE", token)
+        except Exception as exc:
+            logger.debug("Angel One searchScrip(%s) failed: %s", symbol, exc)
+        return None
+
+    def logout(self):
+        if self._obj:
+            try:
+                self._obj.terminateSession(ANGEL_CLIENT_ID)
+            except Exception:
+                pass
+        self._obj = None
+        self._logged_in_at = 0.0
+
+
+angel_session = AngelOneSession()
+
+
+# ── Expiry helpers ────────────────────────────────────────────────────────────
+
+def _next_tuesday(from_date: date | None = None) -> date:
+    d = from_date or date.today()
+    days_ahead = (1 - d.weekday()) % 7
+    return d + timedelta(days=days_ahead)
+
+
+def _last_tuesday_of_month(year: int, month: int) -> date:
+    if month == 12:
+        last = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - 1) % 7)
+
+
+def _guess_expiry(symbol: str) -> str:
+    """Return Angel One expiry string (e.g. '09Jun2026') for nearest valid expiry."""
+    today = date.today()
+    if symbol == "NIFTY":
+        d = _next_tuesday(today)
+    else:
+        d = _last_tuesday_of_month(today.year, today.month)
+        if d < today:
+            if today.month == 12:
+                d = _last_tuesday_of_month(today.year + 1, 1)
+            else:
+                d = _last_tuesday_of_month(today.year, today.month + 1)
+    return d.strftime("%d%b%Y")
+
+
+def _expiry_to_nse_fmt(angel_expiry: str) -> str:
+    """Convert '09Jun2026' → '09-Jun-2026' (NSE format used by nse.py parser)."""
+    try:
+        return datetime.strptime(angel_expiry.upper(), "%d%b%Y").strftime("%d-%b-%Y")
+    except Exception:
+        return angel_expiry
+
+
+# ── Option chain ──────────────────────────────────────────────────────────────
+
+def get_option_chain(symbol: str) -> dict | None:
+    """
+    Fetch option chain from Angel One and return in NSE 'records' format
+    so nse.py's _parse_option_chain() works without modification.
+
+    Returns NSE-compatible dict with keys: records.expiryDates, records.data, filtered.
+    Returns None if Angel One unavailable or call fails.
+    """
+    client = angel_session.get_client()
+    if client is None:
+        return None
+
+    expiry_str = _guess_expiry(symbol)
+
+    # Angel One rate limit: sleep before each call
+    time.sleep(_RATE_LIMIT_SLEEP)
+
+    resp = None
+    for fmt in [expiry_str, expiry_str.upper()]:
+        try:
+            resp = client.optionGreek({"name": symbol, "expirydate": fmt})
+            if resp and resp.get("status") is not False and resp.get("data"):
+                break
+        except Exception as exc:
+            logger.debug("Angel optionGreek %s [%s] error: %s", symbol, fmt, exc)
+        time.sleep(0.3)
+
+    if not resp or not resp.get("data"):
+        logger.warning("Angel OC failed for %s (expiry %s)", symbol, expiry_str)
+        return None
+
+    rows = resp["data"]
+    nse_expiry = _expiry_to_nse_fmt(expiry_str)
+
+    # Build NSE-compatible records.data rows
+    nse_rows = []
+    total_ce_oi = 0
+    total_pe_oi = 0
+
+    for row in rows:
+        sp = float(row.get("strikePrice", 0) or 0)
+        if sp <= 0:
+            continue
+
+        ce_raw = row.get("CE") or {}
+        pe_raw = row.get("PE") or {}
+
+        def _f(d: dict, key: str, default=0):
+            try:
+                return float(d.get(key) or default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        ce_oi   = _f(ce_raw, "openInterest")
+        pe_oi   = _f(pe_raw, "openInterest")
+        ce_chg  = _f(ce_raw, "changeinOpenInterest")
+        pe_chg  = _f(pe_raw, "changeinOpenInterest")
+        ce_pchg = round(ce_chg / ce_oi * 100, 2) if ce_oi > 0 else 0.0
+        pe_pchg = round(pe_chg / pe_oi * 100, 2) if pe_oi > 0 else 0.0
+
+        total_ce_oi += ce_oi
+        total_pe_oi += pe_oi
+
+        spot = _f(ce_raw, "underlyingValue") or _f(pe_raw, "underlyingValue")
+
+        nse_rows.append({
+            "strikePrice": sp,
+            "expiryDate":  nse_expiry,
+            "CE": {
+                "lastPrice":              _f(ce_raw, "lastPrice"),
+                "openInterest":           ce_oi,
+                "changeinOpenInterest":   ce_chg,
+                "pchangeinOpenInterest":  ce_pchg,
+                "totalTradedVolume":      _f(ce_raw, "totalTradedVolume"),
+                "impliedVolatility":      _f(ce_raw, "impliedVolatility"),
+                "bidprice":               _f(ce_raw, "bidprice") or _f(ce_raw, "lastPrice") * 0.995,
+                "askPrice":               _f(ce_raw, "askPrice") or _f(ce_raw, "lastPrice") * 1.005,
+                "underlyingValue":        spot,
+            },
+            "PE": {
+                "lastPrice":              _f(pe_raw, "lastPrice"),
+                "openInterest":           pe_oi,
+                "changeinOpenInterest":   pe_chg,
+                "pchangeinOpenInterest":  pe_pchg,
+                "totalTradedVolume":      _f(pe_raw, "totalTradedVolume"),
+                "impliedVolatility":      _f(pe_raw, "impliedVolatility"),
+                "bidprice":               _f(pe_raw, "bidprice") or _f(pe_raw, "lastPrice") * 0.995,
+                "askPrice":               _f(pe_raw, "askPrice") or _f(pe_raw, "lastPrice") * 1.005,
+                "underlyingValue":        spot,
+            },
+        })
+
+    if not nse_rows:
+        return None
+
+    return {
+        "records": {
+            "expiryDates": [nse_expiry],
+            "data": nse_rows,
+        },
+        "filtered": {
+            "CE": {"totOI": total_ce_oi},
+            "PE": {"totOI": total_pe_oi},
+        },
+        "_source": "angel",
+    }
+
+
+# ── Intraday candles (for VWAP) ───────────────────────────────────────────────
+
+def get_intraday_candles(symbol: str, interval: str = "FIVE_MINUTE") -> "pd.DataFrame | None":
+    """
+    Fetch today's intraday candles from Angel One.
+    Returns DataFrame: datetime, open, high, low, close, volume.
+    Used to compute VWAP and intraday momentum signals.
+
+    interval: ONE_MINUTE | THREE_MINUTE | FIVE_MINUTE | TEN_MINUTE | FIFTEEN_MINUTE
+    """
+    if not _PANDAS:
+        return None
+
+    client = angel_session.get_client()
+    if client is None:
+        return None
+
+    token_info = angel_session.get_token(symbol)
+    if not token_info:
+        logger.debug("No token for %s — cannot fetch intraday candles", symbol)
+        return None
+
+    exchange, token = token_info
+    now_ist   = datetime.now(IST)
+    from_date = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    to_date   = now_ist
+
+    time.sleep(_RATE_LIMIT_SLEEP)
+    try:
+        resp = client.getCandleData({
+            "exchange":    exchange,
+            "symboltoken": token,
+            "interval":    interval,
+            "fromdate":    from_date.strftime("%Y-%m-%d %H:%M"),
+            "todate":      to_date.strftime("%Y-%m-%d %H:%M"),
+        })
+        if not resp or resp.get("status") is False or not resp.get("data"):
+            return None
+
+        df = pd.DataFrame(resp["data"], columns=["datetime", "open", "high", "low", "close", "volume"])
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["datetime"] = pd.to_datetime(df["datetime"])
+        return df.dropna(subset=["close"]).reset_index(drop=True)
+
+    except Exception as exc:
+        logger.debug("Angel intraday candles %s failed: %s", symbol, exc)
+        return None
+
+
+def compute_vwap(candles: "pd.DataFrame") -> float | None:
+    """
+    Compute VWAP from a DataFrame with columns: high, low, close, volume.
+    VWAP = sum(typical_price × volume) / sum(volume)
+    Returns None if data is insufficient.
+    """
+    if candles is None or len(candles) < 3:
+        return None
+    try:
+        tp = (candles["high"] + candles["low"] + candles["close"]) / 3
+        vol = candles["volume"]
+        total_vol = vol.sum()
+        if total_vol <= 0:
+            return None
+        vwap = (tp * vol).sum() / total_vol
+        return round(float(vwap), 2)
+    except Exception as exc:
+        logger.debug("VWAP computation failed: %s", exc)
+        return None
+
+
+# ── Live LTP ──────────────────────────────────────────────────────────────────
+
+def get_ltp(symbol: str) -> float | None:
+    """Return last traded price for a symbol using Angel One ltpData."""
+    client = angel_session.get_client()
+    if client is None:
+        return None
+
+    token_info = angel_session.get_token(symbol)
+    if not token_info:
+        return None
+
+    exchange, token = token_info
+    time.sleep(_RATE_LIMIT_SLEEP)
+    try:
+        resp = client.ltpData(exchange, symbol, token)
+        if resp and resp.get("status") is not False:
+            ltp = (resp.get("data") or {}).get("ltp")
+            return float(ltp) if ltp else None
+    except Exception as exc:
+        logger.debug("Angel LTP(%s) error: %s", symbol, exc)
+    return None
+
+
+def get_ltp_batch(symbols: list[str]) -> dict[str, float]:
+    """
+    Fetch LTP for multiple symbols in one Angel One API call.
+    Returns {symbol: ltp}. Faster than individual ltpData calls.
+    """
+    client = angel_session.get_client()
+    if client is None:
+        return {}
+
+    exchange_tokens = []
+    sym_map: dict[str, str] = {}  # token -> symbol
+    for sym in symbols:
+        info = angel_session.get_token(sym)
+        if info:
+            exchange_tokens.append({"exchange": info[0], "tradingsymbol": sym, "symboltoken": info[1]})
+            sym_map[info[1]] = sym
+
+    if not exchange_tokens:
+        return {}
+
+    time.sleep(_RATE_LIMIT_SLEEP)
+    try:
+        resp = client.getMarketData("LTP", exchange_tokens)
+        if not resp or resp.get("status") is False:
+            return {}
+        result: dict[str, float] = {}
+        for item in (resp.get("data") or {}).get("fetched", []):
+            token = str(item.get("symbolToken", ""))
+            ltp = item.get("ltp")
+            sym = sym_map.get(token)
+            if sym and ltp is not None:
+                result[sym] = float(ltp)
+        return result
+    except Exception as exc:
+        logger.debug("Angel batch LTP error: %s", exc)
+        return {}
+
+
+# ── Option LTP (for position monitoring) ─────────────────────────────────────
+
+def get_option_ltp(underlying: str, strike: float, opt_type: str) -> float | None:
+    """
+    Get current LTP for a specific option (e.g. 'NIFTY', 24500, 'CE').
+    Looks up the option from the cached option chain data.
+    Much faster than fetching a full option chain.
+    """
+    client = angel_session.get_client()
+    if client is None:
+        return None
+
+    expiry_str = _guess_expiry(underlying)
+    time.sleep(_RATE_LIMIT_SLEEP)
+
+    try:
+        resp = client.optionGreek({"name": underlying, "expirydate": expiry_str})
+        if not resp or not resp.get("data"):
+            return None
+        for row in resp["data"]:
+            sp = float(row.get("strikePrice", 0) or 0)
+            if abs(sp - strike) < 0.5:
+                opt = row.get(opt_type) or {}
+                ltp = opt.get("lastPrice")
+                return float(ltp) if ltp else None
+    except Exception as exc:
+        logger.debug("Angel option LTP %s %s %s error: %s", underlying, strike, opt_type, exc)
+    return None
+
+
+# ── F&O universe ──────────────────────────────────────────────────────────────
+
+def get_fo_universe() -> list[str]:
+    """Full scan universe — 40 liquid F&O instruments."""
+    return [
+        # Indices (most liquid, always first)
+        "NIFTY", "BANKNIFTY",
+        # Large-cap (highest option OI and volume)
+        "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
+        "AXISBANK", "KOTAKBANK", "SBIN", "LT", "WIPRO",
+        "BHARTIARTL", "HCLTECH", "BAJFINANCE", "BAJAJFINSV",
+        # Mid/large cap with strong F&O activity
+        "MARUTI", "SUNPHARMA", "TECHM", "TITAN", "ASIANPAINT",
+        "HINDUNILVR", "ULTRACEMCO", "NESTLEIND", "POWERGRID",
+        "NTPC", "ONGC", "M&M", "ADANIPORTS", "JSWSTEEL",
+        "TATASTEEL", "HINDALCO", "GRASIM", "DRREDDY", "CIPLA",
+        "DIVISLAB", "INDUSINDBK", "HDFCLIFE", "EICHERMOT",
+        "APOLLOHOSP", "TATACONSUM",
+    ]
+
+
+# ── Startup test ──────────────────────────────────────────────────────────────
+
+def test_connection() -> dict:
+    """Test Angel One connection. Called at server startup."""
+    if not ANGEL_AVAILABLE:
+        missing = [k for k, v in {
+            "ANGEL_API_KEY":     ANGEL_API_KEY,
+            "ANGEL_CLIENT_ID":   ANGEL_CLIENT_ID,
+            "ANGEL_PIN":         ANGEL_PIN,
+            "ANGEL_TOTP_SECRET": ANGEL_TOTP_SECRET,
+        }.items() if not v]
+        return {"status": "not_configured", "message": f"Missing: {', '.join(missing)}"}
+
+    if not _SMARTAPI:
+        return {"status": "error", "message": "smartapi-python not installed"}
+    if not _PYOTP:
+        return {"status": "error", "message": "pyotp not installed"}
+
+    ok = angel_session.login()
+    if not ok:
+        return {"status": "error", "message": "Login failed — check credentials and TOTP secret"}
+
+    return {"status": "ok", "client_id": ANGEL_CLIENT_ID,
+            "message": "Connected to Angel One SmartAPI"}

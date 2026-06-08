@@ -99,6 +99,16 @@ def _setup_logging() -> None:
 
 def _validate_startup() -> None:
     """Check all critical dependencies at boot and log their status clearly."""
+    # Angel One SmartAPI
+    from app.data_sources.angel import test_connection as angel_test
+    angel_result = angel_test()
+    if angel_result["status"] == "ok":
+        logger.info("STARTUP OK  — Angel One SmartAPI connected (%s)", angel_result["client_id"])
+    elif angel_result["status"] == "not_configured":
+        logger.warning("STARTUP WARN — Angel One not configured: %s", angel_result["message"])
+    else:
+        logger.error("STARTUP FAIL — Angel One: %s", angel_result["message"])
+
     from app.data_sources.nse import nse_data
 
     # NSE connectivity
@@ -280,12 +290,17 @@ def styles():
 
 @app.get("/api/health")
 def health():
+    from app.data_sources.angel import ANGEL_AVAILABLE, angel_session
     return {
         "status":        "ok",
         "pythonBackend": True,
         "database":      str(settings.database_path),
         "ai":            ai_status(),
         "telegram":      telegram_status(),
+        "angelOne": {
+            "configured": ANGEL_AVAILABLE,
+            "connected":  angel_session._obj is not None,
+        },
     }
 
 

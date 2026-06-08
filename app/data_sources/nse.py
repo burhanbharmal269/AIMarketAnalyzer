@@ -276,10 +276,20 @@ class NSEDataSource:
         nse_symbol = "NIFTY FIN SERVICE" if symbol == "FINNIFTY" else symbol
 
         def fetch():
-            # jugaad-data handles Akamai session cookies that plain requests can't obtain.
-            # Uses original NSE ticker (e.g. "FINNIFTY"), not the API display name.
-            # Caller resets self._jugaad = None before each symbol so every call
-            # gets a fresh session — prevents NSE from flagging a shared session.
+            # ── Primary: Angel One SmartAPI (fast, no Akamai blocking) ────────
+            try:
+                from app.data_sources.angel import (
+                    get_option_chain as angel_oc, ANGEL_AVAILABLE,
+                )
+                if ANGEL_AVAILABLE:
+                    data = angel_oc(symbol)
+                    if data and data.get("records", {}).get("data"):
+                        logger.debug("OC source: Angel One [%s]", symbol)
+                        return data
+            except Exception as exc:
+                logger.debug("Angel One OC %s failed, falling back to NSE: %s", symbol, exc)
+
+            # ── Fallback: jugaad-data (NSE scraping via Akamai workaround) ────
             if _JUGAAD:
                 try:
                     if self._jugaad is None:
@@ -290,12 +300,14 @@ class NSEDataSource:
                     else:
                         data = client.equities_option_chain(symbol)
                     if data and data.get("records", {}).get("data"):
+                        logger.debug("OC source: jugaad-data [%s]", symbol)
                         return data
                     self._jugaad = None
                 except Exception as exc:
-                    logger.debug("jugaad-data option chain %s failed: %s", symbol, exc)
+                    logger.debug("jugaad-data OC %s failed: %s", symbol, exc)
                     self._jugaad = None
-            # Fallback: direct requests (works if NSE session cookies are valid)
+
+            # ── Last resort: direct NSE API ────────────────────────────────────
             endpoint = "option-chain-indices" if symbol in INDEX_SYMBOLS else "option-chain-equities"
             return self._get(endpoint, params={"symbol": nse_symbol})
 
@@ -579,7 +591,7 @@ class NSEDataSource:
 
     # ── technical indicators ──────────────────────────────────────────────────
 
-    def _compute_indicators(self, df_daily, intraday_closes=None) -> dict | None:
+    def _compute_indicators(self, df_daily, intraday_closes=None, symbol: str = "") -> dict | None:
         """Blend real-time NSE intraday closes with daily OHLCV.
 
         Split rationale:
@@ -657,6 +669,21 @@ class NSEDataSource:
                 except Exception as exc:
                     logger.debug("15-min resample failed: %s", exc)
 
+            # ── VWAP from Angel One 5-min candles ────────────────────────────
+            vwap = None
+            vwap_bullish = None
+            try:
+                from app.data_sources.angel import (
+                    get_intraday_candles, compute_vwap, ANGEL_AVAILABLE,
+                )
+                if ANGEL_AVAILABLE and symbol:
+                    candles = get_intraday_candles(symbol, interval="FIVE_MINUTE")
+                    vwap = compute_vwap(candles)
+                    if vwap and spot > 0:
+                        vwap_bullish = spot > vwap
+            except Exception as exc:
+                logger.debug("VWAP fetch failed [%s]: %s", symbol, exc)
+
             return {
                 "ema20":             round(float(ema20), 2),
                 "ema50":             round(float(ema50_), 2),
@@ -674,6 +701,8 @@ class NSEDataSource:
                 "prevDayLow":        round(prev_low, 2),
                 "tf15Bull":          tf15_bull,
                 "tf15Bear":          tf15_bear,
+                "vwap":              vwap,
+                "vwapBullish":       vwap_bullish,
             }
         except Exception as exc:
             logger.warning("Indicator computation failed: %s", exc)
@@ -891,6 +920,17 @@ class NSEDataSource:
             (bearish and ind.get("tf15Bear", False))
         )
 
+        # ── VWAP alignment ────────────────────────────────────────────────────
+        # spot above VWAP = intraday buyers in control (BUY confirmation)
+        # spot below VWAP = intraday sellers in control (SELL confirmation)
+        vwap = ind.get("vwap")
+        vwap_confirmed = False
+        if vwap is not None and vwap > 0:
+            if bullish and ind["spotPrice"] > vwap:
+                vwap_confirmed = True
+            elif bearish and ind["spotPrice"] < vwap:
+                vwap_confirmed = True
+
         return {
             "id":               f"{symbol.lower()}-{opt_type.lower()}-{strike}-{strike_type.lower()}",
             "instrument":       instrument,
@@ -930,13 +970,16 @@ class NSEDataSource:
                 or
                 (bearish and ind["spotPrice"] < ind.get("prevDayLow",  ind["spotPrice"]))
             ),
-            "atmIV":        opt.get("atmIV", 0),
-            "ivRank":       iv_rank,
-            "tf15Aligned":  tf15_aligned,
-            "delta":        greeks["delta"],
-            "theta":        greeks["theta"],
-            "vega":         greeks["vega"],
-            "notes":        [f"Live NSE data. Spot: {ind['spotPrice']:.0f}. DTE: {dte}."],
+            "atmIV":         opt.get("atmIV", 0),
+            "ivRank":        iv_rank,
+            "tf15Aligned":   tf15_aligned,
+            "vwap":          vwap,
+            "vwapConfirmed": vwap_confirmed,
+            "delta":         greeks["delta"],
+            "theta":         greeks["theta"],
+            "vega":          greeks["vega"],
+            "notes":         [f"Live data. Spot: {ind['spotPrice']:.0f}. DTE: {dte}."
+                              + (f" VWAP: {vwap:.0f}." if vwap else "")],
         }
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -946,7 +989,7 @@ class NSEDataSource:
         try:
             df_d     = self.get_ohlcv_daily(symbol)
             intraday = self.get_intraday_closes(symbol)
-            ind      = self._compute_indicators(df_d, intraday)
+            ind      = self._compute_indicators(df_d, intraday, symbol=symbol)
             if not ind:
                 logger.info("Skip %s: indicators unavailable", symbol)
                 return []
@@ -980,69 +1023,85 @@ class NSEDataSource:
             return []
 
     # Static fallback scan list — used when NSE index constituent endpoints are unreachable.
-    # Ordered by historical reliability with jugaad-data. Angel One expands this to full F&O.
+    # Angel One expands this to the full 40-symbol universe without Akamai blocking.
     _NSE_DEFAULT_SYMBOLS = [
         # Indices — always pinned, most liquid
         "NIFTY", "BANKNIFTY",
-        # Large-cap F&O stocks — highest option turnover, reliable session
+        # Large-cap F&O — highest option OI and turnover
         "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
-        "AXISBANK", "KOTAKBANK", "SBIN", "LT",
-        # Mid/large additions — included if within per-symbol timeout
-        "WIPRO", "BHARTIARTL", "HCLTECH", "BAJFINANCE",
+        "AXISBANK", "KOTAKBANK", "SBIN", "LT", "WIPRO",
+        "BHARTIARTL", "HCLTECH", "BAJFINANCE", "BAJAJFINSV",
+        # Mid/large cap with strong F&O activity
+        "MARUTI", "SUNPHARMA", "TECHM", "TITAN", "ASIANPAINT",
+        "HINDUNILVR", "ULTRACEMCO", "NESTLEIND", "POWERGRID",
+        "NTPC", "ONGC", "M&M", "ADANIPORTS", "JSWSTEEL",
+        "TATASTEEL", "HINDALCO", "GRASIM", "DRREDDY", "CIPLA",
+        "DIVISLAB", "INDUSINDBK", "HDFCLIFE", "EICHERMOT",
+        "APOLLOHOSP", "TATACONSUM",
     ]
 
-    def get_live_candidates(self, scan_list: list[str] | None = None, top_n: int = 14) -> list[dict]:
+    def get_live_candidates(self, scan_list: list[str] | None = None, top_n: int = 40) -> list[dict]:
         """Scan F&O instruments and return all valid option candidates.
 
         Workflow:
-          Phase 0 — Build universe: dynamic (NSE index constituents + OI spurts) or static fallback.
-          Phase 1 — Serial option-chain pre-fetch (one at a time, fresh jugaad session per symbol,
-                    with a per-symbol timeout so slow symbols don't stall the scan).
-          Phase 2 — Parallel OHLCV + indicator computation (reads SQLite cache, never hits NSE).
-
-        Angel One SmartAPI integration will replace Phase 0-1 with a single fast API call,
-        unlocking the full 150+ F&O universe once credentials are available.
+          Phase 0 — Build universe.
+                    Angel One available: use full 40-symbol list directly.
+                    Angel One unavailable: dynamic NSE constituents + OI spurts, or static fallback.
+          Phase 1 — Option chain pre-fetch.
+                    Angel One: parallel fetch (no Akamai blocking, no per-symbol timeout needed).
+                    NSE scraping: serial fetch with 15s timeout per symbol.
+          Phase 2 — Parallel OHLCV + indicator + VWAP computation.
         """
+        from app.data_sources.angel import ANGEL_AVAILABLE, get_fo_universe
+
         if scan_list:
             instruments = scan_list
+        elif ANGEL_AVAILABLE:
+            instruments = get_fo_universe()
+            logger.info("Universe source: Angel One (%d symbols)", len(instruments))
         else:
             instruments = self._build_dynamic_universe(max_symbols=top_n)
 
         vix       = self.get_india_vix()
         lot_sizes = self.get_lot_sizes()
 
-        # ── Phase 1: serial option-chain pre-fetch with per-symbol timeout ──────
-        # jugaad-data NSELive session is reset before each symbol (prevents session
-        # flagging when NSE detects multiple rapid requests from the same client).
-        # If a symbol's option chain doesn't arrive within _OC_TIMEOUT_SECS, we skip
-        # it for this scan — it's excluded from Phase 2 naturally (cache miss → None).
-        fetched = 0
-        for sym in instruments:
-            self._jugaad = None          # fresh jugaad session per symbol
-            _ev = threading.Event()
+        # ── Phase 1: option chain pre-fetch ──────────────────────────────────────
+        if ANGEL_AVAILABLE:
+            # Angel One: parallel fetch — no Akamai, no serial bottleneck
+            logger.info("Phase 1: parallel OC fetch via Angel One (%d symbols)", len(instruments))
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                futures = {pool.submit(self.get_option_chain, sym): sym for sym in instruments}
+                fetched = sum(1 for fut in as_completed(futures) if fut.result() is not None)
+            logger.info("Phase 1 complete: %d/%d option chains fetched (Angel One)", fetched, len(instruments))
+        else:
+            # NSE scraping: serial with per-symbol timeout (Akamai blocking requires fresh sessions)
+            logger.info("Phase 1: serial OC fetch via NSE jugaad-data (%d symbols)", len(instruments))
+            fetched = 0
+            for sym in instruments:
+                self._jugaad = None
+                _ev = threading.Event()
 
-            def _oc_task(s=sym, ev=_ev):
-                try:
-                    self.get_option_chain(s)
-                except Exception as exc:
-                    logger.warning("OC pre-fetch failed [%s]: %s", s, exc)
-                finally:
-                    ev.set()
+                def _oc_task(s=sym, ev=_ev):
+                    try:
+                        self.get_option_chain(s)
+                    except Exception as exc:
+                        logger.warning("OC pre-fetch failed [%s]: %s", s, exc)
+                    finally:
+                        ev.set()
 
-            _t = threading.Thread(target=_oc_task, daemon=True)
-            _t.start()
-            if _ev.wait(timeout=_OC_TIMEOUT_SECS):
-                fetched += 1
-            else:
-                logger.warning("OC pre-fetch timeout [%s] after %ds — skipping", sym, _OC_TIMEOUT_SECS)
-            self._jugaad = None          # clean slate for next symbol regardless
+                _t = threading.Thread(target=_oc_task, daemon=True)
+                _t.start()
+                if _ev.wait(timeout=_OC_TIMEOUT_SECS):
+                    fetched += 1
+                else:
+                    logger.warning("OC pre-fetch timeout [%s] after %ds — skipping", sym, _OC_TIMEOUT_SECS)
+                self._jugaad = None
 
-        logger.info("Phase 1 complete: %d/%d option chains fetched", fetched, len(instruments))
+            logger.info("Phase 1 complete: %d/%d option chains fetched (NSE jugaad)", fetched, len(instruments))
 
-        # ── Phase 2: indicators + candidate build (parallel, reads cache only) ──
-        # Each symbol produces up to 3 candidates (ITM / ATM / OTM). Flatten all.
+        # ── Phase 2: indicators + VWAP + candidate build (parallel) ──────────────
         candidates: list[dict] = []
-        with ThreadPoolExecutor(max_workers=min(len(instruments), 6)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(instruments), 8)) as pool:
             futures = {
                 pool.submit(self._fetch_candidate, sym, vix, lot_sizes): sym
                 for sym in instruments

@@ -30,6 +30,12 @@ class Settings:
     azure_openai_deployment: str = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
     azure_openai_api_version: str = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
 
+    # Angel One SmartAPI
+    angel_api_key:     str = os.getenv("ANGEL_API_KEY", "")
+    angel_client_id:   str = os.getenv("ANGEL_CLIENT_ID", "")
+    angel_pin:         str = os.getenv("ANGEL_PIN", "")
+    angel_totp_secret: str = os.getenv("ANGEL_TOTP_SECRET", "")
+
     news_api_key: str       = os.getenv("NEWS_API_KEY", "")
 
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")

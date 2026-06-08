@@ -48,55 +48,82 @@ def is_bearish_trend(candidate):
 
 def trend_score(candidate):
     aligned = is_bullish_trend(candidate) if candidate["direction"] == "BUY" else is_bearish_trend(candidate)
-    score = 12 if aligned else 4
+    score = 11 if aligned else 3
 
-    # Supertrend confirmation (+6 when it agrees with EMA direction)
+    # Supertrend — confirms macro trend direction
     st_bullish = candidate.get("supertrendBullish", True)
     st_matches = (
         (candidate["direction"] == "BUY"  and     st_bullish) or
         (candidate["direction"] == "SELL" and not st_bullish)
     )
     if st_matches:
-        score += 6
+        score += 5
 
-    # Previous day high/low breakout — strong momentum signal
+    # Previous day high/low breakout — institutional momentum
     if candidate.get("pdBreakout"):
         score += 4
 
-    # 15-min EMA9/21 confirms daily direction — adds intraday confluence
+    # VWAP confirmation — intraday institutional bias (Angel One 5-min candles)
+    # BUY: spot > VWAP = buyers dominating all session = +4 pts
+    # SELL: spot < VWAP = sellers dominating all session = +4 pts
+    if candidate.get("vwapConfirmed"):
+        score += 4
+
+    # 15-min EMA9/21 short-term confluence
     if candidate.get("tf15Aligned"):
         score += 3
 
-    # Price action pattern
+    # Price action
     price_action = candidate["priceAction"].lower()
     if "breakout" in price_action:
-        score += 3
-    elif "retest held" in price_action:
         score += 2
+    elif "retest held" in price_action:
+        score += 1
 
     return clamp(score, 0, CATEGORY_MAX["trend"])
 
 
 def momentum_score(candidate):
     score = 0
-    if candidate["direction"] == "BUY" and 55 <= candidate["rsi"] <= 70:
-        score += 7
-    elif candidate["direction"] == "SELL" and 30 <= candidate["rsi"] <= 45:
-        score += 7
-    elif 48 < candidate["rsi"] < 55:
+    direction = candidate["direction"]
+    rsi = candidate["rsi"]
+
+    # RSI — ideal zone for option buyers (avoid chasing)
+    if direction == "BUY":
+        if 55 <= rsi <= 70:
+            score += 7   # sweet spot — trending but not overbought
+        elif 50 <= rsi < 55:
+            score += 4   # warming up
+        elif rsi > 70:
+            score += 1   # overbought — IV crush risk
+        elif rsi < 45:
+            score -= 2   # counter-trend
+    else:  # SELL
+        if 30 <= rsi <= 45:
+            score += 7   # sweet spot — trending down but not oversold
+        elif 45 < rsi <= 50:
+            score += 4
+        elif rsi < 30:
+            score += 1   # oversold — bounce risk
+        elif rsi > 55:
+            score -= 2
+
+    # MACD crossover — direction must match
+    if direction == "BUY" and candidate["macd"] > candidate["macdSignal"]:
+        score += 6
+    elif direction == "SELL" and candidate["macd"] < candidate["macdSignal"]:
+        score += 6
+
+    # ADX — trend strength (directional move quality)
+    adx = candidate["adx"]
+    if adx >= 28:
+        score += 7   # strong trending environment — options move fast
+    elif adx >= 22:
+        score += 5
+    elif adx >= 18:
         score += 3
-
-    if candidate["direction"] == "BUY" and candidate["macd"] > candidate["macdSignal"]:
-        score += 6
-    if candidate["direction"] == "SELL" and candidate["macd"] < candidate["macdSignal"]:
-        score += 6
-
-    if candidate["adx"] >= 25:
-        score += 7
-    elif candidate["adx"] >= 20:
-        score += 4
-    elif candidate["adx"] >= 16:
-        score += 2
+    elif adx >= 14:
+        score += 1
 
     return clamp(score, 0, CATEGORY_MAX["momentum"])
 
@@ -124,73 +151,92 @@ def option_chain_score(candidate):
     score = 0
     direction = candidate["direction"]
 
-    # OI change — positive = fresh contracts added in this option (CE for BUY, PE for SELL).
-    # Rising OI in the direction we're trading confirms market participants are adding positions.
+    # OI change — fresh open interest in trading direction = new money confirming the move.
+    # BUY: rising CE OI = participants opening fresh long calls or shorts covering.
+    # SELL: rising PE OI = participants opening fresh long puts.
     oi_chg = candidate["oiChangePct"]
-    if oi_chg >= 10:
-        score += 8
-    elif oi_chg >= 6:
+    if oi_chg >= 15:
+        score += 8   # very strong fresh positioning — high conviction
+    elif oi_chg >= 8:
         score += 6
-    elif oi_chg >= 3:
-        score += 3
+    elif oi_chg >= 4:
+        score += 4
+    elif oi_chg >= 1:
+        score += 2
     elif oi_chg >= 0:
         score += 1
     else:
-        score -= 2   # falling OI = unwinding, no fresh interest
+        score -= 3   # unwinding — participants exiting, no fresh interest
 
-    # PCR — directionally aware.
-    # BUY: high PCR (>1.0) means more put writing than call writing = institutions bullish
-    # SELL: low PCR (<0.9) means more call writing = institutions bearish
+    # PCR — directionally aware institutional sentiment.
+    # BUY: high PCR means put writers > call writers = institutions net bullish
+    # SELL: low PCR means call writers > put writers = institutions net bearish
     pcr = candidate["pcr"]
     if direction == "BUY":
-        if pcr >= 1.2:
-            score += 6
-        elif pcr >= 0.9:
-            score += 3
+        if pcr >= 1.3:
+            score += 6   # strongly bullish OI setup
+        elif pcr >= 1.0:
+            score += 4
+        elif pcr >= 0.8:
+            score += 2
         elif pcr < 0.7:
-            score -= 2   # very low PCR = strong bearish sentiment, contra-trade
+            score -= 3   # contra institutional positioning
     else:  # SELL
         if pcr <= 0.7:
             score += 6
-        elif pcr <= 1.0:
-            score += 3
+        elif pcr <= 0.9:
+            score += 4
+        elif pcr <= 1.1:
+            score += 2
         elif pcr > 1.3:
-            score -= 2   # very high PCR = strong bullish sentiment, contra-trade
+            score -= 3
 
-    # Max pain distance — spot far from max pain = options can move before pain pulls back
-    score += 4 if candidate["maxPainDistancePct"] >= 1.0 else 1
-
-    # Spread — tight spread = better fill, less slippage
-    if candidate["spreadPct"] <= 1.5:
+    # Max pain distance — spot far from max pain means less gravity toward pain level
+    mp_dist = candidate["maxPainDistancePct"]
+    if mp_dist >= 2.0:
         score += 3
-    elif candidate["spreadPct"] <= 2.5:
+    elif mp_dist >= 1.0:
+        score += 2
+    else:
         score += 1
 
-    # IV level — buying high-IV options is a losing edge (IV crush kills even right direction)
+    # Spread — tight spread = liquid, better execution
+    if candidate["spreadPct"] <= 1.0:
+        score += 3
+    elif candidate["spreadPct"] <= 2.0:
+        score += 2
+    elif candidate["spreadPct"] <= 3.0:
+        score += 1
+
+    # IV level — buying high-IV options means paying inflated premium (IV crush risk)
     atm_iv = candidate.get("atmIV", 0)
     if atm_iv > 0:
-        if atm_iv < 18:
-            score += 3    # cheap premium — excellent for buyers
-        elif atm_iv < 25:
+        if atm_iv < 16:
+            score += 3    # historically cheap premium — best buyer setup
+        elif atm_iv < 22:
+            score += 2
+        elif atm_iv < 30:
             score += 1    # fair value
-        elif atm_iv < 35:
-            pass          # neutral — acceptable
-        elif atm_iv < 45:
-            score -= 2    # expensive — IV crush risk
+        elif atm_iv < 40:
+            score -= 1    # elevated
+        elif atm_iv < 50:
+            score -= 3    # expensive — significant IV crush risk
         else:
-            score -= 4    # very expensive — avoid buying
+            score -= 5    # very expensive — avoid buying
 
-    # IV Rank — percentile vs 52-week history (more reliable than raw level alone)
+    # IV Rank — 52-week percentile (more reliable than raw IV level)
     iv_rank = candidate.get("ivRank")
     if iv_rank is not None:
-        if iv_rank < 20:
-            score += 3    # historically cheap IV — option buyers' sweet spot
-        elif iv_rank < 40:
+        if iv_rank < 15:
+            score += 3    # historically cheapest IV — option buyers' ideal
+        elif iv_rank < 30:
+            score += 2
+        elif iv_rank < 50:
             score += 1
-        elif iv_rank > 75:
-            score -= 3    # historically expensive premium
-        elif iv_rank > 55:
-            score -= 1
+        elif iv_rank > 80:
+            score -= 4    # at multi-month highs — avoid buying
+        elif iv_rank > 65:
+            score -= 2
 
     return clamp(score, 0, CATEGORY_MAX["optionChain"])
 

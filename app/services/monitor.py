@@ -32,7 +32,10 @@ def _market_hours() -> bool:
 
 def _get_option_price(nse_data, instrument: str) -> float | None:
     """Fetch current LTP for an option from its instrument string 'SYMBOL STRIKE TYPE'.
-    Returns None if the chain is unavailable or the strike is not found.
+
+    Priority:
+      1. Angel One ltpData/optionGreek — fast, no scraping (when credentials configured)
+      2. NSE option chain full fetch — fallback (slow, subject to Akamai blocking)
     """
     parts = instrument.strip().split()
     if len(parts) != 3:
@@ -45,6 +48,17 @@ def _get_option_price(nse_data, instrument: str) -> float | None:
     except ValueError:
         return None
 
+    # ── Primary: Angel One (fast single-strike lookup) ─────────────────────────
+    try:
+        from app.data_sources.angel import get_option_ltp, ANGEL_AVAILABLE
+        if ANGEL_AVAILABLE:
+            ltp = get_option_ltp(underlying, strike, opt_type)
+            if ltp is not None and ltp > 0:
+                return ltp
+    except Exception as exc:
+        logger.debug("Angel option LTP failed for %s: %s", instrument, exc)
+
+    # ── Fallback: full NSE option chain (slow) ─────────────────────────────────
     oc = nse_data.get_option_chain(underlying)
     if not oc:
         return None
