@@ -208,8 +208,9 @@ class NSEDataSource:
         self._session: requests.Session | None = None
         self._session_at: float = 0.0
         self._cache: dict = {}
-        self._session_lock = threading.Lock()  # one thread initialises the session at a time
-        self._jugaad: object | None = None      # jugaad-data NSELive client (lazy init)
+        self._session_lock = threading.Lock()
+        self._jugaad: object | None = None
+        self.last_nifty_direction: str | None = None  # set by get_live_candidates each scan
 
     # ── HTTP session ──────────────────────────────────────────────────────────
 
@@ -1228,6 +1229,7 @@ class NSEDataSource:
                                                   symbol="NIFTY", angel_candles=angel_nifty)
             if ind_nifty:
                 nifty_direction = "BUY" if ind_nifty["ema20"] > ind_nifty["ema200"] else "SELL"
+                self.last_nifty_direction = nifty_direction
                 logger.info("NIFTY master direction: %s (EMA20=%.0f EMA200=%.0f)",
                             nifty_direction, ind_nifty["ema20"], ind_nifty["ema200"])
         except Exception as exc:

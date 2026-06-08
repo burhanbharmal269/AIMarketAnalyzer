@@ -11,7 +11,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from app.config import BASE_DIR, settings
-from app.services.ai import ai_status, generate_market_summary, generate_trade_explanation, openai_enabled
+from app.services.ai import (
+    ai_status,
+    generate_market_summary,
+    generate_trade_explanation,
+    get_batch_news_sentiment,
+    get_market_regime_ai,
+    openai_enabled,
+)
 from app.services.backtest import backtest_snapshot
 from app.services.scanner import CATEGORY_MAX, scan_market
 from app.services.storage import (
@@ -201,8 +208,10 @@ def _live_data():
     from app.data_sources.nse import nse_data
     market     = nse_data.get_market_snapshot()
     candidates = nse_data.get_live_candidates()
-    # Empty candidates is valid — it means no symbols passed the trend-alignment filter
-    # today (mixed market). Do NOT treat this as an error; scanner returns 0 approved.
+    # Bubble NIFTY direction up into the market dict so signal_log and AI regime
+    # classification can reference it without re-computing.
+    if nse_data.last_nifty_direction:
+        market["niftyDirection"] = nse_data.last_nifty_direction
     return candidates, market
 
 
@@ -252,6 +261,33 @@ def _auto_paper_trade(item: dict, signal_id: int | None = None) -> None:
 def build_scan(settings_payload: dict | None = None, persist: bool = True) -> dict:
     """Run a live market scan. Raises RuntimeError if NSE data is unavailable."""
     candidates, market = _live_data()   # raises — no silent sample fallback
+
+    # ── AI pre-scan: regime classification ───────────────────────────────────
+    # One API call before scoring runs. Injects aiAction/aiRegime/aiBias into
+    # market dict so sentiment_score() and hard_gate_failures() can use them.
+    if openai_enabled():
+        try:
+            regime = get_market_regime_ai(market)
+            market.update(regime)
+            logger.info("AI regime injected: action=%s regime=%s",
+                        regime.get("aiAction"), regime.get("aiRegime"))
+        except Exception as exc:
+            logger.warning("AI regime skipped: %s", exc)
+
+    # ── AI pre-scan: news sentiment for all unique underlyings ────────────────
+    # One batched API call covers all 40 symbols. Result injected as newsSentiment
+    # field on each candidate so news_score() in scanner.py can read it.
+    if openai_enabled():
+        try:
+            from app.data_sources.news import get_headlines
+            underlyings = list({c.get("underlying", "") for c in candidates if c.get("underlying")})
+            symbol_headlines = {sym: get_headlines(sym) for sym in underlyings}
+            sentiments = get_batch_news_sentiment(symbol_headlines)
+            for c in candidates:
+                c["newsSentiment"] = sentiments.get(c.get("underlying", ""), 0)
+            logger.info("News sentiment injected for %d underlyings", len(sentiments))
+        except Exception as exc:
+            logger.warning("News sentiment skipped: %s", exc)
 
     risk_pct   = (settings_payload or {}).get("riskPercent", 2.0)
     risk_state = compute_risk_state(risk_pct=risk_pct)

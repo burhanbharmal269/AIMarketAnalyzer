@@ -3,12 +3,13 @@ from zoneinfo import ZoneInfo
 
 
 CATEGORY_MAX = {
-    "trend": 30,   # +5 headroom for S/R breakout and gap scoring
-    "momentum": 20,
-    "volume": 15,
+    "trend":       30,   # +5 headroom for S/R breakout and gap scoring
+    "momentum":    20,
+    "volume":      15,
     "optionChain": 20,
-    "sentiment": 10,
-    "riskReward": 10,
+    "sentiment":   10,
+    "riskReward":  10,
+    "news":         5,   # AI news sentiment — directional news alignment bonus/penalty
 }
 
 
@@ -269,32 +270,63 @@ def option_chain_score(candidate):
     return clamp(score, 0, CATEGORY_MAX["optionChain"])
 
 
+def news_score(candidate):
+    """Score based on AI-classified news sentiment for the underlying.
+
+    Sentiment is -3…+3, set by get_batch_news_sentiment() in build_scan.
+    Positive sentiment aligns with BUY, negative sentiment aligns with SELL.
+    Returns 0 when no sentiment data is available (AI not configured).
+    """
+    raw = candidate.get("newsSentiment")
+    if raw is None:
+        return 0   # AI not configured or news unavailable — no score impact
+    direction = candidate["direction"]
+    # Align sign: positive sentiment helps BUY, negative sentiment helps SELL
+    effective = raw if direction == "BUY" else -raw
+    if effective >= 2:   return 5    # strong tailwind — news confirms direction
+    if effective >= 1:   return 3    # mild positive alignment
+    if effective == 0:   return 1    # neutral news — slight positive (no headwinds)
+    if effective == -1:  return -1   # mild headwind — reduce confidence
+    return -3                        # strong contra-directional news — significant penalty
+
+
 def sentiment_score(candidate, market):
     score = candidate.get("marketSentiment", 0)
     vix = market["indiaVix"]
     # Progressive VIX penalty — calm markets get a bonus, elevated markets lose points.
-    # This works in tandem with the VIX-adjusted SL in nse.py: high VIX already widens
-    # the SL (reducing RR and lots), so the scoring penalty adds a second filter layer.
     if vix <= 14:
         score += 3    # very calm trending environment
     elif vix <= 16:
         score += 1    # normal
     elif vix <= 18:
-        score += 0    # neutral — no bonus, no penalty
+        score += 0    # neutral
     elif vix <= 20:
         score -= 2    # elevated — trade only high-conviction setups
     else:             # 20–22  (above 22 = hard gate, never reaches here)
-        score -= 4    # high risk environment — very few signals should pass
-    # Market breadth — when majority of stocks agree with direction, move is genuine
+        score -= 4    # high risk environment
+
+    # Market breadth
     breadth = market.get("breadth", 1.0)
     if breadth >= 1.5:
-        score += 3   # strongly broad-based move — highest conviction
+        score += 3
     elif breadth >= 1.2:
         score += 2
     elif breadth >= 1.0:
         score += 1
     elif breadth < 0.8:
-        score -= 1   # narrow or contra-breadth — index move driven by few stocks
+        score -= 1
+
+    # AI market regime bonus/penalty — AI-classified action overrides rule-based bias
+    # when AI is configured. "trade_full" = high-conviction day; "avoid" is a hard gate
+    # (handled in hard_gate_failures), so we only need intermediate cases here.
+    ai_action = market.get("aiAction")
+    if ai_action == "trade_full":
+        score += 3   # AI confirms ideal trading conditions
+    elif ai_action == "trade_reduced":
+        score -= 1   # AI suggests caution — reduce confidence slightly
+    elif ai_action == "selective":
+        score -= 2   # AI recommends only the strongest setups
+
     return clamp(score, 0, CATEGORY_MAX["sentiment"])
 
 
@@ -311,12 +343,13 @@ def risk_reward_score(candidate):
 
 def score_candidate(candidate, market):
     scores = {
-        "trend": trend_score(candidate),
-        "momentum": momentum_score(candidate),
-        "volume": volume_score(candidate),
+        "trend":       trend_score(candidate),
+        "momentum":    momentum_score(candidate),
+        "volume":      volume_score(candidate),
         "optionChain": option_chain_score(candidate),
-        "sentiment": sentiment_score(candidate, market),
-        "riskReward": risk_reward_score(candidate),
+        "sentiment":   sentiment_score(candidate, market),
+        "riskReward":  risk_reward_score(candidate),
+        "news":        news_score(candidate),
     }
     return {"scores": scores, "total": sum(scores.values())}
 
@@ -354,6 +387,12 @@ def hard_gate_failures(candidate, market, risk_state, settings):
         failures.append("Major event risk is too close or manually flagged.")
     if market["indiaVix"] >= 22:
         failures.append("India VIX is elevated beyond directional buying threshold.")
+
+    # AI regime gate — only fires when AI is configured and explicitly classifies
+    # the day as untradeable. Not triggered when AI is absent (aiAction == None).
+    if market.get("aiAction") == "avoid":
+        reason = market.get("aiReason", "AI classified current conditions as untradeable.")
+        failures.append(f"AI regime gate: {reason}")
 
     # Time-of-day gate — avoid opening chop and closing volatility
     now_ist     = datetime.now(ZoneInfo("Asia/Kolkata"))

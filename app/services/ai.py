@@ -1,11 +1,14 @@
+import json
 import logging
+import re
 from datetime import date
 
 from app.config import settings
 
-# ── explanation cache ─────────────────────────────────────────────────────────
-# Keyed by (instrument, score_bucket, date). Cleared naturally each new trading day.
-_EXPLANATION_CACHE: dict = {}
+# ── caches — all keyed with today's date so they reset each trading day ───────
+_EXPLANATION_CACHE: dict = {}   # (instrument, score_bucket, date) -> str
+_SENTIMENT_CACHE:   dict = {}   # (symbol, date) -> int  (-3…+3)
+_REGIME_CACHE:      dict = {}   # date -> dict
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,154 @@ def _call(system: str, user: str, max_tokens: int = 400) -> str | None:
 
 # ── public functions ──────────────────────────────────────────────────────────
 
+def get_batch_news_sentiment(symbol_headlines: dict[str, list[str]]) -> dict[str, int]:
+    """Score news sentiment for multiple symbols in ONE API call.
+
+    Returns {symbol: score} where score is -3 (very bearish) to +3 (very bullish).
+    Cached per (symbol, date) — at most 1 call per symbol per trading day.
+    Symbols with cached scores are excluded from the API call.
+    Falls back to {} when AI is not configured — callers default missing symbols to 0.
+
+    One batched call instead of 40 individual calls keeps cost negligible.
+    """
+    if not openai_enabled() or not symbol_headlines:
+        return {}
+
+    today = date.today().isoformat()
+    result: dict[str, int] = {}
+    uncached: dict[str, list[str]] = {}
+
+    for sym, headlines in symbol_headlines.items():
+        key = (sym, today)
+        if key in _SENTIMENT_CACHE:
+            result[sym] = _SENTIMENT_CACHE[key]
+        elif headlines:
+            uncached[sym] = headlines
+
+    if not uncached:
+        return result
+
+    news_block = ""
+    for sym, headlines in uncached.items():
+        news_block += f"\n{sym}:\n" + "\n".join(f"  - {h}" for h in headlines[:3])
+
+    system = (
+        "You are a financial news sentiment scorer for Indian equity markets. "
+        "Reply with valid JSON only — no prose, no markdown."
+    )
+    user = (
+        "Rate the net news sentiment for each symbol from a short-term F&O trader's perspective.\n"
+        "Scale: -3 very bearish, -2 bearish, -1 slightly bearish, "
+        "0 neutral/no news, +1 slightly bullish, +2 bullish, +3 very bullish.\n"
+        f"News:{news_block}\n\n"
+        f"Reply as JSON object: {{\"SYMBOL\": score, ...}} for every symbol listed."
+    )
+
+    raw = _call(system, user, max_tokens=250)
+    if raw:
+        try:
+            # Extract first JSON object from response (handles markdown code fences)
+            match = re.search(r"\{[^{}]+\}", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                for sym, val in parsed.items():
+                    try:
+                        score = max(-3, min(3, int(val)))
+                    except (TypeError, ValueError):
+                        score = 0
+                    result[sym] = score
+                    _SENTIMENT_CACHE[(sym, today)] = score
+                logger.info("News sentiment scored: %d symbols", len(parsed))
+        except Exception as exc:
+            logger.warning("Sentiment parse failed: %s | raw=%s", exc, raw[:120])
+
+    # Cache zeros for symbols where AI gave no response (avoid re-fetching)
+    for sym in uncached:
+        if (sym, today) not in _SENTIMENT_CACHE:
+            _SENTIMENT_CACHE[(sym, today)] = 0
+            result.setdefault(sym, 0)
+
+    return result
+
+
+def get_market_regime_ai(market: dict) -> dict:
+    """AI-classified pre-scan market regime. Called once per scan, cached for the day.
+
+    Returns a structured regime dict that feeds into:
+      - sentiment_score()  bonus/penalty based on aiAction
+      - hard_gate_failures() blocks the full scan when aiAction == 'avoid'
+
+    Regime classification is more nuanced than rule-based VIX thresholds because
+    it combines VIX level, breadth, event calendar, and live news context together.
+    """
+    _safe = {
+        "aiRegime": None, "aiBias": None,
+        "aiRisk":   None, "aiAction": None,
+    }
+    if not openai_enabled():
+        return _safe
+
+    today = date.today().isoformat()
+    if today in _REGIME_CACHE:
+        return _REGIME_CACHE[today]
+
+    # Pull up to 3 market headlines for context
+    try:
+        from app.data_sources.news import get_market_headlines
+        headlines = get_market_headlines(max_results=3)
+    except Exception:
+        headlines = []
+
+    news_block = ("\nLive headlines:\n" + "\n".join(f"  - {h}" for h in headlines)
+                  if headlines else "")
+
+    events = [e["name"] for e in market.get("eventCalendar", [])
+              if e.get("minutesAway", 9999) <= 240]   # events within 4 hours
+
+    system = (
+        "You are a market regime classifier for Indian F&O intraday traders. "
+        "Reply with valid JSON only — no prose, no markdown."
+    )
+    user = (
+        f"India VIX: {market.get('indiaVix')}\n"
+        f"Advance/Decline ratio: {market.get('breadth')}\n"
+        f"Rule-based regime: {market.get('regime')}\n"
+        f"Upcoming events (within 4h): {events}\n"
+        f"{news_block}\n\n"
+        "Classify the current market environment for directional F&O option buying.\n"
+        "Reply as JSON:\n"
+        '{"regime": "trending_bull|trending_bear|range_bound|volatile",\n'
+        ' "bias": "strong_long|long|neutral|short|strong_short",\n'
+        ' "risk": "low|medium|high",\n'
+        ' "action": "trade_full|trade_reduced|selective|avoid",\n'
+        ' "reason": "one sentence max"}'
+    )
+
+    raw = _call(system, user, max_tokens=150)
+    regime_data = _safe.copy()
+    if raw:
+        try:
+            match = re.search(r"\{[^{}]+\}", raw, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+                regime_data = {
+                    "aiRegime": parsed.get("regime"),
+                    "aiBias":   parsed.get("bias"),
+                    "aiRisk":   parsed.get("risk"),
+                    "aiAction": parsed.get("action"),
+                    "aiReason": parsed.get("reason"),
+                }
+                logger.info(
+                    "AI regime: %s | bias: %s | action: %s",
+                    regime_data["aiRegime"], regime_data["aiBias"], regime_data["aiAction"],
+                )
+        except Exception as exc:
+            logger.warning("Regime parse failed: %s | raw=%s", exc, raw[:120])
+
+    _REGIME_CACHE[today] = regime_data
+    return regime_data
+
+
 def generate_trade_explanation(candidate: dict, score: dict, market: dict) -> str:
     """Per-trade AI analysis with live news context. Falls back to rule-based text.
 
@@ -120,12 +271,12 @@ def generate_trade_explanation(candidate: dict, score: dict, market: dict) -> st
         "holds the entry structure and event risk does not change."
     )
 
-    # Only use AI for top-tier signals — borderline signals (72–79) use rule text
-    if not openai_enabled() or score["total"] < 80:
+    # AI explanation for all approved signals (score >= 75).
+    # Borderline signals (70-74) often need the most context — rule text alone is weak.
+    if not openai_enabled() or score["total"] < 75:
         return rule_text
 
-    # Cache key: same instrument + score band + calendar date = same analysis
-    score_bucket = (score["total"] // 5) * 5   # bucket into 5-point bands: 80,85,90…
+    score_bucket = (score["total"] // 5) * 5
     cache_key = (candidate["instrument"], score_bucket, date.today().isoformat())
     if cache_key in _EXPLANATION_CACHE:
         logger.debug("AI explanation cache hit: %s", cache_key)
@@ -140,50 +291,71 @@ def generate_trade_explanation(candidate: dict, score: dict, market: dict) -> st
 
     system = (
         "You are a professional Indian F&O trader assistant. "
-        "You receive structured market data and return concise trade analysis. "
-        "Factual only. No generic disclaimers."
+        "Receive structured signal data and give a concise, factual trade analysis. "
+        "No generic disclaimers. Reference specific numbers from the data."
     )
 
-    # Structured JSON input — clean signal data as recommended in system design
-    import json
     signal_data = {
-        "instrument":    candidate["instrument"],
-        "direction":     candidate["direction"],
-        "score":         score["total"],
-        "entry":         candidate["entry"],
-        "stop_loss":     candidate["stopLoss"],
-        "targets":       candidate["targets"],
-        "spot":          round(candidate.get("ema20", 0)),   # proxy when spot not directly in candidate
-        "vwap":          candidate.get("vwap"),
-        "vwap_above":    candidate.get("vwapConfirmed", False),
-        "volume_spike":  candidate.get("volumeSpike", False),
-        "rel_volume":    candidate.get("relativeVolume"),
-        "rsi":           round(candidate["rsi"], 1),
-        "adx":           round(candidate["adx"], 1),
-        "macd_bullish":  candidate["macd"] > candidate["macdSignal"],
-        "supertrend":    "bull" if candidate.get("supertrendBullish") else "bear",
-        "pdh_breakout":  candidate.get("pdBreakout", False),
-        "tf15_aligned":  candidate.get("tf15Aligned", False),
-        "oi_change_pct": candidate["oiChangePct"],
-        "pcr":           candidate["pcr"],
-        "atm_iv":        candidate.get("atmIV"),
-        "iv_rank":       candidate.get("ivRank"),
-        "atr":           round(candidate.get("adx", 0)),     # reuse adx as proxy
-        "max_pain_dist": candidate.get("maxPainDistancePct"),
-        "dte":           candidate.get("dte"),
-        "expiry_type":   candidate.get("expiry"),
-        "vix":           market["indiaVix"],
-        "market_regime": market["regime"],
-        "breadth":       market.get("breadth"),
+        "instrument":       candidate["instrument"],
+        "direction":        candidate["direction"],
+        "score":            score["total"],
+        "score_breakdown":  score.get("scores", {}),
+        "entry":            candidate["entry"],
+        "stop_loss":        candidate["stopLoss"],
+        "targets":          candidate["targets"],
+        "rr":               candidate.get("rr"),
+        "spot":             candidate.get("spotPrice") or candidate.get("ema20"),
+        # Trend
+        "ema20_vs_200":     f"{candidate.get('ema20')} vs {candidate.get('ema200')}",
+        "supertrend":       "bull" if candidate.get("supertrendBullish") else "bear",
+        "pdh_breakout":     candidate.get("pdBreakout", False),
+        "gap_up":           candidate.get("gapUp", False),
+        "gap_down":         candidate.get("gapDown", False),
+        "gap_pct":          candidate.get("gapPct", 0),
+        "sr_breakout":      candidate.get("srBreakout", False),
+        "near_resistance":  candidate.get("nearResistance", False),
+        "resistance":       candidate.get("resistance"),
+        "support":          candidate.get("support"),
+        # Momentum
+        "rsi":              round(candidate["rsi"], 1),
+        "adx":              round(candidate["adx"], 1),
+        "macd_bullish":     candidate["macd"] > candidate["macdSignal"],
+        "tf15_aligned":     candidate.get("tf15Aligned", False),
+        # Volume / VWAP
+        "vwap":             candidate.get("vwap"),
+        "vwap_confirmed":   candidate.get("vwapConfirmed", False),
+        "rel_volume":       candidate.get("relativeVolume"),
+        "volume_spike":     candidate.get("volumeSpike", False),
+        # Option chain
+        "atm_iv":           candidate.get("atmIV"),
+        "iv_rank":          candidate.get("ivRank"),
+        "pcr":              candidate.get("pcr"),
+        "oi_change_pct":    candidate.get("oiChangePct"),
+        "max_pain_dist":    candidate.get("maxPainDistancePct"),
+        "dte":              candidate.get("dte"),
+        "expiry_type":      candidate.get("expiry"),
+        "spread_pct":       candidate.get("spreadPct"),
+        # Greeks
+        "delta":            candidate.get("delta"),
+        "theta_per_day":    candidate.get("theta"),
+        # Market context
+        "vix":              market["indiaVix"],
+        "market_regime":    market.get("regime"),
+        "ai_regime":        market.get("aiRegime"),
+        "ai_action":        market.get("aiAction"),
+        "breadth":          market.get("breadth"),
+        "news_sentiment":   candidate.get("newsSentiment"),
     }
 
     user = (
         f"Signal data:\n{json.dumps(signal_data, indent=2)}"
         f"{news_block}\n\n"
-        "Respond in exactly 3 sections (2 lines each):\n"
-        "WHY THIS TRADE:\nWHY IT COULD FAIL:\nKEY RISKS:"
+        "Respond in exactly 3 labelled sections (2 sentences each):\n"
+        "WHY THIS TRADE:\n"
+        "WHY IT COULD FAIL:\n"
+        "KEY RISKS:"
     )
-    result = _call(system, user, max_tokens=300)
+    result = _call(system, user, max_tokens=320)
     text = result if result else rule_text
     _EXPLANATION_CACHE[cache_key] = text
     return text
