@@ -25,10 +25,11 @@ _BT_SYMBOLS = {
     "SBIN":      "SBIN.NS",
 }
 
-_LOOKBACK = "180d"
-_INTERVAL = "1d"
-# ATR multiplier for stop: 1.5× ATR is a realistic ATM option stop distance
-_ATR_STOP_MULT = 1.5
+from app.core.constants import BACKTEST_LOOKBACK, BACKTEST_INTERVAL, ATR_STOP_MULT
+
+_LOOKBACK      = BACKTEST_LOOKBACK
+_INTERVAL      = BACKTEST_INTERVAL
+_ATR_STOP_MULT = ATR_STOP_MULT
 
 
 # ── data loading ──────────────────────────────────────────────────────────────

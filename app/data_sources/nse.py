@@ -6,9 +6,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date as _date, datetime
 from zoneinfo import ZoneInfo
 
-# Max seconds to wait for a single option chain fetch before skipping that symbol.
-# At 15s, a 12-symbol scan completes in ≤180s worst-case; most symbols finish in 5-10s.
-_OC_TIMEOUT_SECS = 15
+from app.core.constants import NSE_BASE, NSE_API_BASE, OC_TIMEOUT_SECS, EARNINGS_WINDOW_DAYS
+
+_OC_TIMEOUT_SECS = OC_TIMEOUT_SECS
 
 import requests
 
@@ -33,8 +33,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
-_NSE_BASE = "https://www.nseindia.com"
-_NSE_API = f"{_NSE_BASE}/api"
+_NSE_BASE = NSE_BASE
+_NSE_API  = NSE_API_BASE
 
 _HEADERS = {
     "Host": "www.nseindia.com",
@@ -1876,7 +1876,7 @@ class NSEDataSource:
         result = self._cached("breadth", fetch)
         return result if result is not None else 1.0
 
-    def _has_upcoming_earnings(self, symbol: str, days: int = 2) -> bool:
+    def _has_upcoming_earnings(self, symbol: str, days: int = EARNINGS_WINDOW_DAYS) -> bool:
         """True if symbol has a financial-results board meeting within `days` calendar days."""
         try:
             cal = self.get_earnings_calendar()

@@ -60,8 +60,10 @@ try:
 except ImportError:
     _PANDAS = False
 
-_SESSION_TTL      = 23 * 3600   # refresh before 24h JWT expiry
-_RATE_LIMIT_SLEEP = 0.35        # Angel One allows ~3 req/sec (1 call per 0.35s)
+from app.core.constants import ANGEL_SESSION_TTL_SECS, ANGEL_RATE_LIMIT_SLEEP
+
+_SESSION_TTL      = ANGEL_SESSION_TTL_SECS
+_RATE_LIMIT_SLEEP = ANGEL_RATE_LIMIT_SLEEP
 
 # Global rate limiter — prevents burst violations when 8 threads fire simultaneously.
 # Per-function time.sleep() doesn't help in parallel scans: each thread sleeps 0.35s

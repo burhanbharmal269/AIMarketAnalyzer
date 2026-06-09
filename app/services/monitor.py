@@ -17,9 +17,16 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
+from app.core.constants import (
+    MONITOR_INTERVAL_SECS, WATCHDOG_INTERVAL_SECS,
+    MARKET_OPEN_H, MARKET_OPEN_M, MARKET_CLOSE_H, MARKET_CLOSE_M,
+    MAX_PNL_LOSS_CAP, MAX_PNL_WIN_CAP,
+    TIME_EXIT_H, TIME_EXIT_M,
+)
+
 IST             = ZoneInfo("Asia/Kolkata")
-_INTERVAL_SECS    = 60    # 1-minute polling
-_WATCHDOG_SECS    = 900   # NSE session health check every 15 min
+_INTERVAL_SECS  = MONITOR_INTERVAL_SECS
+_WATCHDOG_SECS  = WATCHDOG_INTERVAL_SECS
 _alerted: set     = set() # (entry_id, "t1"|"t2"|"sl") already sent this session
 _monitor_started  = False
 _watchdog_started = False
@@ -27,7 +34,7 @@ _watchdog_started = False
 
 def _market_hours() -> bool:
     now = datetime.now(IST)
-    return (9, 15) <= (now.hour, now.minute) <= (15, 30)
+    return (MARKET_OPEN_H, MARKET_OPEN_M) <= (now.hour, now.minute) <= (MARKET_CLOSE_H, MARKET_CLOSE_M)
 
 
 def _get_option_price(nse_data, instrument: str) -> float | None:
@@ -146,7 +153,7 @@ def _check_positions(nse_data, send_fn) -> None:
         if sl_px > 0 and current <= sl_px and (eid, "sl") not in _alerted:
             _alerted.add((eid, "sl"))
             pnl_r = _pnl(current)
-            final_pnl = max(pnl_r, -3.0)
+            final_pnl = max(pnl_r, MAX_PNL_LOSS_CAP)
             update_journal_entry(eid, {
                 "status":     "closed",
                 "outcome":    "loss",
@@ -165,7 +172,7 @@ def _check_positions(nse_data, send_fn) -> None:
             for lvl in ("t1", "t2", "t3"):
                 _alerted.add((eid, lvl))
             pnl_r = _pnl(current)
-            final_pnl = min(pnl_r, 5.0)
+            final_pnl = min(pnl_r, MAX_PNL_WIN_CAP)
             update_journal_entry(eid, {
                 "status":     "closed",
                 "outcome":    "win",
@@ -184,7 +191,7 @@ def _check_positions(nse_data, send_fn) -> None:
             for lvl in ("t1", "t2", "t3"):   # mark all — position is fully closed
                 _alerted.add((eid, lvl))
             pnl_r = _pnl(current)
-            final_pnl = min(pnl_r, 5.0)
+            final_pnl = min(pnl_r, MAX_PNL_WIN_CAP)
             update_journal_entry(eid, {
                 "status":     "closed",
                 "outcome":    "win",
@@ -223,8 +230,8 @@ def _check_positions(nse_data, send_fn) -> None:
         # If open past 14:15 IST with NO T1 hit, theta acceleration outweighs holding.
         # Trades where T1 was already hit have stop at breakeven — they stay open to T2/T3.
         elif (
-            (datetime.now(IST).hour > 14
-             or (datetime.now(IST).hour == 14 and datetime.now(IST).minute >= 15))
+            (datetime.now(IST).hour > TIME_EXIT_H
+             or (datetime.now(IST).hour == TIME_EXIT_H and datetime.now(IST).minute >= TIME_EXIT_M))
             and (eid, "t1")        not in _alerted
             and (eid, "time_exit") not in _alerted
         ):

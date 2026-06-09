@@ -1,680 +1,73 @@
-from datetime import datetime, timedelta, time as dtime  # timedelta used in signal_valid_until
-from zoneinfo import ZoneInfo
+"""Public scanning API — thin delegator.
+
+All business logic lives in:
+  app/services/strategies/  — scan orchestration + position sizing
+  app/services/scoring/     — per-category scoring classes
+  app/services/gates/       — per-rule hard gates
+
+This file preserves the original public surface so every existing import
+(main.py, tests, scripts) works without any changes.
+"""
+from __future__ import annotations
+
+from app.core.constants import SCORE_CATEGORIES, SCORE_MAX_RAW, DEFAULT_SCAN_SETTINGS
+from app.services.strategies.options import OptionsTradingStrategy
+
+# ── Backward-compatible aliases ───────────────────────────────────────────────
+CATEGORY_MAX   = SCORE_CATEGORIES
+_SCORE_MAX_RAW = SCORE_MAX_RAW
+DEFAULT_SETTINGS = DEFAULT_SCAN_SETTINGS
+
+# ── Singleton strategy ────────────────────────────────────────────────────────
+_options_strategy = OptionsTradingStrategy()
 
 
-CATEGORY_MAX = {
-    "trend":       33,   # +3 for 15-min Supertrend (Angel One intraday)
-    "momentum":    23,   # +3 for MACD histogram expansion
-    "volume":      15,
-    "optionChain": 20,
-    "sentiment":   10,
-    "riskReward":  10,
-    "news":         5,   # AI news sentiment — directional news alignment bonus/penalty
-}
-
-# Raw scores sum to 116 max (was 110 before 15-min ST + MACD histogram were added).
-# Normalised to 100 so UI, minScore, and comparisons are consistent.
-# minScore=70 → raw threshold ≈ 81/116.  Previous: raw ≈ 77/110.
-# The ~4-point rise in the raw bar is intentional: new signals raise the quality floor.
-_SCORE_MAX_RAW = sum(CATEGORY_MAX.values())   # 116
-
-
-DEFAULT_SETTINGS = {
-    "accountCapital": 100000,  # 1 lakh — realistic F&O minimum (30K can't fund even 1 NIFTY lot)
-    "riskPercent": 2,
-    "maxSpread": 1.5,
-    "minVolume": 25000,   # 25K min option volume — 50K was too high for equities (blocked all signals)
-    "eventWindow": 60,
-    "lossStreak": 0,
-    "maxDailyLossPct": 3,
-    "maxWeeklyDrawdownPct": 8,
-    "maxMonthlyDrawdownPct": 15,
-    "minScore": 70,   # 70/100 quality floor — 72 was blocking valid setups; hard gates unchanged
-    "maxSignals": 5,
-}
-
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def merged_settings(settings):
-    merged = DEFAULT_SETTINGS.copy()
+def scan_market(
+    candidates: list[dict],
+    market: dict,
+    risk_state: dict,
+    settings: dict | None = None,
+) -> dict:
+    """Run the full options scan.  settings overrides DEFAULT_SETTINGS keys."""
+    merged = DEFAULT_SCAN_SETTINGS.copy()
     if settings:
-        merged.update({key: value for key, value in settings.items() if value is not None})
-    return merged
+        merged.update({k: v for k, v in settings.items() if v is not None})
+    return _options_strategy.run_scan(candidates, market, risk_state, merged)
 
 
-def is_bullish_trend(candidate):
-    return candidate["ema20"] > candidate["ema50"] > candidate["ema200"]
+# ── Utility functions (called by main.py / telegram.py) ──────────────────────
 
+def build_risks(candidate: dict, market: dict) -> list[str]:
+    return OptionsTradingStrategy._build_risks(candidate, market)
 
-def is_bearish_trend(candidate):
-    return candidate["ema20"] < candidate["ema50"] < candidate["ema200"]
 
-
-def trend_score(candidate):
-    aligned = is_bullish_trend(candidate) if candidate["direction"] == "BUY" else is_bearish_trend(candidate)
-    score = 11 if aligned else 3
-
-    # Supertrend — confirms macro trend direction
-    st_bullish = candidate.get("supertrendBullish", True)
-    st_matches = (
-        (candidate["direction"] == "BUY"  and     st_bullish) or
-        (candidate["direction"] == "SELL" and not st_bullish)
-    )
-    if st_matches:
-        score += 5
-
-    # Previous day high/low breakout — institutional momentum
-    if candidate.get("pdBreakout"):
-        score += 4
-
-    # VWAP confirmation — intraday institutional bias (Angel One 5-min candles)
-    # BUY: spot > VWAP = buyers have dominated all session = +6 pts
-    # SELL: spot < VWAP = sellers have dominated all session = +6 pts
-    # Also bonus +2 if there's an explicit volume spike confirming the VWAP move
-    if candidate.get("vwapConfirmed"):
-        score += 6
-        if candidate.get("volumeSpike"):
-            score += 2
-
-    # 15-min EMA9/21 — primary intraday signal (RSI/MACD also computed from 15-min)
-    if candidate.get("tf15Aligned"):
-        score += 3
-
-    # 30-min EMA5/EMA10 — macro intraday trend gate
-    # All 3 timeframes aligned (15-min + 30-min + daily) = high-conviction multi-TF setup
-    if candidate.get("tf30Aligned"):
-        score += 2
-        if candidate.get("tf15Aligned"):
-            score += 1   # 3-TF confluence bonus: 15m + 30m + daily all agree
-
-    # S/R breakout — spot cleared a former swing-high resistance (confirmed by daily OHLCV).
-    # Multi-touch breakouts (level tested 2+ times) score higher: more institutional memory
-    # = more sellers trapped above = stronger follow-through when level breaks.
-    if candidate.get("srBreakout"):
-        touches = (
-            candidate.get("resistanceTouches", 0) if candidate["direction"] == "BUY"
-            else candidate.get("supportTouches", 0)
-        )
-        score += 4 if touches >= 2 else 2   # 4 pts for proven multi-touch breakout
-    if candidate["direction"] == "BUY" and candidate.get("nearResistance"):
-        score -= 2   # approaching overhead supply — exit risk
-    if candidate["direction"] == "SELL" and candidate.get("nearSupport"):
-        score -= 2   # approaching demand zone — bounce risk
-
-    # Opening gap in trade direction — institutional overnight positioning confirms move
-    if candidate["direction"] == "BUY"  and candidate.get("gapUp"):
-        score += 2
-    if candidate["direction"] == "SELL" and candidate.get("gapDown"):
-        score += 2
-
-    # Price action
-    price_action = candidate["priceAction"].lower()
-    if "breakout" in price_action:
-        score += 2
-    elif "retest held" in price_action:
-        score += 1
-
-    # 15-min Supertrend — intraday structure confirmation (Angel One 5-min → resampled).
-    # Complements the daily ST: daily sets the macro bias, 15-min validates intraday entry.
-    # Only fires when Angel One candles are available (st15Bullish is None on daily fallback).
-    st15 = candidate.get("st15Bullish")
-    if st15 is not None:
-        st15_matches = (candidate["direction"] == "BUY" and st15) or \
-                       (candidate["direction"] == "SELL" and not st15)
-        score += 3 if st15_matches else -2
-
-    # Opening Range Breakout — spot cleared the first 15-min auction range.
-    # Breakout = institutional participation beyond the opening price discovery zone.
-    # Only available from Angel One 5-min candles (orHigh/orLow absent on daily fallback).
-    if candidate.get("orbBreakout"):
-        score += 3
-    elif candidate.get("orbAgainst"):
-        score -= 2   # trading against the OR direction — counter-trend risk
-
-    return clamp(score, 0, CATEGORY_MAX["trend"])
-
-
-def momentum_score(candidate):
-    score = 0
-    direction = candidate["direction"]
-    rsi = candidate["rsi"]
-
-    # RSI — ideal zone for option buyers (avoid chasing)
-    if direction == "BUY":
-        if 55 <= rsi <= 70:
-            score += 7   # sweet spot — trending but not overbought
-        elif 50 <= rsi < 55:
-            score += 4   # warming up
-        elif rsi > 70:
-            score += 1   # overbought — IV crush risk
-        elif rsi < 45:
-            score -= 2   # counter-trend
-    else:  # SELL
-        if 30 <= rsi <= 45:
-            score += 7   # sweet spot — trending down but not oversold
-        elif 45 < rsi <= 50:
-            score += 4
-        elif rsi < 30:
-            score += 1   # oversold — bounce risk
-        elif rsi > 55:
-            score -= 2
-
-    # MACD crossover — direction must match
-    if direction == "BUY" and candidate["macd"] > candidate["macdSignal"]:
-        score += 6
-    elif direction == "SELL" and candidate["macd"] < candidate["macdSignal"]:
-        score += 6
-
-    # MACD histogram expansion — momentum building vs fading.
-    # Expanding histogram (gap between MACD and signal growing) = trend accelerating.
-    # Contracting histogram that is < 10% of MACD value = crossover imminent, stalling.
-    # hist == 0.0 means no intraday data (daily fallback) — no penalty applied.
-    hist = candidate.get("macdHistogram", 0.0)
-    macd_abs = abs(candidate.get("macd", 0.0))
-    if candidate.get("macdHistExpanding") and hist != 0.0:
-        if (direction == "BUY" and hist > 0) or (direction == "SELL" and hist < 0):
-            score += 3   # momentum building in trade direction
-    elif hist != 0.0 and macd_abs > 0 and abs(hist) < 0.10 * macd_abs:
-        score -= 1   # histogram shrinking toward zero = momentum fading, avoid entering
-
-    # ADX — trend strength (directional move quality)
-    adx = candidate["adx"]
-    if adx >= 28:
-        score += 7   # strong trending environment — options move fast
-    elif adx >= 22:
-        score += 5
-    elif adx >= 18:
-        score += 3
-    elif adx >= 14:
-        score += 1
-
-    # ADX direction — rising ADX means trend is strengthening, not exhausting
-    if candidate.get("adxRising") and adx >= 18:
-        score += 2
-
-    return clamp(score, 0, CATEGORY_MAX["momentum"])
-
-
-def volume_score(candidate):
-    score = 0
-
-    # Relative equity volume vs 20-day average
-    rel_vol = candidate["relativeVolume"]
-    if rel_vol >= 2.0:
-        score += 9   # explicit volume spike — unusual participation
-    elif rel_vol >= 1.6:
-        score += 7
-    elif rel_vol >= 1.3:
-        score += 5
-    elif rel_vol >= 1.0:
-        score += 3
-
-    # Volume spike bonus — 2× avg volume = institutions moving, not noise
-    if candidate.get("volumeSpike"):
-        score += 3
-
-    # Option contract liquidity
-    if candidate["optionVolume"] >= 100000:
-        score += 6
-    elif candidate["optionVolume"] >= 50000:
-        score += 4
-    elif candidate["optionVolume"] >= 20000:
-        score += 2
-
-    return clamp(score, 0, CATEGORY_MAX["volume"])
-
-
-def option_chain_score(candidate):
-    score = 0
-    direction = candidate["direction"]
-
-    # OI change — fresh open interest in trading direction = new money confirming the move.
-    # BUY: rising CE OI = participants opening fresh long calls or shorts covering.
-    # SELL: rising PE OI = participants opening fresh long puts.
-    oi_chg = candidate["oiChangePct"]
-    if oi_chg >= 15:
-        score += 8   # very strong fresh positioning — high conviction
-    elif oi_chg >= 8:
-        score += 6
-    elif oi_chg >= 4:
-        score += 4
-    elif oi_chg >= 1:
-        score += 2
-    elif oi_chg >= 0:
-        score += 1
-    else:
-        score -= 3   # unwinding — participants exiting, no fresh interest
-
-    # PCR — directionally aware institutional sentiment.
-    # BUY: high PCR means put writers > call writers = institutions net bullish
-    # SELL: low PCR means call writers > put writers = institutions net bearish
-    pcr = candidate["pcr"]
-    if direction == "BUY":
-        if pcr >= 1.3:
-            score += 6   # strongly bullish OI setup
-        elif pcr >= 1.0:
-            score += 4
-        elif pcr >= 0.8:
-            score += 2
-        elif pcr < 0.7:
-            score -= 3   # contra institutional positioning
-    else:  # SELL
-        if pcr <= 0.7:
-            score += 6
-        elif pcr <= 0.9:
-            score += 4
-        elif pcr <= 1.1:
-            score += 2
-        elif pcr > 1.3:
-            score -= 3
-
-    # Max pain distance — spot far from max pain means less gravity toward pain level
-    mp_dist = candidate["maxPainDistancePct"]
-    if mp_dist >= 2.0:
-        score += 3
-    elif mp_dist >= 1.0:
-        score += 2
-    else:
-        score += 1
-
-    # Spread — tight spread = liquid, better execution
-    if candidate["spreadPct"] <= 1.0:
-        score += 3
-    elif candidate["spreadPct"] <= 2.0:
-        score += 2
-    elif candidate["spreadPct"] <= 3.0:
-        score += 1
-
-    # IV level — buying high-IV options means paying inflated premium (IV crush risk)
-    atm_iv = candidate.get("atmIV", 0)
-    if atm_iv > 0:
-        if atm_iv < 16:
-            score += 3    # historically cheap premium — best buyer setup
-        elif atm_iv < 22:
-            score += 2
-        elif atm_iv < 30:
-            score += 1    # fair value
-        elif atm_iv < 40:
-            score -= 1    # elevated
-        elif atm_iv < 50:
-            score -= 3    # expensive — significant IV crush risk
-        else:
-            score -= 5    # very expensive — avoid buying
-
-    # IV Rank — 52-week percentile (more reliable than raw IV level)
-    iv_rank = candidate.get("ivRank")
-    if iv_rank is not None:
-        if iv_rank < 15:
-            score += 3    # historically cheapest IV — option buyers' ideal
-        elif iv_rank < 30:
-            score += 2
-        elif iv_rank < 50:
-            score += 1
-        elif iv_rank > 80:
-            score -= 4    # at multi-month highs — avoid buying
-        elif iv_rank > 65:
-            score -= 2
-
-    return clamp(score, 0, CATEGORY_MAX["optionChain"])
-
-
-def news_score(candidate):
-    """Score based on AI-classified news sentiment for the underlying.
-
-    Sentiment is -3…+3, set by get_batch_news_sentiment() in build_scan.
-    Positive sentiment aligns with BUY, negative sentiment aligns with SELL.
-    Returns 0 when no sentiment data is available (AI not configured).
-    """
-    raw = candidate.get("newsSentiment")
-    if raw is None:
-        return 0   # AI not configured or news unavailable — no score impact
-    direction = candidate["direction"]
-    # Align sign: positive sentiment helps BUY, negative sentiment helps SELL
-    effective = raw if direction == "BUY" else -raw
-    if effective >= 2:   return 5    # strong tailwind — news confirms direction
-    if effective >= 1:   return 3    # mild positive alignment
-    if effective == 0:   return 1    # neutral news — slight positive (no headwinds)
-    if effective == -1:  return -1   # mild headwind — reduce confidence
-    return -3                        # strong contra-directional news — significant penalty
-
-
-def sentiment_score(candidate, market):
-    score = candidate.get("marketSentiment", 0)
-    vix = market["indiaVix"]
-    # Progressive VIX penalty — calm markets get a bonus, elevated markets lose points.
-    if vix <= 14:
-        score += 3    # very calm trending environment
-    elif vix <= 16:
-        score += 1    # normal
-    elif vix <= 18:
-        score += 0    # neutral
-    elif vix <= 20:
-        score -= 2    # elevated — trade only high-conviction setups
-    else:             # 20–22  (above 22 = hard gate, never reaches here)
-        score -= 4    # high risk environment
-
-    # Market breadth
-    breadth = market.get("breadth", 1.0)
-    if breadth >= 1.5:
-        score += 3
-    elif breadth >= 1.2:
-        score += 2
-    elif breadth >= 1.0:
-        score += 1
-    elif breadth < 0.8:
-        score -= 1
-
-    # AI market regime bonus/penalty — AI-classified action overrides rule-based bias
-    # when AI is configured. "trade_full" = high-conviction day; "avoid" is a hard gate
-    # (handled in hard_gate_failures), so we only need intermediate cases here.
-    ai_action = market.get("aiAction")
-    if ai_action == "trade_full":
-        score += 3   # AI confirms ideal trading conditions
-    elif ai_action == "trade_reduced":
-        score -= 1   # AI suggests caution — reduce confidence slightly
-    elif ai_action == "selective":
-        score -= 2   # AI recommends only the strongest setups
-
-    return clamp(score, 0, CATEGORY_MAX["sentiment"])
-
-
-def risk_reward_score(candidate):
-    # rr is now S/R-anchored (T1 = nearest resistance/support translated via delta).
-    # Previously always 2.0 by construction. Now genuinely variable: 1.0–3.0+.
-    rr = candidate["rr"]
-    if rr >= 2.5:
-        return 10   # T1 reaches well past the first S/R — strong structure
-    if rr >= 2.0:
-        return 8
-    if rr >= 1.5:
-        return 5
-    if rr >= 1.0:
-        return 2    # minimum acceptable — T1 just reaches S/R
-    return 0        # below 1:1 — hard gate will reject anyway (rr < 2 gate)
-
-
-def score_candidate(candidate, market):
-    scores = {
-        "trend":       trend_score(candidate),
-        "momentum":    momentum_score(candidate),
-        "volume":      volume_score(candidate),
-        "optionChain": option_chain_score(candidate),
-        "sentiment":   sentiment_score(candidate, market),
-        "riskReward":  risk_reward_score(candidate),
-        "news":        news_score(candidate),
-    }
-    raw   = sum(scores.values())
-    total = round(raw / _SCORE_MAX_RAW * 100)   # normalise 110 → 100
-    return {"scores": scores, "total": total, "rawTotal": raw}
-
-
-def event_blocked(candidate, market, settings):
-    if candidate.get("eventRisk"):
-        return True
-    for event in market.get("eventCalendar", []):
-        if event["severity"] == "high" and event["minutesAway"] <= settings["eventWindow"]:
-            return True
-    return False
-
-
-def hard_gate_failures(candidate, market, risk_state, settings):
-    failures = []
-    aligned = is_bullish_trend(candidate) if candidate["direction"] == "BUY" else is_bearish_trend(candidate)
-
-    if settings["lossStreak"] >= 3:
-        failures.append("Stop-trading rule active after 3 consecutive losses.")
-    if risk_state["dailyLossPct"] >= settings["maxDailyLossPct"]:
-        failures.append("Daily loss limit reached.")
-    if risk_state["weeklyDrawdownPct"] >= settings["maxWeeklyDrawdownPct"]:
-        failures.append("Weekly drawdown limit reached.")
-    if risk_state["monthlyDrawdownPct"] >= settings["maxMonthlyDrawdownPct"]:
-        failures.append("Monthly drawdown limit reached.")
-    if candidate["rr"] < 1.5:
-        failures.append("Risk reward is below 1:1.5 (S/R target too close to entry).")
-    if not aligned:
-        failures.append("Trend is not aligned with trade direction.")
-    # IV Rank hard gate — buying options at historical IV extremes risks immediate IV crush.
-    # Scoring already penalises high IV Rank, but > 80th percentile is a hard no.
-    # Requires 20+ daily readings; skipped when IV Rank is unavailable (insufficient history).
-    iv_rank = candidate.get("ivRank")
-    if iv_rank is not None and iv_rank > 80:
-        failures.append(
-            f"IV Rank {iv_rank:.0f}th percentile — options are historically expensive. IV crush risk too high."
-        )
-    if candidate["optionVolume"] < settings["minVolume"]:
-        failures.append("Option volume is below minimum liquidity threshold.")
-    if candidate["spreadPct"] > settings["maxSpread"]:
-        failures.append("Bid-ask spread is excessive.")
-    if event_blocked(candidate, market, settings):
-        if candidate.get("eventRisk"):
-            failures.append("Earnings / board meeting scheduled within 2 days — event risk.")
-        else:
-            failures.append("Major market event risk is too close (RBI MPC, expiry, or flagged event).")
-    if market["indiaVix"] >= 22:
-        failures.append("India VIX is elevated beyond directional buying threshold.")
-
-    # AI regime gate — only fires when AI is configured and explicitly classifies
-    # the day as untradeable. Not triggered when AI is absent (aiAction == None).
-    if market.get("aiAction") == "avoid":
-        reason = market.get("aiReason", "AI classified current conditions as untradeable.")
-        failures.append(f"AI regime gate: {reason}")
-
-    # Time-of-day gate — avoid opening chop and closing volatility
-    now_ist     = datetime.now(ZoneInfo("Asia/Kolkata"))
-    now_ist_t   = now_ist.time()
-    if dtime(9, 15) <= now_ist_t <= dtime(9, 30):
-        failures.append("Opening volatility window (9:15–9:30 IST) — wait for price discovery.")
-    if dtime(14, 45) <= now_ist_t <= dtime(15, 30):
-        failures.append("Closing volatility window (14:45–15:30 IST) — avoid new entries near close.")
-
-    # Expiry day gate — Tuesday after 11:00 IST (NSE moved weekly expiry to Tuesday 2025-09-01)
-    # Gamma accelerates and time decay is punishing on expiry morning for weekly long options.
-    if now_ist.weekday() == 1 and now_ist_t >= dtime(11, 0):
-        if candidate.get("expiry") == "Weekly":
-            failures.append(
-                "Weekly expiry day (Tuesday) after 11:00 IST — accelerated gamma and "
-                "time decay make new long-option entries unfavourable."
-            )
-
-    return failures
-
-
-def position_sizing(candidate, settings):
-    rupee_risk = settings["accountCapital"] * (settings["riskPercent"] / 100)
-    per_unit_risk = abs(candidate["entry"] - candidate["stopLoss"])
-    lot_risk = per_unit_risk * candidate["lotSize"]
-    lots = int(rupee_risk // lot_risk) if lot_risk else 0
-
-    return {
-        "rupeeRisk": round(rupee_risk),
-        "perUnitRisk": round(per_unit_risk, 2),
-        "lotRisk": round(lot_risk),
-        "lots": max(0, lots),
-        "quantity": max(0, lots) * candidate["lotSize"],
-    }
-
-
-def signal_valid_until(candidate):
-    now = datetime.now(ZoneInfo("Asia/Kolkata"))
-    valid_until = now + timedelta(minutes=candidate["signalValidMinutes"])
-    return valid_until.strftime("%I:%M %p")
-
-
-def build_explanation(candidate, sizing, approved):
-    if not approved:
-        return (
-            "Rejected before recommendation because deterministic risk gates or score "
-            "requirements were not satisfied. AI may explain this rejection, but it "
-            "cannot convert the setup into a trade."
-        )
-
-    return (
-        f"{candidate['instrument']} qualifies because trend, momentum, liquidity and "
-        f"option-chain evidence align with the trade direction. The setup uses a "
-        f"defined stop at {candidate['stopLoss']} and the account risk rule limits "
-        f"size to {sizing['lots']} lot(s). The trade remains valid only while price "
-        "action holds the entry structure and event risk does not change."
-    )
-
-
-def build_risks(candidate, market):
-    risks = []
-    if candidate["spreadPct"] > 2:
-        risks.append("Spread can reduce realized reward.")
-    if market["indiaVix"] > 16:
-        risks.append("Volatility is above the calm-market zone.")
-    if candidate["expiry"] == "Weekly":
-        risks.append("Weekly options carry faster time decay after failed follow-through.")
-
-    for event in market.get("eventCalendar", []):
-        if event["severity"] == "high" and event["minutesAway"] <= 1440:
-            risks.append(f"{event['name']} can change market sentiment within the next trading day.")
-
-    risks.extend(candidate.get("notes", []))
-    return risks[:5]
-
-
-# Sector map for the 40-symbol scan universe.
-# Used to cap at 1 approved signal per sector — prevents correlated blowups
-# (e.g. HDFCBANK + ICICIBANK + AXISBANK all shorting on the same RBI day).
-# Indices are exempt — NIFTY and BANKNIFTY are independent products.
-_SECTOR_MAP: dict[str, str] = {
-    "NIFTY": "index", "BANKNIFTY": "index",
-    # Banking
-    "HDFCBANK": "banking", "ICICIBANK": "banking", "AXISBANK": "banking",
-    "KOTAKBANK": "banking", "SBIN": "banking", "INDUSINDBK": "banking",
-    # Finance (NBFC / insurance — correlated with banking but distinct)
-    "BAJFINANCE": "finance", "BAJAJFINSV": "finance", "HDFCLIFE": "finance",
-    # IT
-    "INFY": "it", "TCS": "it", "WIPRO": "it", "HCLTECH": "it", "TECHM": "it",
-    # Oil & Gas
-    "RELIANCE": "oil_gas", "ONGC": "oil_gas",
-    # Telecom
-    "BHARTIARTL": "telecom",
-    # Auto
-    "MARUTI": "auto", "EICHERMOT": "auto",
-    # Pharma
-    "SUNPHARMA": "pharma", "DRREDDY": "pharma", "CIPLA": "pharma", "DIVISLAB": "pharma",
-    # FMCG
-    "HINDUNILVR": "fmcg", "NESTLEIND": "fmcg", "TATACONSUM": "fmcg",
-    # Infra / Power / Ports
-    "LT": "infra", "ADANIPORTS": "infra", "POWERGRID": "infra", "NTPC": "infra",
-    # Metals
-    "JSWSTEEL": "metals", "TATASTEEL": "metals", "HINDALCO": "metals",
-    # Cement & Conglomerate
-    "ULTRACEMCO": "cement", "GRASIM": "cement",
-    # Consumer / Lifestyle / Healthcare
-    "ASIANPAINT": "consumer", "TITAN": "consumer", "APOLLOHOSP": "consumer",
-    # Large conglomerates — standalone
-    "M&M": "auto",
-}
-
-
-def scan_market(candidates, market, risk_state, settings=None):
-    settings  = merged_settings(settings)
-    min_score = settings["minScore"]
-
-    evaluated = []
-    for candidate in candidates:
-        failures = hard_gate_failures(candidate, market, risk_state, settings)
-        score    = score_candidate(candidate, market)
-        sizing   = position_sizing(candidate, settings)
-
-        approved = (
-            not failures
-            and score["total"] >= min_score
-            and sizing["lots"] >= 1
-        )
-
-        rejection_reasons = list(failures)
-        if score["total"] < min_score:
-            rejection_reasons.append(f"Score {score['total']} is below threshold {min_score}.")
-        if sizing["lots"] < 1:
-            rejection_reasons.append("Position size would exceed configured account risk.")
-
-        evaluated.append({
-            "candidate":        candidate,
-            "approved":         approved,
-            "score":            score,
-            "sizing":           sizing,
-            "validUntil":       signal_valid_until(candidate),
-            "explanation":      build_explanation(candidate, sizing, approved),
-            "risks":            build_risks(candidate, market),
-            "rejectionReasons": rejection_reasons,
-        })
-
-    approved_list = sorted(
-        [item for item in evaluated if item["approved"]],
-        key=lambda item: item["score"]["total"],
-        reverse=True,
-    )[: settings["maxSignals"]]
-
-    # Sector concentration: keep only the highest-scoring signal per sector.
-    # Indices (NIFTY/BANKNIFTY) are exempt — they are independent products.
-    # List is already score-sorted so first occurrence per sector wins.
-    _sector_seen: set[str] = set()
-    _sector_deduped: list  = []
-    for item in approved_list:
-        underlying = item["candidate"].get(
-            "underlying", item["candidate"]["instrument"].split()[0]
-        )
-        sector = _SECTOR_MAP.get(underlying, underlying)   # unknown → own sector
-        if sector == "index" or sector not in _sector_seen:
-            _sector_seen.add(sector)
-            _sector_deduped.append(item)
-        else:
-            item["approved"] = False
-            item.setdefault("rejectionReasons", []).append(
-                f"Sector cap: a higher-scoring {sector.upper()} signal is already approved."
-            )
-    approved_list = _sector_deduped
-
-    approved_ids = {item["candidate"]["id"] for item in approved_list}
-    rejected     = [item for item in evaluated if item["candidate"]["id"] not in approved_ids]
-
-    return {
-        "settings":         settings,
-        "approved":         approved_list,
-        "rejected":         rejected,
-        "noTrade":          len(approved_list) == 0,
-        "scoreThreshold":   min_score,
-        "thresholdRelaxed": False,
-        "generatedAt":      datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
-    }
-
-
-def telegram_text(scan, market):
+def telegram_text(scan: dict, market: dict) -> str:
     if scan["noTrade"]:
-        return "\n".join(
-            [
-                "NO TRADE MODE",
-                f"Market: {market['regime']}",
-                "Reason: No setup passed hard risk gates and score threshold.",
-                "Action: Preserve capital. Wait for clean alignment.",
-            ]
-        )
+        return "\n".join([
+            "NO TRADE MODE",
+            f"Market: {market['regime']}",
+            "Reason: No setup passed hard risk gates and score threshold.",
+            "Action: Preserve capital. Wait for clean alignment.",
+        ])
 
     messages = []
     for item in scan["approved"]:
-        candidate = item["candidate"]
-        messages.append(
-            "\n".join(
-                [
-                    f"{candidate['direction']} {candidate['instrument']}",
-                    f"Entry: {candidate['entry']}",
-                    f"SL: {candidate['stopLoss']}",
-                    f"T1/T2/T3: {' / '.join(str(target) for target in candidate['targets'])}",
-                    f"RR: 1:{candidate['rr']}",
-                    f"Confidence Score: {item['score']['total']}/100",
-                    f"Valid Until: {item['validUntil']}",
-                    f"Size: {item['sizing']['lots']} lot(s), max risk Rs {item['sizing']['rupeeRisk']}",
-                    f"Why: {item['explanation']}",
-                    f"Risks: {'; '.join(item['risks'])}",
-                ]
-            )
-        )
+        c = item["candidate"]
+        messages.append("\n".join([
+            f"{c['direction']} {c['instrument']}",
+            f"Entry: {c['entry']}",
+            f"SL: {c['stopLoss']}",
+            f"T1/T2/T3: {' / '.join(str(t) for t in c['targets'])}",
+            f"RR: 1:{c['rr']}",
+            f"Confidence Score: {item['score']['total']}/100",
+            f"Valid Until: {item['validUntil']}",
+            f"Size: {item['sizing']['lots']} lot(s), max risk Rs {item['sizing']['rupeeRisk']}",
+            f"Why: {item['explanation']}",
+            f"Risks: {'; '.join(item['risks'])}",
+        ]))
     return "\n\n".join(messages)
 
+
+def position_sizing(candidate: dict, settings: dict) -> dict:
+    """Exposed for any callers that compute sizing independently."""
+    return _options_strategy.compute_position_size(candidate, settings)

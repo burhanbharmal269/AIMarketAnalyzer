@@ -6,13 +6,13 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from app.config import settings
+from app.core.constants import TELEGRAM_RETRY_DELAYS, TELEGRAM_DRAIN_SECS
 from app.services.scanner import telegram_text
 
 logger = logging.getLogger(__name__)
 
-# Retry delays in seconds after each failed attempt (3 attempts total: 0s, 30s, 120s)
-_RETRY_DELAYS = [30, 120]
-_DRAIN_INTERVAL = 15   # seconds between queue drain checks
+_RETRY_DELAYS   = list(TELEGRAM_RETRY_DELAYS)
+_DRAIN_INTERVAL = TELEGRAM_DRAIN_SECS
 _drain_started  = False
 
 
