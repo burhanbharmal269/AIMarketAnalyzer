@@ -573,12 +573,18 @@
       .then(function (r) { return r.json(); })
       .then(function (s) {
         if (s.liveDataAvailable) {
-          els.liveDataDot.classList.add("live");
-          els.liveDataDot.style.background = "";
           const lastScan = s.lastScanAt
             ? " · Last scan " + new Date(s.lastScanAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour: "2-digit", minute: "2-digit" })
             : "";
-          els.liveDataLabel.textContent = "Live NSE data — VIX " + s.indiaVix + lastScan;
+          if (s.marketOpen) {
+            els.liveDataDot.classList.add("live");
+            els.liveDataDot.style.background = "";
+            els.liveDataLabel.textContent = "Live NSE data — VIX " + s.indiaVix + lastScan;
+          } else {
+            els.liveDataDot.classList.remove("live");
+            els.liveDataDot.style.background = "#f5a623";
+            els.liveDataLabel.textContent = "Market closed — VIX " + s.indiaVix + lastScan;
+          }
         } else {
           els.liveDataDot.classList.remove("live");
           els.liveDataDot.style.background = "#e02020";

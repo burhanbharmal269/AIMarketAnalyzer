@@ -64,6 +64,16 @@ def _make_monitor_job(nse_data, send_fn):
     return job
 
 
+def _make_probe_job():
+    def job():
+        try:
+            from app.services.api_probe import probe_all
+            probe_all()
+        except Exception as exc:
+            logger.error("API probe job failed: %s", exc)
+    return job
+
+
 def create_scheduler(scan_fn, send_fn=None, nse_data=None):
     if not settings.enable_scheduler or BackgroundScheduler is None:
         return None
@@ -115,4 +125,14 @@ def create_scheduler(scan_fn, send_fn=None, nse_data=None):
             id="price_monitor",
         )
         logger.info("Price monitor scheduled (every 2 min, market hours only)")
+
+    # API integration probe — every 5 min, always on
+    if IntervalTrigger is not None:
+        scheduler.add_job(
+            _make_probe_job(),
+            IntervalTrigger(minutes=5, timezone=IST),
+            id="api_probe",
+        )
+        logger.info("API integration probe scheduled (every 5 min)")
+
     return scheduler

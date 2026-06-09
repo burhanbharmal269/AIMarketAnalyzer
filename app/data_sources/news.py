@@ -67,41 +67,66 @@ _SYMBOL_QUERY = {
 _NEWSAPI_URL = "https://newsapi.org/v2/everything"
 
 
+def _yfinance_headlines(symbol: str, max_results: int) -> list[str]:
+    """Fallback: fetch headlines via yfinance (no API key required)."""
+    # Map NSE symbol to a yfinance ticker
+    _YF_TICKER = {
+        "NIFTY": "^NSEI", "BANKNIFTY": "^NSEBANK", "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
+    }
+    yf_sym = _YF_TICKER.get(symbol, f"{symbol}.NS")
+    try:
+        import yfinance as yf
+        news = yf.Ticker(yf_sym).news or []
+        return [
+            n.get("content", {}).get("title") or n.get("title", "")
+            for n in news
+            if (n.get("content", {}).get("title") or n.get("title"))
+        ][:max_results]
+    except Exception as exc:
+        logger.debug("yfinance news fallback failed [%s]: %s", symbol, exc)
+        return []
+
+
 def get_headlines(symbol: str, max_results: int = 3) -> list[str]:
     """Return top news headlines for an NSE symbol.
 
-    Cached for 15 minutes. Returns empty list if NewsAPI key is not configured
-    or the request fails — callers must handle the empty case gracefully.
+    Cached for 15 minutes. Uses NewsAPI when a key is configured, falls back
+    to yfinance news (no auth required) so callers always get something.
     """
-    if not settings.news_api_key:
-        return []
-
     cached = _CACHE.get(symbol)
     if cached and time.time() - cached["ts"] < _TTL:
         return cached["data"]
 
-    query = _SYMBOL_QUERY.get(symbol, f"{symbol} NSE India stock")
-    try:
-        resp = requests.get(
-            _NEWSAPI_URL,
-            params={
-                "q":        query,
-                "apiKey":   settings.news_api_key,
-                "language": "en",
-                "sortBy":   "publishedAt",
-                "pageSize": max_results,
-            },
-            timeout=10,
-        )
-        resp.raise_for_status()
-        articles = resp.json().get("articles", [])
-        headlines = [a["title"] for a in articles if a.get("title")][:max_results]
-        _CACHE[symbol] = {"data": headlines, "ts": time.time()}
-        logger.debug("NewsAPI [%s]: %d headlines fetched", symbol, len(headlines))
-        return headlines
-    except Exception as exc:
-        logger.debug("NewsAPI fetch failed [%s]: %s", symbol, exc)
-        return []
+    headlines: list[str] = []
+
+    if settings.news_api_key:
+        query = _SYMBOL_QUERY.get(symbol, f"{symbol} NSE India stock")
+        try:
+            resp = requests.get(
+                _NEWSAPI_URL,
+                params={
+                    "q":        query,
+                    "apiKey":   settings.news_api_key,
+                    "language": "en",
+                    "sortBy":   "publishedAt",
+                    "pageSize": max_results,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            articles = resp.json().get("articles", [])
+            headlines = [a["title"] for a in articles if a.get("title")][:max_results]
+            logger.debug("NewsAPI [%s]: %d headlines fetched", symbol, len(headlines))
+        except Exception as exc:
+            logger.debug("NewsAPI fetch failed [%s]: %s — trying yfinance", symbol, exc)
+
+    if not headlines:
+        headlines = _yfinance_headlines(symbol, max_results)
+        if headlines:
+            logger.debug("yfinance news [%s]: %d headlines fetched", symbol, len(headlines))
+
+    _CACHE[symbol] = {"data": headlines, "ts": time.time()}
+    return headlines
 
 
 def get_market_headlines(max_results: int = 4) -> list[str]:

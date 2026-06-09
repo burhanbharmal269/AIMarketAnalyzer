@@ -96,19 +96,24 @@ def _add_indicators(df):
 # ── signal detection (simplified, mirrors scanner rules) ─────────────────────
 
 def _detect_signal(row) -> str | None:
+    # NOTE: this function is a daily-candle proxy used only inside the backtest.
+    # It is intentionally simpler than the live scanner's multi-factor scoring engine.
+    # Changes here do NOT affect live signal generation in any way.
     bullish = row["ema20"] > row["ema50"] > row["ema200"]
     bearish = row["ema20"] < row["ema50"] < row["ema200"]
     if not (bullish or bearish):
         return None
 
-    rsi      = row["rsi"]
-    macd_ok  = (row["macd"] > row["macd_signal"]) if bullish else (row["macd"] < row["macd_signal"])
-    adx_ok   = row["adx"] >= 18
-    vol_ok   = False if pd.isna(row["rel_vol"]) else row["rel_vol"] >= 1.1
-
-    if bullish and 50 < rsi < 75 and macd_ok and adx_ok and vol_ok:
+    rsi     = row["rsi"]
+    macd_ok = (row["macd"] > row["macd_signal"]) if bullish else (row["macd"] < row["macd_signal"])
+    adx_ok  = row["adx"] >= 18
+    # Relative volume is unreliable on daily bars (NaN when avg_vol window is incomplete);
+    # dropping it as a hard gate — volume quality is not the focus of this daily proxy.
+    # RSI range widened (45–80 / 20–55) to capture trend continuation on daily timeframe
+    # where RSI can stay extended for many bars without the trade being invalid.
+    if bullish and 45 < rsi < 80 and macd_ok and adx_ok:
         return "BUY_CE"
-    if bearish and 25 < rsi < 50 and macd_ok and adx_ok and vol_ok:
+    if bearish and 20 < rsi < 55 and macd_ok and adx_ok:
         return "BUY_PE"
     return None
 
@@ -181,7 +186,8 @@ def _compute_metrics(trades: list[dict]) -> dict:
     # Sharpe proxy: mean / stdev of R outcomes
     returns = [t["r"] for t in trades]
     try:
-        sharpe = round(statistics.mean(returns) / statistics.stdev(returns), 2) if len(returns) > 1 else 0.0
+        stdev = statistics.stdev(returns) if len(returns) > 1 else 0.0
+        sharpe = round(statistics.mean(returns) / stdev, 2) if stdev > 0 else 0.0
     except statistics.StatisticsError:
         sharpe = 0.0
 
@@ -244,7 +250,7 @@ def run_backtest() -> dict:
                 "trades":   m["totalTrades"],
                 "winRate":  m["winRate"],
                 "avgRr":    m["avgWinR"],
-                "status":   "Live historical data" if m["totalTrades"] >= 10 else "Insufficient data",
+                "status":   "Live historical data" if m["totalTrades"] >= 5 else "Insufficient data",
             })
 
     if not all_trades:

@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 
 from app.config import settings
 from app.services.ai import ai_status, generate_market_summary
-from app.services.scan_service import build_scan, get_cached_scan, get_cache_timestamp
+from app.services.scan_service import get_cached_scan, get_cache_timestamp
 from app.services.telegram import telegram_status
 
 logger = logging.getLogger(__name__)
@@ -58,29 +58,61 @@ def option_ltp(
     return result
 
 
+def _is_market_open() -> bool:
+    """True only during NSE trading hours: Mon–Fri, 09:15–15:30 IST."""
+    from datetime import time as dtime
+    now = datetime.now(_IST)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    t = now.time()
+    return dtime(9, 15) <= t <= dtime(15, 30)
+
+
 @router.get("/data-status")
 def data_status():
     from app.data_sources.nse import nse_data
-    available = nse_data.is_available()
-    vix       = nse_data.get_india_vix() if available else None
+    available   = nse_data.is_available()
+    vix         = nse_data.get_india_vix() if available else None
+    market_open = _is_market_open()
     return {
         "liveDataAvailable": available,
+        "marketOpen":        market_open,
         "indiaVix":          vix,
         "lastScanAt":        get_cache_timestamp(),
         "timestamp":         datetime.now(_IST).isoformat(),
     }
 
 
+@router.get("/integration-status")
+def integration_status():
+    """Latest API probe result. Probe runs every 5 min via the scheduler.
+    Call POST /api/integration-status/run to trigger an immediate probe."""
+    from app.services.api_probe import get_last_result, secs_since_last_probe
+    result = get_last_result()
+    if not result:
+        return {"detail": "No probe has run yet — trigger one via POST /api/integration-status/run"}
+    return {**result, "secondsSinceProbe": secs_since_last_probe()}
+
+
+@router.post("/integration-status/run")
+def run_integration_probe():
+    """Trigger an immediate API probe outside the 5-min schedule."""
+    from app.services.api_probe import probe_all
+    return probe_all()
+
+
 @router.get("/summary")
 def summary():
-    cached = get_cached_scan()
-    if cached:
-        return generate_market_summary(cached, cached["market"])
-    try:
-        result = build_scan(persist=False)
-        return generate_market_summary(result, result["market"])
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Live data unavailable for summary: {exc}",
-        ) from exc
+    """Return AI market briefing from the latest scan cache.
+
+    Never triggers a live scan — always responds immediately.
+    Run POST /api/scan first to populate the cache.
+    """
+    from app.services.scan_service import _scan_cache  # raw cache, bypass TTL for summary
+    if _scan_cache:
+        result = _scan_cache
+        return {**generate_market_summary(result, result["market"]), "stale": get_cache_timestamp()}
+    raise HTTPException(
+        status_code=503,
+        detail="No scan data yet — run POST /api/scan first, then retry.",
+    )
