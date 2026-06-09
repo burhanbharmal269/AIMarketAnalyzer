@@ -427,13 +427,17 @@ def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
         ema_tag  = "aligned" if (ema_bull or ema_bear) else "mixed"
         macd_ok  = (c["macd"] > c.get("macdSignal", 0)) if c["direction"] == "BUY" \
                    else (c["macd"] < c.get("macdSignal", 0))
+        iv_rank  = c.get('ivRank')
+        rel_vol  = c.get('relativeVolume')
+        # Mark intraday fields as unavailable when market is closed (relVol=0 means no session data)
+        iv_str   = f"ivRank={round(iv_rank)}" if iv_rank is not None else "ivRank=n/a"
+        vol_str  = f"relVol={round(rel_vol, 1)}" if (rel_vol is not None and rel_vol > 0) else "relVol=n/a(closed)"
+        vwap_str = "vwap=yes" if c.get('vwapConfirmed') else ("vwap=n/a(closed)" if (rel_vol or 0) == 0 else "vwap=no")
         rows.append(
             f"{sym}: dir={c['direction']} ema={ema_tag} rsi={c['rsi'] or 50} "
             f"adx={c['adx'] or 0} adxRising={c.get('adxRising') or False} "
             f"macd={'confirms' if macd_ok else 'diverges'} "
-            f"relVol={round(c.get('relativeVolume') or 1, 1)} "
-            f"ivRank={round(c.get('ivRank') or 50)} "
-            f"vwap={'yes' if c.get('vwapConfirmed') else 'no'} "
+            f"{vol_str} {iv_str} {vwap_str} "
             f"eventRisk={c.get('eventRisk') or False} "
             f"sector={SECTOR_MAP.get(sym, 'other')}"
         )
@@ -482,33 +486,37 @@ def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
         max_candidates = min(max_candidates, 6)
         regime_rule += " AI regime action=REDUCE: cut shortlist to preserve capital."
 
-    system = """You are a senior NSE F&O desk analyst. Your job is to shortlist the most \
-promising option-chain candidates from a raw scan list, so we only fetch expensive \
-Angel One API calls for symbols that actually meet professional entry criteria.
+    system = """You are a senior NSE F&O desk analyst. Shortlist the most promising \
+option-chain candidates so we only call the Angel One API for symbols worth trading.
 
-HARD RULES (non-negotiable — skip any symbol that violates these):
-1. EMA must be fully aligned with direction (20>50>200 for BUY, reverse for SELL). \
-   Mixed EMA = skip.
-2. ADX must be >= 20. Below 20 means no trend — options bleed theta without directional move.
-3. RSI must be 45-72 for BUY, 28-55 for SELL. Outside range = overbought/oversold, skip.
-4. MACD must confirm the direction. Diverging MACD = momentum stalling, skip.
-5. IV Rank must be <= 50. Buying options when IV > 50 means paying inflated premium, skip.
-6. Skip any symbol with eventRisk=True (earnings within 2 days = binary risk).
-7. Relative volume >= 1.1 required — no volume participation means weak conviction.
+HARD GATES — skip immediately if any of these fail (no exceptions):
+1. EMA alignment: 20>50>200 for BUY, 20<50<200 for SELL. Mixed EMA = skip.
+2. IV Rank > 60: buying expensive options destroys edge. Skip.
+3. eventRisk=True: earnings/event within 2 days = binary risk. Skip.
 
-QUALITY RULES (prefer symbols that satisfy these):
-- VWAP confirmed = strong intraday anchor, strongly prefer.
-- ADX rising = trend accelerating, prefer over flat ADX.
-- Indices (NIFTY, BANKNIFTY) are always preferred when EMA aligned — highest liquidity.
-- Pick max 1 symbol per sector (banking, IT, pharma, etc.) — correlated sectors move together.
+QUALITY SCORING — score each surviving candidate 0-5 points, shortlist the highest scorers:
++2  ADX >= 25 (strong trend). ADX 18-24 = +1 (weak trend). ADX < 18 = +0.
++1  RSI in momentum zone: BUY = 42-76 (trend continuation; mild overbought ok for momentum),
+    SELL = 24-68 (overbought-reversal is a valid PE entry, do not penalise RSI 56-68 for SELL).
++1  MACD confirms direction (macd=confirms). Diverging = -0, not a disqualifier.
++1  relVol >= 0.9. If relVol=n/a(closed) treat as neutral (+0), do NOT penalise.
++1  vwap=yes. If vwap=n/a(closed) treat as neutral (+0), do NOT penalise.
+NOTE: ivRank is a HARD GATE only — low ivRank (< 60) is GOOD (cheap options). Do not use ivRank in scoring.
 
-REGIME RULE (override everything based on current market):
+SELECTION RULES:
+- Shortlist candidates scoring >= 2 points (at least 2 quality signals present).
+- If no candidate scores >= 2, admit the top 3 by score anyway — always return something.
+- Max 1 symbol per sector (banking, IT, pharma, oil_gas, etc.). Pick highest scorer per sector.
+- Indices (NIFTY, BANKNIFTY) get a +1 bonus for liquidity — always prefer them when EMA aligned.
+- Always include NIFTY or BANKNIFTY if their EMA is aligned, regardless of other scores.
+
+REGIME RULE (applied after scoring):
 """ + regime_rule + f"""
 
 Current market: regime={regime}, bias={bias}, VIX={vix:.1f}
 Return at most {max_candidates} symbols.""" + perf_block + """
 
-OUTPUT: Respond with valid JSON only. No markdown, no explanation outside the JSON.
+OUTPUT: Respond with valid JSON only. No markdown, no extra text.
 {
   "shortlist": ["SYM1", "SYM2", ...],
   "skipped": {"SYM": "one-line reason", ...},
