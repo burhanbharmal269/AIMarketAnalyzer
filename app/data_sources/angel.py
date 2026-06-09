@@ -299,32 +299,48 @@ def startup_login() -> bool:
 
 # ── Expiry helpers ────────────────────────────────────────────────────────────
 
-def _next_tuesday(from_date: date | None = None) -> date:
-    d = from_date or date.today()
-    days_ahead = (1 - d.weekday()) % 7
-    return d + timedelta(days=days_ahead)
+# Indices whose weekly contracts expire every Tuesday (NSE schedule since 2025-09-01).
+# These use the nearest upcoming Tuesday, not the end-of-month date.
+_WEEKLY_TUESDAY_EXPIRY = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
 
 
-def _last_tuesday_of_month(year: int, month: int) -> date:
+def _next_weekday(from_date: date, weekday: int) -> date:
+    """Return the nearest upcoming date (>= from_date) that falls on `weekday` (0=Mon…6=Sun)."""
+    days_ahead = (weekday - from_date.weekday()) % 7
+    return from_date + timedelta(days=days_ahead)
+
+
+def _last_thursday_of_month(year: int, month: int) -> date:
+    """Last Thursday of the given month — standard NSE stock monthly F&O expiry."""
     if month == 12:
         last = date(year + 1, 1, 1) - timedelta(days=1)
     else:
         last = date(year, month + 1, 1) - timedelta(days=1)
-    return last - timedelta(days=(last.weekday() - 1) % 7)
+    return last - timedelta(days=(last.weekday() - 3) % 7)  # 3 = Thursday
+
+
+def _nearest_stock_monthly_expiry(today: date) -> date:
+    """Last Thursday of current month, rolling to next month if already past."""
+    d = _last_thursday_of_month(today.year, today.month)
+    if d < today:
+        nxt_month = today.month + 1 if today.month < 12 else 1
+        nxt_year  = today.year if today.month < 12 else today.year + 1
+        d = _last_thursday_of_month(nxt_year, nxt_month)
+    return d
 
 
 def _guess_expiry(symbol: str) -> str:
-    """Return Angel One expiry string (e.g. '09Jun2026') for nearest valid expiry."""
+    """Return Angel One expiry string (e.g. '09Jun2026') for the nearest valid expiry.
+
+    Expiry rules (NSE F&O schedule):
+      - Weekly index contracts (NIFTY, BANKNIFTY, etc.): nearest upcoming Tuesday.
+      - Stock monthly contracts: last Thursday of the current (or next) month.
+    """
     today = date.today()
-    if symbol == "NIFTY":
-        d = _next_tuesday(today)
+    if symbol in _WEEKLY_TUESDAY_EXPIRY:
+        d = _next_weekday(today, weekday=1)   # 1 = Tuesday
     else:
-        d = _last_tuesday_of_month(today.year, today.month)
-        if d < today:
-            if today.month == 12:
-                d = _last_tuesday_of_month(today.year + 1, 1)
-            else:
-                d = _last_tuesday_of_month(today.year, today.month + 1)
+        d = _nearest_stock_monthly_expiry(today)
     return d.strftime("%d%b%Y")
 
 
