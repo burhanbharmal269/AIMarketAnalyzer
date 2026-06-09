@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from app.core.constants import SCAN_CACHE_TTL_SECS, SCAN_AUDIT_KEEP_DAYS, SCORE_CATEGORIES, SCORE_MAX_RAW
+from app.core.constants import SCAN_CACHE_TTL_SECS, SCAN_AUDIT_KEEP_DAYS, SCORE_CATEGORIES, SCORE_MAX_RAW, SP500_GATE_PCT
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,31 @@ def build_scan(
     )
 
     candidates, market = _live_data()
+
+    # ── Global cues gate: block BUY/CE when S&P 500 prev session < -1% ───────
+    # A US drop of >1% overnight correlates with NSE gap-down opens and elevated
+    # CE risk. On such days only SELL/PE setups are permitted.
+    try:
+        from app.services.ai import get_sp500_change
+        sp_chg = get_sp500_change()
+        if sp_chg is not None and sp_chg < SP500_GATE_PCT:
+            before_gate = len(candidates)
+            candidates  = [c for c in candidates if c.get("direction") != "BUY"]
+            blocked     = before_gate - len(candidates)
+            market["globalCuesGate"] = {
+                "triggered": True,
+                "sp500Change": sp_chg,
+                "threshold": SP500_GATE_PCT,
+                "blockedBuyCandidates": blocked,
+            }
+            logger.info(
+                "Global cues gate: S&P500 %+.2f%% (threshold %.1f%%) — blocked %d BUY/CE candidates",
+                sp_chg, SP500_GATE_PCT, blocked,
+            )
+        else:
+            market["globalCuesGate"] = {"triggered": False, "sp500Change": sp_chg}
+    except Exception as exc:
+        logger.debug("Global cues gate skipped: %s", exc)
 
     # ── AI: regime classification (one call, injected into market dict) ───────
     if openai_enabled():

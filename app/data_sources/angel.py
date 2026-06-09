@@ -137,6 +137,20 @@ _STOCK_TOKENS: dict[str, tuple[str, str]] = {
     "EICHERMOT":   ("NSE", "910"),
     "APOLLOHOSP":  ("NSE", "157"),
     "TATACONSUM":  ("NSE", "3432"),
+    # Tier-2 expansion — verified Angel One ScripMaster tokens
+    "TATAMOTORS":  ("NSE", "3456"),
+    "BPCL":        ("NSE", "526"),
+    "ITC":         ("NSE", "1660"),
+    "BEL":         ("NSE", "383"),
+    "BRITANNIA":   ("NSE", "547"),
+    "HEROMOTOCO":  ("NSE", "1348"),
+    "BANKBARODA":  ("NSE", "4668"),
+    "PNB":         ("NSE", "2730"),
+    "AUROPHARMA":  ("NSE", "275"),
+    "VEDL":        ("NSE", "3063"),
+    "TATAPOWER":   ("NSE", "3426"),
+    # Dynamic lookup via searchScrip for newer listings
+    # COALINDIA, DLF, GODREJCP, ZOMATO, LTIM, PERSISTENT, CHOLAFIN, BAJAJ-AUTO, DMART
 }
 
 _INDEX_SYMBOLS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
@@ -157,6 +171,16 @@ _LOT_SIZES = {
     "HDFCLIFE": 1100, "EICHERMOT": 100, "NESTLEIND": 50,
     "POWERGRID": 4800, "DIVISLAB": 200, "APOLLOHOSP": 125,
     "TATACONSUM": 1350,
+    # Tier-2 expansion (lot sizes as of 2025 — verify quarterly from NSE F&O circulars)
+    "TATAMOTORS": 1425, "BAJAJ-AUTO": 125,  "HEROMOTOCO": 300,
+    "BANKBARODA": 5850, "PNB":        8000,
+    "BPCL":       1800, "COALINDIA":  4200,  "ITC":        3200, "TATAPOWER":  4350,
+    "BEL":        2900, "DLF":        1350,
+    "VEDL":       4100,
+    "AUROPHARMA": 650,  "BRITANNIA":  200,   "GODREJCP":   500,
+    "ZOMATO":     4500, "DMART":      132,
+    "LTIM":       150,  "PERSISTENT": 125,
+    "CHOLAFIN":   1250,
 }
 
 
@@ -716,21 +740,36 @@ def get_daily_ohlcv(symbol: str, days: int = 400) -> "pd.DataFrame | None":
 # ── F&O universe ──────────────────────────────────────────────────────────────
 
 def get_fo_universe() -> list[str]:
-    """Full scan universe — 40 liquid F&O instruments."""
+    """Full scan universe — 61 liquid F&O instruments.
+
+    Tier-1 (41): original high-conviction stocks with confirmed option liquidity.
+    Tier-2 (20): expanded coverage — liquid F&O stocks added to increase trade opportunities
+                 without sacrificing quality (AI shortlist filters to best setups).
+    """
     return [
         # Indices (most liquid, always first)
         "NIFTY", "BANKNIFTY",
-        # Large-cap (highest option OI and volume)
+        # Tier-1: Large-cap (highest option OI and volume)
         "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS",
         "AXISBANK", "KOTAKBANK", "SBIN", "LT", "WIPRO",
         "BHARTIARTL", "HCLTECH", "BAJFINANCE", "BAJAJFINSV",
-        # Mid/large cap with strong F&O activity
+        # Tier-1: Mid/large cap with strong F&O activity
         "MARUTI", "SUNPHARMA", "TECHM", "TITAN", "ASIANPAINT",
         "HINDUNILVR", "ULTRACEMCO", "NESTLEIND", "POWERGRID",
         "NTPC", "ONGC", "M&M", "ADANIPORTS", "JSWSTEEL",
         "TATASTEEL", "HINDALCO", "GRASIM", "DRREDDY", "CIPLA",
         "DIVISLAB", "INDUSINDBK", "HDFCLIFE", "EICHERMOT",
         "APOLLOHOSP", "TATACONSUM",
+        # Tier-2: Expansion — more sectors, more trade candidates
+        "TATAMOTORS", "BAJAJ-AUTO", "HEROMOTOCO",   # auto (broader coverage)
+        "BANKBARODA", "PNB",                          # PSU banks (high OI)
+        "BPCL", "COALINDIA", "ITC", "TATAPOWER",     # energy + diversified
+        "BEL", "DLF",                                 # defense + realty
+        "VEDL",                                       # metals (non-ferrous)
+        "AUROPHARMA", "BRITANNIA", "GODREJCP",        # pharma + FMCG
+        "ZOMATO", "DMART",                            # new-economy consumer
+        "LTIM", "PERSISTENT",                         # mid-cap IT
+        "CHOLAFIN",                                   # NBFC
     ]
 
 

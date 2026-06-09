@@ -96,19 +96,35 @@ SECTOR_MAP: dict[str, str] = {
     "NIFTY": "index", "BANKNIFTY": "index",
     "HDFCBANK":   "banking",  "ICICIBANK":  "banking",  "AXISBANK":    "banking",
     "KOTAKBANK":  "banking",  "SBIN":       "banking",  "INDUSINDBK":  "banking",
+    "BANKBARODA": "banking",  "PNB":        "banking",
     "BAJFINANCE": "finance",  "BAJAJFINSV": "finance",  "HDFCLIFE":    "finance",
+    "CHOLAFIN":   "finance",
     "INFY":       "it",       "TCS":        "it",       "WIPRO":       "it",
-    "HCLTECH":    "it",       "TECHM":      "it",
-    "RELIANCE":   "oil_gas",  "ONGC":       "oil_gas",
+    "HCLTECH":    "it",       "TECHM":      "it",       "LTIM":        "it",
+    "PERSISTENT": "it",
+    "RELIANCE":   "oil_gas",  "ONGC":       "oil_gas",  "BPCL":        "oil_gas",
     "BHARTIARTL": "telecom",
     "MARUTI":     "auto",     "EICHERMOT":  "auto",     "M&M":         "auto",
+    "TATAMOTORS": "auto",     "BAJAJ-AUTO": "auto",     "HEROMOTOCO":  "auto",
     "SUNPHARMA":  "pharma",   "DRREDDY":    "pharma",   "CIPLA":       "pharma",
-    "DIVISLAB":   "pharma",
+    "DIVISLAB":   "pharma",   "AUROPHARMA": "pharma",
     "HINDUNILVR": "fmcg",     "NESTLEIND":  "fmcg",     "TATACONSUM":  "fmcg",
+    "ITC":        "fmcg",     "BRITANNIA":  "fmcg",     "GODREJCP":    "fmcg",
     "LT":         "infra",    "ADANIPORTS": "infra",    "POWERGRID":   "infra",
-    "NTPC":       "infra",
+    "NTPC":       "infra",    "TATAPOWER":  "infra",
     "JSWSTEEL":   "metals",   "TATASTEEL":  "metals",   "HINDALCO":    "metals",
+    "VEDL":       "metals",
+    "COALINDIA":  "energy",
     "ULTRACEMCO": "cement",   "GRASIM":     "cement",
     "ASIANPAINT": "consumer", "TITAN":      "consumer", "APOLLOHOSP":  "consumer",
+    "ZOMATO":     "consumer", "DMART":      "consumer",
+    "BEL":        "defense",
+    "DLF":        "realty",
 }
 EXEMPT_SECTOR = "index"   # sectors with this value bypass the concentration gate
+
+# ── Global cues gate ──────────────────────────────────────────────────────────
+# If S&P 500 previous session < this threshold, block all BUY/CE candidates.
+# Rationale: >1% US overnight drop correlates strongly with NSE gap-down opens
+# and elevated CE risk. Only PE/SELL setups are permitted on such days.
+SP500_GATE_PCT: float = -1.0

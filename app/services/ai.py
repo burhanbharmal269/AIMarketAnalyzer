@@ -7,7 +7,7 @@ from datetime import date
 from app.config import settings
 
 # ── global market snapshot (S&P 500 + USD/INR) ───────────────────────────────
-_GLOBAL_CACHE: dict = {}   # {"data": {...}, "ts": float}
+_GLOBAL_CACHE: dict = {}   # {"data": str, "sp_chg": float|None, "ts": float}
 _GLOBAL_TTL = 900          # 15 min — stale enough to not hammer yfinance
 
 def _get_global_context() -> str:
@@ -15,6 +15,7 @@ def _get_global_context() -> str:
     global _GLOBAL_CACHE
     if _GLOBAL_CACHE and time.time() - _GLOBAL_CACHE["ts"] < _GLOBAL_TTL:
         return _GLOBAL_CACHE["data"]
+    sp_chg_val: float | None = None
     try:
         import yfinance as yf
         tickers = yf.download("^GSPC USDINR=X", period="5d", interval="1d",
@@ -24,16 +25,30 @@ def _get_global_context() -> str:
         usd_series = closes["USDINR=X"].dropna()
         parts = []
         if len(sp_series) >= 2:
-            sp_chg = round((sp_series.iloc[-1] / sp_series.iloc[-2] - 1) * 100, 2)
-            parts.append(f"S&P 500 prev session: {sp_chg:+.2f}%")
+            sp_chg_val = round((sp_series.iloc[-1] / sp_series.iloc[-2] - 1) * 100, 2)
+            parts.append(f"S&P 500 prev session: {sp_chg_val:+.2f}%")
         if len(usd_series) >= 1:
             usd_inr = round(float(usd_series.iloc[-1]), 2)
             parts.append(f"USD/INR: {usd_inr}")
         line = " | ".join(parts)
     except Exception:
         line = ""
-    _GLOBAL_CACHE = {"data": line, "ts": time.time()}
+    _GLOBAL_CACHE = {"data": line, "sp_chg": sp_chg_val, "ts": time.time()}
     return line
+
+
+def get_sp500_change() -> float | None:
+    """Return previous S&P 500 session % change as a float (e.g. -1.23), or None if unavailable.
+
+    Used by scan_service for the global cues gate — blocks BUY/CE candidates when
+    the US market closed down more than the SP500_GATE_PCT threshold.
+    Result is cached for 15 min alongside _get_global_context().
+    """
+    global _GLOBAL_CACHE
+    if _GLOBAL_CACHE and time.time() - _GLOBAL_CACHE["ts"] < _GLOBAL_TTL:
+        return _GLOBAL_CACHE.get("sp_chg")
+    _get_global_context()   # populates cache including sp_chg
+    return _GLOBAL_CACHE.get("sp_chg")
 
 # ── caches — all keyed with today's date so they reset each trading day ───────
 _EXPLANATION_CACHE: dict = {}   # (instrument, score_bucket, date) -> str
@@ -433,10 +448,12 @@ def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
         iv_str   = f"ivRank={round(iv_rank)}" if iv_rank is not None else "ivRank=n/a"
         vol_str  = f"relVol={round(rel_vol, 1)}" if (rel_vol is not None and rel_vol > 0) else "relVol=n/a(closed)"
         vwap_str = "vwap=yes" if c.get('vwapConfirmed') else ("vwap=n/a(closed)" if (rel_vol or 0) == 0 else "vwap=no")
+        tf15 = c.get('tf15Aligned', False)
         rows.append(
             f"{sym}: dir={c['direction']} ema={ema_tag} rsi={c['rsi'] or 50} "
             f"adx={c['adx'] or 0} adxRising={c.get('adxRising') or False} "
             f"macd={'confirms' if macd_ok else 'diverges'} "
+            f"tf15={'aligned' if tf15 else 'mixed'} "
             f"{vol_str} {iv_str} {vwap_str} "
             f"eventRisk={c.get('eventRisk') or False} "
             f"sector={SECTOR_MAP.get(sym, 'other')}"
@@ -512,20 +529,28 @@ UNIVERSAL HARD GATES (skip regardless of strategy):
 3. EMA alignment required for non-mean-reversion strategies: direction must match EMA stack.
    (Mean reversion is the only strategy where mixed EMA is acceptable.)
 
-QUALITY SCORING for {strat_name} — score 0-5 pts, shortlist highest scorers:
+QUALITY SCORING for {strat_name} — score 0-6 pts, shortlist highest scorers:
 +2  ADX >= {min_adx + 5} (strong trend for this strategy). ADX {min_adx}-{min_adx + 4} = +1. Below {min_adx} = +0.
 +1  RSI in strategy zone: BUY = {rsi_lo}-{rsi_hi}, SELL = {100 - rsi_hi}-{100 - rsi_lo}.
 +1  MACD confirms direction (macd=confirms).
++1  tf15=aligned (15-min Supertrend confirms daily direction — multi-timeframe confluence).
 +1  relVol >= 0.9. relVol=n/a(closed) = neutral (+0), do NOT penalise missing data.
 +1  vwap=yes. vwap=n/a(closed) = neutral (+0), do NOT penalise missing data.
 NOTE: Low ivRank is GOOD (cheap options). Only gate on ivRank > {iv_max}, don't use in scoring.
 
 SELECTION RULES:
-- Shortlist candidates scoring >= 2 points.
-- If fewer than 3 candidates score >= 2, admit top-3 by score anyway — always return candidates.
+- Shortlist candidates scoring >= 3 points (ensures multi-signal confluence — higher win rate).
+- If fewer than 3 candidates score >= 3, admit top-3 by score anyway — always return candidates.
 - Max 1 symbol per sector. Pick highest scorer per sector.
 {"- NIFTY and BANKNIFTY get +1 liquidity bonus. Prefer them when EMA aligned." if prefer_index else "- Stocks can outperform indices in this strategy. Evaluate on merit."}
 - Always include at least 1 index (NIFTY or BANKNIFTY) if EMA is aligned.
+
+PRIME ENTRY WINDOWS (IST):
+- 10:00–11:30: High-quality momentum setups after opening volatility settles. Best for Momentum and VWAP strategies.
+- 13:00–14:00: Post-lunch breakout / continuation window. Avoid 11:30–13:00 (low-volume drift, stop-hunts).
+- 09:15–10:00 (ORB only): Opening Range Breakout entries — valid ONLY for ORB strategy.
+- 14:30–15:15: Pre-close momentum. Avoid entering < 30 min before close (theta and slippage risk).
+Flag any setup where the current time is outside these windows as "off-window" — lower priority.
 
 REGIME RULE:
 {regime_rule}
