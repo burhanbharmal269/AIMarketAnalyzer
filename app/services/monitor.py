@@ -181,8 +181,8 @@ def _check_positions(nse_data, send_fn) -> None:
 
         # T2 hit — auto-close as win (conservative paper-trade exit)
         elif t2_px > 0 and current >= t2_px and (eid, "t2") not in _alerted:
-            _alerted.add((eid, "t1"))
-            _alerted.add((eid, "t2"))
+            for lvl in ("t1", "t2", "t3"):   # mark all — position is fully closed
+                _alerted.add((eid, lvl))
             pnl_r = _pnl(current)
             final_pnl = min(pnl_r, 5.0)
             update_journal_entry(eid, {
@@ -198,34 +198,8 @@ def _check_positions(nse_data, send_fn) -> None:
                     logger.debug("signal_log outcome update failed: %s", exc)
             _send_alert(send_fn, "T2 HIT — AUTO CLOSED", instrument, entry_px, current, t2_px, pnl_r)
 
-        # Time-based exit — if 14:15 IST passed with no T1 hit, theta decay accelerates.
-        # Closing 75 min before session end preserves capital vs holding a stalled trade.
-        # Only fires when T1 has NOT been hit (trailed stop already protects T1+ trades).
-        # Uses Angel One LTP (via _get_option_price) for the exit price.
-        now_ist = datetime.now(IST)
-        past_cutoff = now_ist.hour > 14 or (now_ist.hour == 14 and now_ist.minute >= 15)
-        if (past_cutoff
-                and (eid, "t1")        not in _alerted
-                and (eid, "time_exit") not in _alerted):
-            _alerted.add((eid, "time_exit"))
-            pnl_r     = _pnl(current)
-            final_pnl = round(pnl_r, 2)
-            outcome   = "loss" if current < entry_px else "win"
-            update_journal_entry(eid, {
-                "status":     "closed",
-                "outcome":    outcome,
-                "exit_price": current,
-                "pnl_r":      final_pnl,
-            })
-            if sig_id:
-                try:
-                    update_signal_outcome(sig_id, outcome, current, final_pnl, "time_exit")
-                except Exception as exc:
-                    logger.debug("signal_log time-exit update failed: %s", exc)
-            _send_alert(send_fn, "TIME EXIT — 14:15 IST, no T1 hit",
-                        instrument, entry_px, current, entry_px, pnl_r)
-
-        # T1 hit — move stop to breakeven, let trade run to T2/T3
+        # T1 hit — move stop to breakeven, let trade run to T2/T3.
+        # Must stay BEFORE time-exit in the elif chain so a T1 hit is never overridden.
         elif t1_px > 0 and current >= t1_px and (eid, "t1") not in _alerted:
             _alerted.add((eid, "t1"))
             # Trail: stop moves from original SL to entry price (guaranteed breakeven).
@@ -244,6 +218,33 @@ def _check_positions(nse_data, send_fn) -> None:
                         pass
             _send_alert(send_fn, "T1 HIT — Stop trailed to breakeven",
                         instrument, entry_px, current, t1_px, _pnl(current))
+
+        # Time-based exit — last branch in the chain so it never overrides SL/T1/T2/T3.
+        # If open past 14:15 IST with NO T1 hit, theta acceleration outweighs holding.
+        # Trades where T1 was already hit have stop at breakeven — they stay open to T2/T3.
+        elif (
+            (datetime.now(IST).hour > 14
+             or (datetime.now(IST).hour == 14 and datetime.now(IST).minute >= 15))
+            and (eid, "t1")        not in _alerted
+            and (eid, "time_exit") not in _alerted
+        ):
+            _alerted.add((eid, "time_exit"))
+            pnl_r     = _pnl(current)
+            final_pnl = round(pnl_r, 2)
+            outcome   = "loss" if current < entry_px else "win"
+            update_journal_entry(eid, {
+                "status":     "closed",
+                "outcome":    outcome,
+                "exit_price": current,
+                "pnl_r":      final_pnl,
+            })
+            if sig_id:
+                try:
+                    update_signal_outcome(sig_id, outcome, current, final_pnl, "time_exit")
+                except Exception as exc:
+                    logger.debug("signal_log time-exit update failed: %s", exc)
+            _send_alert(send_fn, "TIME EXIT — 14:15 IST, no T1 hit",
+                        instrument, entry_px, current, entry_px, pnl_r)
 
 
 def _session_healthy(nse_data) -> bool:

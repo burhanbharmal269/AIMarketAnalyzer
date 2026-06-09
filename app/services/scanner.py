@@ -3,8 +3,8 @@ from zoneinfo import ZoneInfo
 
 
 CATEGORY_MAX = {
-    "trend":       33,   # +3 headroom for 15-min Supertrend (Angel One intraday)
-    "momentum":    23,   # +3 headroom for MACD histogram expansion
+    "trend":       33,   # +3 for 15-min Supertrend (Angel One intraday)
+    "momentum":    23,   # +3 for MACD histogram expansion
     "volume":      15,
     "optionChain": 20,
     "sentiment":   10,
@@ -12,10 +12,11 @@ CATEGORY_MAX = {
     "news":         5,   # AI news sentiment — directional news alignment bonus/penalty
 }
 
-# Raw scores sum to 110 max. Normalise to 100 so UI, minScore, and user
-# perception are consistent. All comparisons (minScore=70) are against the
-# normalised total, not the raw sum.
-_SCORE_MAX_RAW = sum(CATEGORY_MAX.values())   # 110
+# Raw scores sum to 116 max (was 110 before 15-min ST + MACD histogram were added).
+# Normalised to 100 so UI, minScore, and comparisons are consistent.
+# minScore=70 → raw threshold ≈ 81/116.  Previous: raw ≈ 77/110.
+# The ~4-point rise in the raw bar is intentional: new signals raise the quality floor.
+_SCORE_MAX_RAW = sum(CATEGORY_MAX.values())   # 116
 
 
 DEFAULT_SETTINGS = {
@@ -161,16 +162,15 @@ def momentum_score(candidate):
 
     # MACD histogram expansion — momentum building vs fading.
     # Expanding histogram (gap between MACD and signal growing) = trend accelerating.
-    # Contracting histogram near zero = crossover imminent, momentum stalling.
-    if candidate.get("macdHistExpanding"):
-        # Confirm expansion is in the right direction
-        hist = candidate.get("macdHistogram", 0)
+    # Contracting histogram that is < 10% of MACD value = crossover imminent, stalling.
+    # hist == 0.0 means no intraday data (daily fallback) — no penalty applied.
+    hist = candidate.get("macdHistogram", 0.0)
+    macd_abs = abs(candidate.get("macd", 0.0))
+    if candidate.get("macdHistExpanding") and hist != 0.0:
         if (direction == "BUY" and hist > 0) or (direction == "SELL" and hist < 0):
             score += 3   # momentum building in trade direction
-    else:
-        hist = candidate.get("macdHistogram", 0)
-        if abs(hist) < 0.001:
-            score -= 1   # histogram near zero = crossover imminent, avoid entering
+    elif hist != 0.0 and macd_abs > 0 and abs(hist) < 0.10 * macd_abs:
+        score -= 1   # histogram shrinking toward zero = momentum fading, avoid entering
 
     # ADX — trend strength (directional move quality)
     adx = candidate["adx"]

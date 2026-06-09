@@ -21,6 +21,19 @@ from zoneinfo import ZoneInfo
 logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 
+# ── Ensure .env is loaded regardless of import order ─────────────────────────
+# ANGEL_AVAILABLE is read at module load time via os.getenv. If angel.py is
+# imported before config.py (test scripts, direct imports), the .env file may
+# not yet be in os.environ and all four vars would read as empty strings,
+# silently disabling Angel One even when credentials are correctly configured.
+# Loading dotenv here is idempotent — it does NOT overwrite vars already set.
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    import pathlib as _pathlib
+    _load_dotenv(_pathlib.Path(__file__).resolve().parents[2] / ".env")
+except Exception:
+    pass
+
 # ── Credentials ───────────────────────────────────────────────────────────────
 ANGEL_API_KEY     = os.getenv("ANGEL_API_KEY", "")
 ANGEL_CLIENT_ID   = os.getenv("ANGEL_CLIENT_ID", "")
