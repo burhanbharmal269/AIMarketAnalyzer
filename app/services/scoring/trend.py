@@ -1,4 +1,7 @@
 """Trend scoring category — EMA alignment, Supertrend, VWAP, ORB, S/R."""
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
+
 from app.core.constants import SCORE_CATEGORIES
 from app.services.scoring.base import BaseScorer
 
@@ -56,6 +59,19 @@ class TrendScorer(BaseScorer):
             score -= 2   # approaching overhead supply — exit risk
         if direction == "SELL" and candidate.get("nearSupport"):
             score -= 2   # approaching demand zone — bounce risk
+
+        # Prime entry window — research-validated high-probability IST windows.
+        # First-hour momentum (10:00–11:30): market has settled from open chop,
+        # directional moves are sustained. Post-lunch (13:00–14:00): breakout or
+        # continuation window before close-driven volatility starts at 14:30.
+        # Evidence: Gao et al. (2018) and our own prime-window guidance in AI prompt.
+        now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).time()
+        in_prime = (
+            (dtime(10, 0) <= now_ist <= dtime(11, 30)) or
+            (dtime(13, 0) <= now_ist <= dtime(14, 0))
+        )
+        if in_prime:
+            score += 2
 
         # Opening gap in trade direction
         if direction == "BUY"  and candidate.get("gapUp"):

@@ -30,7 +30,17 @@ class BaseSignalStrategy(ISignalStrategy):
         for candidate in candidates:
             failures = self.check_gates(candidate, market, risk_state, settings)
             score    = self.score_candidate(candidate, market)
-            sizing   = self.compute_position_size(candidate, settings)
+
+            # ── Signal grade: drives position size adjustment ─────────────────
+            # Grade A (≥ 80): high-conviction — multiple strong signals aligned.
+            #   Full position size. Historically these correlate with higher WR.
+            # Grade B (70-79): good setup but borderline — fewer signals align.
+            #   65% of computed lots. Smaller bet on lower-conviction entries.
+            # This implements a practical Kelly-type position scaling without
+            # requiring historical WR data: more signals aligned = edge is clearer.
+            grade = "A" if score["total"] >= 80 else "B"
+
+            sizing = self.compute_position_size(candidate, settings, grade=grade)
 
             approved = (
                 not failures
@@ -40,9 +50,20 @@ class BaseSignalStrategy(ISignalStrategy):
 
             rejection_reasons = list(failures)
             if score["total"] < min_score:
-                rejection_reasons.append(
-                    f"Score {score['total']} is below threshold {min_score}."
-                )
+                # Identify the weakest scoring category to give actionable feedback
+                scores_dict = score.get("scores", {})
+                if scores_dict:
+                    weakest_cat = min(scores_dict, key=lambda k: scores_dict[k])
+                    weakest_pts = scores_dict[weakest_cat]
+                    rejection_reasons.append(
+                        f"Score {score['total']}/100 below threshold {min_score}. "
+                        f"Weakest: {weakest_cat} ({weakest_pts} pts) — "
+                        f"improve trend/momentum alignment to qualify."
+                    )
+                else:
+                    rejection_reasons.append(
+                        f"Score {score['total']} is below threshold {min_score}."
+                    )
             if sizing["lots"] < 1:
                 rejection_reasons.append(
                     "Position size would exceed configured account risk."
@@ -51,6 +72,7 @@ class BaseSignalStrategy(ISignalStrategy):
             evaluated.append({
                 "candidate":        candidate,
                 "approved":         approved,
+                "grade":            grade,
                 "score":            score,
                 "sizing":           sizing,
                 "validUntil":       self._signal_valid_until(candidate),

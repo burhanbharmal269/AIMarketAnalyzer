@@ -61,17 +61,30 @@ class OptionsTradingStrategy(BaseSignalStrategy):
     ) -> list[str]:
         return self._gate_engine.check(candidate, market, risk_state, settings)
 
-    def compute_position_size(self, candidate: dict, settings: dict) -> dict:
+    # Grade multipliers: Grade A = full size, Grade B = 65% (Kelly-inspired scaling)
+    _GRADE_MULTIPLIER = {"A": 1.0, "B": 0.65}
+
+    def compute_position_size(self, candidate: dict, settings: dict, grade: str = "A") -> dict:
         rupee_risk    = settings["accountCapital"] * (settings["riskPercent"] / 100)
         per_unit_risk = abs(candidate["entry"] - candidate["stopLoss"])
         lot_risk      = per_unit_risk * candidate["lotSize"]
-        lots          = int(rupee_risk // lot_risk) if lot_risk else 0
+        full_lots     = int(rupee_risk // lot_risk) if lot_risk else 0
+
+        # Scale lots by grade — Grade B gets 65% to reflect lower conviction
+        multiplier    = self._GRADE_MULTIPLIER.get(grade, 1.0)
+        lots          = max(0, int(full_lots * multiplier))
+
         return {
-            "rupeeRisk":    round(rupee_risk),
+            "rupeeRisk":    round(rupee_risk * multiplier),
             "perUnitRisk":  round(per_unit_risk, 2),
             "lotRisk":      round(lot_risk),
-            "lots":         max(0, lots),
-            "quantity":     max(0, lots) * candidate["lotSize"],
+            "lots":         lots,
+            "quantity":     lots * candidate["lotSize"],
+            "grade":        grade,
+            "gradeNote":    (
+                "Full size — high-conviction (score ≥ 80)." if grade == "A"
+                else "Reduced to 65% — good setup, borderline score (70-79)."
+            ),
         }
 
     # ── Post-filter: sector concentration ────────────────────────────────────
