@@ -413,7 +413,7 @@ def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
     all_symbols = [c["underlying"] for c in candidates]
 
     if not openai_enabled():
-        return {"shortlist": all_symbols, "skipped": {}, "regimeNote": "", "source": "fallback"}
+        return {"shortlist": all_symbols, "skipped": {}, "regimeNote": "", "source": "fallback", "strategy": None}
 
     from app.core.constants import SECTOR_MAP
     from app.services.signal_analytics import get_performance_context
@@ -455,6 +455,11 @@ def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
             "Use this to down-rank symbols/score-ranges that historically underperform."
         )
 
+    # ── Strategy selection (regime-aware) ────────────────────────────────────
+    from app.services.strategies.regime_selector import select_strategy, strategy_summary
+    strategy  = select_strategy(market, candidates)
+    logger.info("AI shortlist using strategy: %s", strategy_summary(strategy))
+
     # ── Layer 3: regime-conditioned rules ─────────────────────────────────────
     vix       = market.get("indiaVix", 15)
     regime    = market.get("regime", "neutral")
@@ -486,41 +491,53 @@ def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
         max_candidates = min(max_candidates, 6)
         regime_rule += " AI regime action=REDUCE: cut shortlist to preserve capital."
 
-    system = """You are a senior NSE F&O desk analyst. Shortlist the most promising \
-option-chain candidates so we only call the Angel One API for symbols worth trading.
+    rsi_lo, rsi_hi = strategy["entryRSI"]
+    min_adx        = strategy["minADX"]
+    iv_max         = strategy["ivRankMax"]
+    strat_name     = strategy["name"]
+    strat_hint     = strategy["aiHint"]
+    prefer_index   = strategy["preferIndex"]
 
-HARD GATES — skip immediately if any of these fail (no exceptions):
-1. EMA alignment: 20>50>200 for BUY, 20<50<200 for SELL. Mixed EMA = skip.
-2. IV Rank > 60: buying expensive options destroys edge. Skip.
-3. eventRisk=True: earnings/event within 2 days = binary risk. Skip.
+    system = f"""You are a senior NSE F&O desk analyst executing the **{strat_name}** strategy.
 
-QUALITY SCORING — score each surviving candidate 0-5 points, shortlist the highest scorers:
-+2  ADX >= 25 (strong trend). ADX 18-24 = +1 (weak trend). ADX < 18 = +0.
-+1  RSI in momentum zone: BUY = 42-76 (trend continuation; mild overbought ok for momentum),
-    SELL = 24-68 (overbought-reversal is a valid PE entry, do not penalise RSI 56-68 for SELL).
-+1  MACD confirms direction (macd=confirms). Diverging = -0, not a disqualifier.
-+1  relVol >= 0.9. If relVol=n/a(closed) treat as neutral (+0), do NOT penalise.
-+1  vwap=yes. If vwap=n/a(closed) treat as neutral (+0), do NOT penalise.
-NOTE: ivRank is a HARD GATE only — low ivRank (< 60) is GOOD (cheap options). Do not use ivRank in scoring.
+ACTIVE STRATEGY: {strat_name}
+{strategy['description']}
+
+STRATEGY-SPECIFIC ENTRY CRITERIA (use these, not generic rules):
+{strat_hint}
+
+UNIVERSAL HARD GATES (skip regardless of strategy):
+1. eventRisk=True — binary earnings/event risk. Always skip.
+2. ivRank > {iv_max} — buying overpriced premium destroys edge in any strategy.
+3. EMA alignment required for non-mean-reversion strategies: direction must match EMA stack.
+   (Mean reversion is the only strategy where mixed EMA is acceptable.)
+
+QUALITY SCORING for {strat_name} — score 0-5 pts, shortlist highest scorers:
++2  ADX >= {min_adx + 5} (strong trend for this strategy). ADX {min_adx}-{min_adx + 4} = +1. Below {min_adx} = +0.
++1  RSI in strategy zone: BUY = {rsi_lo}-{rsi_hi}, SELL = {100 - rsi_hi}-{100 - rsi_lo}.
++1  MACD confirms direction (macd=confirms).
++1  relVol >= 0.9. relVol=n/a(closed) = neutral (+0), do NOT penalise missing data.
++1  vwap=yes. vwap=n/a(closed) = neutral (+0), do NOT penalise missing data.
+NOTE: Low ivRank is GOOD (cheap options). Only gate on ivRank > {iv_max}, don't use in scoring.
 
 SELECTION RULES:
-- Shortlist candidates scoring >= 2 points (at least 2 quality signals present).
-- If no candidate scores >= 2, admit the top 3 by score anyway — always return something.
-- Max 1 symbol per sector (banking, IT, pharma, oil_gas, etc.). Pick highest scorer per sector.
-- Indices (NIFTY, BANKNIFTY) get a +1 bonus for liquidity — always prefer them when EMA aligned.
-- Always include NIFTY or BANKNIFTY if their EMA is aligned, regardless of other scores.
+- Shortlist candidates scoring >= 2 points.
+- If fewer than 3 candidates score >= 2, admit top-3 by score anyway — always return candidates.
+- Max 1 symbol per sector. Pick highest scorer per sector.
+{"- NIFTY and BANKNIFTY get +1 liquidity bonus. Prefer them when EMA aligned." if prefer_index else "- Stocks can outperform indices in this strategy. Evaluate on merit."}
+- Always include at least 1 index (NIFTY or BANKNIFTY) if EMA is aligned.
 
-REGIME RULE (applied after scoring):
-""" + regime_rule + f"""
+REGIME RULE:
+{regime_rule}
 
-Current market: regime={regime}, bias={bias}, VIX={vix:.1f}
+Current market: strategy={strategy['shortName']}, regime={regime}, bias={bias}, VIX={vix:.1f}
 Return at most {max_candidates} symbols.""" + perf_block + """
 
-OUTPUT: Respond with valid JSON only. No markdown, no extra text.
+OUTPUT: Valid JSON only. No markdown, no extra text outside the JSON.
 {
   "shortlist": ["SYM1", "SYM2", ...],
   "skipped": {"SYM": "one-line reason", ...},
-  "regimeNote": "one sentence on how regime shaped the shortlist"
+  "regimeNote": "one sentence on strategy selected and why"
 }"""
 
     user = f"Candidate indicators:\n{candidate_table}"
@@ -549,6 +566,15 @@ OUTPUT: Respond with valid JSON only. No markdown, no extra text.
             "skipped":     data.get("skipped", {}),
             "regimeNote":  data.get("regimeNote", ""),
             "source":      "ai",
+            "strategy":    {
+                "key":         strategy["key"],
+                "name":        strategy["name"],
+                "shortName":   strategy["shortName"],
+                "selectedBy":  strategy["selectedBy"],
+                "typicalWinRate": strategy["typicalWinRate"],
+                "typicalRR":   strategy["typicalRR"],
+                "description": strategy["description"],
+            },
         }
     except Exception as exc:
         logger.warning("AI shortlist parse failed (%s) — falling back to all candidates", exc)
