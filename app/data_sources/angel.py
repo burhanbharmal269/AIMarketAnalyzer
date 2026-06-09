@@ -143,33 +143,59 @@ class AngelOneSession:
     def is_configured(self) -> bool:
         return ANGEL_AVAILABLE and _SMARTAPI and _PYOTP
 
-    def login(self) -> bool:
+    def login(self, retries: int = 3) -> bool:
+        """Login with TOTP retry — regenerates code each attempt to handle clock skew."""
         if not self.is_configured():
+            logger.warning("Angel One not configured — check env vars")
             return False
         with self._lock:
-            try:
-                totp_code = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
-                obj = SmartConnect(api_key=ANGEL_API_KEY)
-                resp = obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp_code)
-                if not resp or resp.get("status") is False:
-                    logger.error("Angel One login failed: %s",
-                                 resp.get("message", "no response") if resp else "no response")
-                    return False
-                self._obj = obj
-                self._logged_in_at = time.time()
-                logger.info("Angel One login OK — client %s", ANGEL_CLIENT_ID)
-                return True
-            except Exception as exc:
-                logger.error("Angel One login error: %s", exc)
-                self._obj = None
-                return False
+            for attempt in range(1, retries + 1):
+                try:
+                    totp_code = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+                    obj = SmartConnect(api_key=ANGEL_API_KEY)
+                    resp = obj.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp_code)
+                    if resp and resp.get("status") is not False and resp.get("data"):
+                        self._obj = obj
+                        self._logged_in_at = time.time()
+                        name = resp["data"].get("name", ANGEL_CLIENT_ID)
+                        logger.info("Angel One login OK — %s (attempt %d)", name, attempt)
+                        return True
+                    msg = (resp or {}).get("message", "no response")
+                    logger.warning("Angel One login attempt %d/%d failed: %s", attempt, retries, msg)
+                except Exception as exc:
+                    logger.warning("Angel One login attempt %d/%d error: %s", attempt, retries, exc)
+                if attempt < retries:
+                    time.sleep(1.5)   # wait for next TOTP window
+            logger.error("Angel One login failed after %d attempts", retries)
+            self._obj = None
+            return False
 
     def get_client(self) -> "SmartConnect | None":
+        """Return active SmartConnect client, refreshing session if expired or missing."""
         age = time.time() - self._logged_in_at
-        if self._obj is None or age > _SESSION_TTL:
-            if not self.login():
-                return None
+        # If session is fresh, return as-is
+        if self._obj is not None and age <= _SESSION_TTL:
+            return self._obj
+        # Session expired or never set — re-login
+        if not self.login():
+            return None
         return self._obj
+
+    def ensure_connected(self) -> bool:
+        """Returns True if a valid session is active (or just established)."""
+        return self.get_client() is not None
+
+    def status(self) -> dict:
+        """Return session health info for the /api/health endpoint."""
+        age = time.time() - self._logged_in_at
+        connected = self._obj is not None and age <= _SESSION_TTL
+        return {
+            "connected":     connected,
+            "configured":    self.is_configured(),
+            "session_age_s": round(age) if self._logged_in_at > 0 else None,
+            "session_ttl_s": _SESSION_TTL,
+            "client_id":     ANGEL_CLIENT_ID if ANGEL_CLIENT_ID else None,
+        }
 
     def get_token(self, symbol: str) -> tuple[str, str] | None:
         """Return (exchange, token) for a symbol. Index → hardcoded; Stock → searchScrip."""
@@ -208,6 +234,35 @@ class AngelOneSession:
 
 
 angel_session = AngelOneSession()
+
+
+def _session_keepalive_worker():
+    """Background thread: re-login 1 hour before JWT expires so scans never hit a dead session."""
+    while True:
+        try:
+            age = time.time() - angel_session._logged_in_at
+            # Refresh when 1 hour before TTL (23h window → refresh at 22h)
+            if angel_session._obj is not None and age > (_SESSION_TTL - 3600):
+                logger.info("Angel One session nearing expiry — refreshing proactively")
+                angel_session.login()
+        except Exception as exc:
+            logger.debug("Session keepalive tick error: %s", exc)
+        time.sleep(1800)   # check every 30 minutes
+
+
+def startup_login() -> bool:
+    """Call from FastAPI startup to establish session immediately.
+    Returns True if connected, False if credentials not set or login failed.
+    """
+    if not angel_session.is_configured():
+        logger.info("Angel One not configured — running in NSE-scrape mode")
+        return False
+    ok = angel_session.login()
+    if ok:
+        t = threading.Thread(target=_session_keepalive_worker, daemon=True, name="angel-keepalive")
+        t.start()
+        logger.info("Angel One keepalive thread started")
+    return ok
 
 
 # ── Expiry helpers ────────────────────────────────────────────────────────────
@@ -494,31 +549,60 @@ def get_ltp_batch(symbols: list[str]) -> dict[str, float]:
 
 # ── Option LTP (for position monitoring) ─────────────────────────────────────
 
-def get_option_ltp(underlying: str, strike: float, opt_type: str) -> float | None:
+def get_option_ltp(underlying: str, strike: float, opt_type: str,
+                   expiry_hint: str | None = None) -> dict | None:
     """
-    Get current LTP for a specific option (e.g. 'NIFTY', 24500, 'CE').
-    Looks up the option from the cached option chain data.
-    Much faster than fetching a full option chain.
+    Get real-time quote for a specific option.
+
+    Args:
+        underlying:   'NIFTY', 'BANKNIFTY', 'TCS', etc.
+        strike:       numeric strike price (e.g. 23200)
+        opt_type:     'CE' or 'PE'
+        expiry_hint:  Angel One expiry string override (e.g. '12Jun2026')
+                      If None, _guess_expiry() is used.
+
+    Returns dict with keys: ltp, change, changePct, oi, volume, iv, bid, ask
+    Returns None if not found or connection failure.
     """
     client = angel_session.get_client()
     if client is None:
+        logger.warning("get_option_ltp: Angel One not connected")
         return None
 
-    expiry_str = _guess_expiry(underlying)
+    expiry_str = expiry_hint or _guess_expiry(underlying)
     time.sleep(_RATE_LIMIT_SLEEP)
 
-    try:
-        resp = client.optionGreek({"name": underlying, "expirydate": expiry_str})
-        if not resp or not resp.get("data"):
-            return None
-        for row in resp["data"]:
-            sp = float(row.get("strikePrice", 0) or 0)
-            if abs(sp - strike) < 0.5:
+    for fmt in [expiry_str, expiry_str.upper()]:
+        try:
+            resp = client.optionGreek({"name": underlying, "expirydate": fmt})
+            if not resp or not resp.get("data"):
+                continue
+            for row in resp["data"]:
+                sp = float(row.get("strikePrice", 0) or 0)
+                if abs(sp - strike) > 0.5:
+                    continue
                 opt = row.get(opt_type) or {}
-                ltp = opt.get("lastPrice")
-                return float(ltp) if ltp else None
-    except Exception as exc:
-        logger.debug("Angel option LTP %s %s %s error: %s", underlying, strike, opt_type, exc)
+                ltp = opt.get("lastPrice") or opt.get("ltp")
+                if ltp is None:
+                    return None    # strike found but no price (market closed / expired)
+                return {
+                    "underlying": underlying,
+                    "strike":     strike,
+                    "optType":    opt_type,
+                    "expiry":     fmt,
+                    "ltp":        float(ltp),
+                    "change":     float(opt.get("change") or 0),
+                    "changePct":  float(opt.get("pChange") or 0),
+                    "oi":         int(opt.get("openInterest") or 0),
+                    "oiChange":   int(opt.get("changeinOpenInterest") or 0),
+                    "volume":     int(opt.get("totalTradedVolume") or 0),
+                    "iv":         float(opt.get("impliedVolatility") or 0),
+                    "bid":        float(opt.get("bid") or opt.get("bidPrice") or 0),
+                    "ask":        float(opt.get("ask") or opt.get("askPrice") or 0),
+                }
+        except Exception as exc:
+            logger.debug("Angel option LTP [%s] %s %s %s error: %s",
+                         fmt, underlying, strike, opt_type, exc)
     return None
 
 

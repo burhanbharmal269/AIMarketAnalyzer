@@ -139,7 +139,8 @@
   function scoreRows(item) {
     const labels = {
       trend: "Trend", momentum: "Momentum", volume: "Volume",
-      optionChain: "Option Chain", sentiment: "Sentiment", riskReward: "Risk Reward"
+      optionChain: "Option Chain", sentiment: "Sentiment", riskReward: "Risk Reward",
+      news: "News Sentiment"
     };
     return Object.keys(item.score.scores).map(function (key) {
       const value = item.score.scores[key];
@@ -250,6 +251,9 @@
 
   function renderRejectedCard(item) {
     const c = item.candidate;
+    const total = item.score.total;
+    const scoreClass = total >= 85 ? "score-high" : total >= 72 ? "score-mid" : "score-low";
+    const targets = c.targets || [0, 0, 0];
     return [
       "<article class=\"signal-card rejected-card\">",
       "<div class=\"signal-head\">",
@@ -258,16 +262,18 @@
       "<h3>" + escapeHtml(c.instrument) + "</h3>",
       "<span style=\"font-size:0.78rem;color:var(--muted)\">" + escapeHtml(c.style) + "</span>",
       "</div>",
-      "<div class=\"score-badge score-low\">",
-      "<span class=\"score-num\">" + item.score.total + "</span>",
+      "<div class=\"score-badge " + scoreClass + "\">",
+      "<span class=\"score-num\">" + total + "</span>",
       "<span class=\"score-label\">/ 100</span>",
       "</div>",
       "</div>",
       "<div class=\"trade-levels\">",
       "<div class=\"level-entry\"><span>Entry</span><strong>₹" + c.entry + "</strong></div>",
       "<div class=\"level-sl\"><span>Stop Loss</span><strong>₹" + c.stopLoss + "</strong></div>",
+      "<div class=\"level-t1\"><span>Target 1</span><strong>₹" + targets[0] + "</strong></div>",
+      "<div class=\"level-t2\"><span>Target 2</span><strong>₹" + targets[1] + "</strong></div>",
+      "<div class=\"level-t3\"><span>Target 3</span><strong>₹" + targets[2] + "</strong></div>",
       "<div><span>Risk Reward</span><strong>1:" + c.rr + "</strong></div>",
-      "<div><span>Spread</span><strong>" + c.spreadPct + "%</strong></div>",
       "</div>",
       "<div class=\"score-block\">" + scoreRows(item) + "</div>",
       "<div class=\"text-block\">",

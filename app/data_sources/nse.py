@@ -1434,23 +1434,95 @@ class NSEDataSource:
             ],
         }
 
+    # Key sectoral indices used for breadth when stock-level data is unavailable.
+    # These 12 sectors represent the breadth of the Indian equity market and
+    # move semi-independently — A/D among them is a meaningful regime signal.
+    _SECTORAL_INDICES = {
+        "NIFTY 50", "NIFTY BANK", "NIFTY IT", "NIFTY PHARMA",
+        "NIFTY AUTO", "NIFTY FMCG", "NIFTY METAL", "NIFTY REALTY",
+        "NIFTY ENERGY", "NIFTY INFRA", "NIFTY MEDIA", "NIFTY PSU BANK",
+        "NIFTY FINANCIAL SERVICES", "NIFTY OIL AND GAS",
+    }
+
     def _get_breadth(self) -> float:
+        """Advance/decline ratio as a broad-market regime signal.
+
+        Source priority:
+          1. equity-stockIndices 'SECURITIES IN F&O' — ~180 stocks, best signal
+          2. equity-stockIndices 'NIFTY 50'           — 50 stocks, good fallback
+          3. allIndices filtered to 14 key sectors    — always available, reliable
+          4. 1.0 neutral if all sources fail
+
+        allIndices as primary was wrong — it returned 68:1 by counting all
+        sub-index variants. Now it's last-resort and filtered to named sectors.
+        """
         def fetch():
-            data = self._get("allIndices")
-            if not data:
-                return None
-            advances = sum(
-                1 for d in data.get("data", [])
-                if float(d.get("percentChange") or 0) > 0
-            )
-            declines = sum(
-                1 for d in data.get("data", [])
-                if float(d.get("percentChange") or 0) < 0
-            )
-            return round(advances / declines, 2) if declines > 0 else 1.5
+            # ── Stock-level (best) ────────────────────────────────────────────
+            for index_name in ("SECURITIES IN F&O", "NIFTY 50"):
+                try:
+                    data = self._get("equity-stockIndices",
+                                     params={"index": index_name})
+                    if not data:
+                        continue
+                    rows = [
+                        r for r in data.get("data", [])
+                        if r.get("symbol") and (
+                            r.get("series") == "EQ"
+                            or (r.get("priceBand") and r.get("series"))
+                        )
+                    ]
+                    if len(rows) < 10:
+                        continue
+                    advances = sum(
+                        1 for r in rows
+                        if float(r.get("pChange") or r.get("percentChange") or 0) > 0
+                    )
+                    declines = sum(
+                        1 for r in rows
+                        if float(r.get("pChange") or r.get("percentChange") or 0) < 0
+                    )
+                    if declines == 0:
+                        declines = max(len(rows) - advances, 1)
+                    ratio = round(min(advances / declines, 5.0), 2)
+                    logger.debug("Breadth [%s]: %d adv / %d dec = %.2f",
+                                 index_name, advances, declines, ratio)
+                    return ratio
+                except Exception as exc:
+                    logger.debug("Breadth stock-level [%s] failed: %s", index_name, exc)
+
+            # ── Sectoral fallback via allIndices ──────────────────────────────
+            # Filter to the 14 named sectors so we don't count VIX / sub-index
+            # variants. A/D among these sectors is genuinely meaningful.
+            try:
+                data = self._get("allIndices")
+                if data:
+                    rows = [
+                        d for d in data.get("data", [])
+                        if d.get("index", "").upper() in
+                           {s.upper() for s in self._SECTORAL_INDICES}
+                    ]
+                    if len(rows) >= 5:
+                        advances = sum(
+                            1 for r in rows
+                            if float(r.get("percentChange") or 0) > 0
+                        )
+                        declines = sum(
+                            1 for r in rows
+                            if float(r.get("percentChange") or 0) < 0
+                        )
+                        if declines == 0:
+                            declines = max(len(rows) - advances, 1)
+                        ratio = round(min(advances / declines, 5.0), 2)
+                        logger.debug("Breadth [sectoral]: %d adv / %d dec = %.2f",
+                                     advances, declines, ratio)
+                        return ratio
+            except Exception as exc:
+                logger.debug("Breadth sectoral fallback failed: %s", exc)
+
+            return None
 
         result = self._cached("breadth", fetch)
-        return result if result is not None else 1.2
+        return result if result is not None else 1.0
 
     def is_available(self) -> bool:
         """Quick check whether NSE API is reachable."""

@@ -111,15 +111,15 @@ def _setup_logging() -> None:
 
 def _validate_startup() -> None:
     """Check all critical dependencies at boot and log their status clearly."""
-    # Angel One SmartAPI
-    from app.data_sources.angel import test_connection as angel_test
-    angel_result = angel_test()
-    if angel_result["status"] == "ok":
-        logger.info("STARTUP OK  — Angel One SmartAPI connected (%s)", angel_result["client_id"])
-    elif angel_result["status"] == "not_configured":
-        logger.warning("STARTUP WARN — Angel One not configured: %s", angel_result["message"])
+    # Angel One SmartAPI — startup_login() does retry + launches keepalive thread
+    from app.data_sources.angel import startup_login, ANGEL_CLIENT_ID, ANGEL_AVAILABLE
+    if not ANGEL_AVAILABLE:
+        logger.warning("STARTUP WARN — Angel One not configured (env vars missing)")
+    elif startup_login():
+        logger.info("STARTUP OK  — Angel One SmartAPI connected (%s) + keepalive started",
+                    ANGEL_CLIENT_ID)
     else:
-        logger.error("STARTUP FAIL — Angel One: %s", angel_result["message"])
+        logger.error("STARTUP FAIL — Angel One login failed after retries — check credentials")
 
     from app.data_sources.nse import nse_data
 
@@ -361,11 +361,33 @@ def health():
         "database":      str(settings.database_path),
         "ai":            ai_status(),
         "telegram":      telegram_status(),
-        "angelOne": {
-            "configured": ANGEL_AVAILABLE,
-            "connected":  angel_session._obj is not None,
-        },
+        "angelOne":      angel_session.status(),
     }
+
+
+@app.get("/api/option-ltp")
+def option_ltp(underlying: str, strike: float, opt_type: str,
+               expiry: Optional[str] = None):
+    """
+    Real-time Angel One option quote.
+
+    Examples:
+      /api/option-ltp?underlying=NIFTY&strike=23200&opt_type=PE
+      /api/option-ltp?underlying=BANKNIFTY&strike=52000&opt_type=CE&expiry=12Jun2026
+    """
+    from app.data_sources.angel import get_option_ltp
+    opt_type = opt_type.upper()
+    if opt_type not in ("CE", "PE"):
+        return {"error": "opt_type must be CE or PE"}
+    result = get_option_ltp(underlying.upper(), strike, opt_type, expiry_hint=expiry)
+    if result is None:
+        return {
+            "error":      "No data — market may be closed, option expired, or Angel One disconnected",
+            "underlying": underlying,
+            "strike":     strike,
+            "optType":    opt_type,
+        }
+    return result
 
 
 @app.get("/api/data-status")
