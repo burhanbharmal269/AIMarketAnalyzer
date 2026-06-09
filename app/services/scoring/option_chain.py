@@ -64,4 +64,16 @@ class OptionChainScorer(BaseScorer):
             elif iv_rank > 80:  score -= 4   # avoid buying at multi-month highs
             elif iv_rank > 65:  score -= 2
 
+        # Order-Flow Imbalance (OFI) confluence: PCR and OI change both confirm direction.
+        # Research (Cont et al. 2014): when institutional sentiment (PCR) AND fresh open
+        # interest (OI change) both agree, the edge is materially stronger than either alone.
+        # This is the "smart money" alignment signal.
+        oi_positive = oi_chg >= 4   # fresh OI build-up — participants opening, not closing
+        if direction == "BUY":
+            if pcr >= 1.0 and oi_positive:
+                score += 5   # put writers + fresh call OI = dual institutional confirmation
+        else:   # SELL
+            if pcr <= 0.9 and oi_positive:
+                score += 5   # call writers + fresh put OI = dual institutional confirmation
+
         return self._clamp(score)

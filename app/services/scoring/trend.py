@@ -82,4 +82,29 @@ class TrendScorer(BaseScorer):
         elif candidate.get("orbAgainst"):
             score -= 2   # trading against the OR direction — counter-trend risk
 
+        # Daily Pivot Points (PP/R1/S1) — floor pivot analysis.
+        # Research: R1 and S1 are self-reinforcing levels (widely watched by market
+        # makers). Price above PP = intraday bullish bias; near R1 = resistance
+        # for calls but confirmation if broken; near S1 = support floor for puts.
+        spot    = candidate.get("spotPrice", 0)
+        pivot_pp = candidate.get("pivotPP")
+        pivot_r1 = candidate.get("pivotR1")
+        pivot_s1 = candidate.get("pivotS1")
+        if spot > 0 and pivot_pp:
+            tolerance = spot * 0.003   # 0.3% proximity band
+            if direction == "BUY":
+                if spot > pivot_r1 if pivot_r1 else False:
+                    score += 3   # broken above R1 — strong bullish breakout
+                elif spot > pivot_pp:
+                    score += 2   # above PP — bias confirmed
+                if pivot_r1 and abs(spot - pivot_r1) <= tolerance:
+                    score -= 2   # approaching R1 — imminent resistance headwind
+            else:   # SELL
+                if pivot_s1 and spot < pivot_s1:
+                    score += 3   # broken below S1 — strong bearish breakdown
+                elif spot < pivot_pp:
+                    score += 2   # below PP — bearish bias confirmed
+                if pivot_s1 and abs(spot - pivot_s1) <= tolerance:
+                    score -= 2   # approaching S1 — imminent support floor risk
+
         return self._clamp(score)

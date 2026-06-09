@@ -27,4 +27,20 @@ class VolumeScorer(BaseScorer):
         elif opt_vol >= 50_000:  score += 4
         elif opt_vol >= 20_000:  score += 2
 
+        # Intraday Volume Profile POC — price position vs highest-volume level.
+        # Research (auction theory / market profile): price moving decisively away
+        # from POC in trade direction = momentum confirmation (buyers/sellers in
+        # control). Price hugging POC = range-bound, unfavourable for directional trades.
+        poc_pct = candidate.get("priceVsPoc")   # % above(+) or below(-) intraday POC
+        if poc_pct is not None:
+            direction = candidate.get("direction", "BUY")
+            if direction == "BUY":
+                if poc_pct > 1.5:     score += 4   # strongly above POC — bullish momentum
+                elif poc_pct > 0.5:   score += 2   # above POC — buyers in control
+                elif poc_pct < -0.5:  score -= 2   # below POC — headwind for calls
+            else:   # SELL
+                if poc_pct < -1.5:    score += 4   # strongly below POC — bearish momentum
+                elif poc_pct < -0.5:  score += 2   # below POC — sellers in control
+                elif poc_pct > 0.5:   score -= 2   # above POC — headwind for puts
+
         return self._clamp(score)

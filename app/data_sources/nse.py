@@ -691,6 +691,16 @@ class NSEDataSource:
             prev_high   = float(high_d.iloc[-2]) if len(high_d) >= 2 else float(high_d.iloc[-1])
             prev_low    = float(low_d.iloc[-2])  if len(low_d)  >= 2 else float(low_d.iloc[-1])
             prev_close  = float(close_d.iloc[-2]) if len(close_d) >= 2 else float(close_d.iloc[-1])
+
+            # Classic floor pivot points from previous day OHLC.
+            # PP (central pivot) acts as the intraday "fair value" — price above PP = bullish
+            # bias, below = bearish. R1/S1 are the first targets/barriers. Research confirms
+            # these levels are widely watched and self-reinforcing (Holmberg 2013).
+            pp_val = round((prev_high + prev_low + prev_close) / 3, 2)
+            r1_val = round(2 * pp_val - prev_low, 2)
+            s1_val = round(2 * pp_val - prev_high, 2)
+            r2_val = round(pp_val + (prev_high - prev_low), 2)
+            s2_val = round(pp_val - (prev_high - prev_low), 2)
             st_dir      = _supertrend_direction(high_d, low_d, close_d)
 
             # ── Multi-timeframe intraday analysis ─────────────────────────────
@@ -716,8 +726,10 @@ class NSEDataSource:
             tf15_bear = False
             tf30_bull = False
             tf30_bear = False
-            vwap      = None
+            vwap         = None
             vwap_bullish = None
+            poc          = None
+            price_vs_poc = None   # % above(+) or below(-) intraday POC
             today_open   = None
             gap_up = gap_down = False
             gap_pct = 0.0
@@ -872,6 +884,18 @@ class NSEDataSource:
                 except Exception as exc:
                     logger.debug("VWAP compute failed [%s]: %s", symbol, exc)
 
+                # ── Intraday Volume Profile POC ───────────────────────────────
+                # POC = highest-volume price in today's session. Trending moves
+                # accelerate when price breaks cleanly above/below POC.
+                # Same candles as VWAP — zero extra API calls.
+                try:
+                    from app.data_sources.angel import compute_poc_from_candles
+                    poc = compute_poc_from_candles(angel_candles)
+                    if poc and poc > 0 and spot > 0:
+                        price_vs_poc = round((spot - poc) / poc * 100, 2)
+                except Exception as exc:
+                    logger.debug("POC compute failed [%s]: %s", symbol, exc)
+
                 # ── Opening gap from first 5-min candle ──────────────────────
                 try:
                     today_open = float(angel_candles["open"].iloc[0])
@@ -982,6 +1006,13 @@ class NSEDataSource:
                 "tf30Bear":          tf30_bear,
                 "vwap":              vwap,
                 "vwapBullish":       vwap_bullish,
+                "poc":               poc,
+                "priceVsPoc":        price_vs_poc,
+                "pivotPP":           pp_val,
+                "pivotR1":           r1_val,
+                "pivotS1":           s1_val,
+                "pivotR2":           r2_val,
+                "pivotS2":           s2_val,
                 "orHigh":            round(or_high, 2) if or_high else None,
                 "orLow":             round(or_low, 2)  if or_low  else None,
                 # Research dataset: all intraday TFs captured per signal.
@@ -1385,6 +1416,14 @@ class NSEDataSource:
             "volumeSpike":   volume_spike,
             "vwap":          vwap,
             "vwapConfirmed": vwap_confirmed,
+            # Volume Profile — intraday POC and daily pivot levels
+            "poc":           ind.get("poc"),
+            "priceVsPoc":    ind.get("priceVsPoc"),   # % above/below POC
+            "pivotPP":       ind.get("pivotPP"),
+            "pivotR1":       ind.get("pivotR1"),
+            "pivotS1":       ind.get("pivotS1"),
+            "pivotR2":       ind.get("pivotR2"),
+            "pivotS2":       ind.get("pivotS2"),
             "delta":         greeks["delta"],
             "theta":         greeks["theta"],
             "vega":          greeks["vega"],

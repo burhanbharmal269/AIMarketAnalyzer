@@ -556,6 +556,35 @@ def compute_vwap(candles: "pd.DataFrame") -> float | None:
         return None
 
 
+def compute_poc_from_candles(candles: "pd.DataFrame") -> float | None:
+    """Compute intraday Volume Profile Point of Control (POC).
+
+    POC = the price level that traded the most volume in the current session.
+    Research (market profile / auction theory): POC acts as a magnet — price
+    tends to oscillate around it in range markets, and trending moves accelerate
+    when price moves decisively away from it.
+
+    Uses typical price (H+L+C)/3 bucketed into ~50 price levels across today's
+    range, then selects the bucket with the highest cumulative volume.
+    Returns None when data is insufficient (<5 bars).
+    """
+    if candles is None or len(candles) < 5 or not _PANDAS:
+        return None
+    try:
+        typical_price = (candles["high"] + candles["low"] + candles["close"]) / 3
+        price_range = float(typical_price.max() - typical_price.min())
+        if price_range <= 0:
+            return None
+        bucket = max(0.25, price_range / 50)   # 50 buckets, min 0.25 wide
+        bucketed = (typical_price / bucket).round() * bucket
+        vol_by_price = candles.groupby(bucketed)["volume"].sum()
+        poc = float(vol_by_price.idxmax())
+        return round(poc, 2)
+    except Exception as exc:
+        logger.debug("POC computation failed: %s", exc)
+        return None
+
+
 # ── Live LTP ──────────────────────────────────────────────────────────────────
 
 def get_ltp(symbol: str) -> float | None:
