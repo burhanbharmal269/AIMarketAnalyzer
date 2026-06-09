@@ -198,6 +198,33 @@ def _check_positions(nse_data, send_fn) -> None:
                     logger.debug("signal_log outcome update failed: %s", exc)
             _send_alert(send_fn, "T2 HIT — AUTO CLOSED", instrument, entry_px, current, t2_px, pnl_r)
 
+        # Time-based exit — if 14:15 IST passed with no T1 hit, theta decay accelerates.
+        # Closing 75 min before session end preserves capital vs holding a stalled trade.
+        # Only fires when T1 has NOT been hit (trailed stop already protects T1+ trades).
+        # Uses Angel One LTP (via _get_option_price) for the exit price.
+        now_ist = datetime.now(IST)
+        past_cutoff = now_ist.hour > 14 or (now_ist.hour == 14 and now_ist.minute >= 15)
+        if (past_cutoff
+                and (eid, "t1")        not in _alerted
+                and (eid, "time_exit") not in _alerted):
+            _alerted.add((eid, "time_exit"))
+            pnl_r     = _pnl(current)
+            final_pnl = round(pnl_r, 2)
+            outcome   = "loss" if current < entry_px else "win"
+            update_journal_entry(eid, {
+                "status":     "closed",
+                "outcome":    outcome,
+                "exit_price": current,
+                "pnl_r":      final_pnl,
+            })
+            if sig_id:
+                try:
+                    update_signal_outcome(sig_id, outcome, current, final_pnl, "time_exit")
+                except Exception as exc:
+                    logger.debug("signal_log time-exit update failed: %s", exc)
+            _send_alert(send_fn, "TIME EXIT — 14:15 IST, no T1 hit",
+                        instrument, entry_px, current, entry_px, pnl_r)
+
         # T1 hit — move stop to breakeven, let trade run to T2/T3
         elif t1_px > 0 and current >= t1_px and (eid, "t1") not in _alerted:
             _alerted.add((eid, "t1"))

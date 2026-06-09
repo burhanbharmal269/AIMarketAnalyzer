@@ -699,6 +699,12 @@ class NSEDataSource:
             rsi       = 50.0
             macd_val  = 0.0
             macd_sig  = 0.0
+            macd_hist           = 0.0
+            macd_hist_expanding = False
+            st15_dir  = None
+            tf5_bull  = False
+            tf5_bear  = False
+            rsi5      = 50.0
             tf10_bull = False
             tf10_bear = False
             rsi10     = 50.0
@@ -785,6 +791,8 @@ class NSEDataSource:
                 else:
                     macd_i = None
 
+                macd_hist          = 0.0
+                macd_hist_expanding = False
                 if macd_i is not None:
                     m_series = macd_i.macd().dropna()
                     s_series = macd_i.macd_signal().dropna()
@@ -792,6 +800,12 @@ class NSEDataSource:
                         macd_val = float(m_series.iloc[-1])
                     if len(s_series) > 0:
                         macd_sig = float(s_series.iloc[-1])
+                    # Histogram = MACD − Signal. Expanding = momentum building.
+                    # Compare last two bars to detect expansion vs contraction.
+                    if len(m_series) >= 2 and len(s_series) >= 2:
+                        macd_hist      = macd_val - macd_sig
+                        prev_hist      = float(m_series.iloc[-2]) - float(s_series.iloc[-2])
+                        macd_hist_expanding = abs(macd_hist) > abs(prev_hist)
 
                 # tf15: EMA9 vs EMA21 on 15-min bars (intraday trend confluence)
                 if len(close15) >= 9:
@@ -799,6 +813,11 @@ class NSEDataSource:
                     ema21_15  = float(close15.ewm(span=21, adjust=False).mean().iloc[-1])
                     tf15_bull = ema9_15 > ema21_15
                     tf15_bear = ema9_15 < ema21_15
+
+                # Supertrend on 15-min — intraday trend confirmation.
+                # Uses same period/multiplier as daily ST but on intraday structure.
+                # Data source: Angel One 5-min candles resampled to 15-min.
+                st15_dir = _supertrend_direction(c15["high"], c15["low"], close15) if len(c15) >= 10 else None
 
                 # ── 10-min resample — intermediate TF (research data) ────────
                 # Not used for scoring but captured in tfData for strategy research.
@@ -920,12 +939,15 @@ class NSEDataSource:
                 "rsi":               round(rsi, 1),
                 "macd":              round(macd_val, 4),
                 "macdSignal":        round(macd_sig, 4),
+                "macdHistogram":     round(macd_hist, 4),
+                "macdHistExpanding": macd_hist_expanding,
                 "adx":               round(float(adx_val), 1),
                 "atr":               round(float(atr_val), 4),
                 "relativeVolume":    rel_vol,
                 "spotPrice":         round(spot, 2),
                 "dataAge":           data_age,
                 "supertrendBullish": st_dir == 1,
+                "st15Bullish":       (st15_dir == 1) if st15_dir is not None else None,
                 "prevDayHigh":       round(prev_high, 2),
                 "prevDayLow":        round(prev_low, 2),
                 "prevClose":         round(prev_close, 2),
@@ -1315,6 +1337,8 @@ class NSEDataSource:
             "rsi":              round(rsi, 1),
             "macd":             ind["macd"],
             "macdSignal":       ind["macdSignal"],
+            "macdHistogram":    ind.get("macdHistogram", 0),
+            "macdHistExpanding": ind.get("macdHistExpanding", False),
             "adx":              round(adx, 1),
             "relativeVolume":   ind["relativeVolume"],
             "oiChangePct":      opt["oiChangePct"],
@@ -1324,6 +1348,7 @@ class NSEDataSource:
             "rr":               rr,
             "eventRisk":        self._has_upcoming_earnings(symbol),
             "supertrendBullish": ind.get("supertrendBullish", True),
+            "st15Bullish":       ind.get("st15Bullish", None),
             "pdBreakout": (
                 (bullish and ind["spotPrice"] > ind.get("prevDayHigh", ind["spotPrice"]))
                 or

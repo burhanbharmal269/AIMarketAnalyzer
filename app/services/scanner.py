@@ -3,8 +3,8 @@ from zoneinfo import ZoneInfo
 
 
 CATEGORY_MAX = {
-    "trend":       30,   # +5 headroom for S/R breakout and gap scoring
-    "momentum":    20,
+    "trend":       33,   # +3 headroom for 15-min Supertrend (Angel One intraday)
+    "momentum":    23,   # +3 headroom for MACD histogram expansion
     "volume":      15,
     "optionChain": 20,
     "sentiment":   10,
@@ -116,6 +116,15 @@ def trend_score(candidate):
     elif "retest held" in price_action:
         score += 1
 
+    # 15-min Supertrend — intraday structure confirmation (Angel One 5-min → resampled).
+    # Complements the daily ST: daily sets the macro bias, 15-min validates intraday entry.
+    # Only fires when Angel One candles are available (st15Bullish is None on daily fallback).
+    st15 = candidate.get("st15Bullish")
+    if st15 is not None:
+        st15_matches = (candidate["direction"] == "BUY" and st15) or \
+                       (candidate["direction"] == "SELL" and not st15)
+        score += 3 if st15_matches else -2
+
     return clamp(score, 0, CATEGORY_MAX["trend"])
 
 
@@ -149,6 +158,19 @@ def momentum_score(candidate):
         score += 6
     elif direction == "SELL" and candidate["macd"] < candidate["macdSignal"]:
         score += 6
+
+    # MACD histogram expansion — momentum building vs fading.
+    # Expanding histogram (gap between MACD and signal growing) = trend accelerating.
+    # Contracting histogram near zero = crossover imminent, momentum stalling.
+    if candidate.get("macdHistExpanding"):
+        # Confirm expansion is in the right direction
+        hist = candidate.get("macdHistogram", 0)
+        if (direction == "BUY" and hist > 0) or (direction == "SELL" and hist < 0):
+            score += 3   # momentum building in trade direction
+    else:
+        hist = candidate.get("macdHistogram", 0)
+        if abs(hist) < 0.001:
+            score -= 1   # histogram near zero = crossover imminent, avoid entering
 
     # ADX — trend strength (directional move quality)
     adx = candidate["adx"]
@@ -402,6 +424,14 @@ def hard_gate_failures(candidate, market, risk_state, settings):
         failures.append("Risk reward is below 1:1.5 (S/R target too close to entry).")
     if not aligned:
         failures.append("Trend is not aligned with trade direction.")
+    # IV Rank hard gate — buying options at historical IV extremes risks immediate IV crush.
+    # Scoring already penalises high IV Rank, but > 80th percentile is a hard no.
+    # Requires 20+ daily readings; skipped when IV Rank is unavailable (insufficient history).
+    iv_rank = candidate.get("ivRank")
+    if iv_rank is not None and iv_rank > 80:
+        failures.append(
+            f"IV Rank {iv_rank:.0f}th percentile — options are historically expensive. IV crush risk too high."
+        )
     if candidate["optionVolume"] < settings["minVolume"]:
         failures.append("Option volume is below minimum liquidity threshold.")
     if candidate["spreadPct"] > settings["maxSpread"]:
