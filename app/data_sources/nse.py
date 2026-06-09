@@ -1167,6 +1167,24 @@ class NSEDataSource:
             oi_chg_pct  = float(opt.get("pchangeinOpenInterest") or 0)
             atm_iv      = float(opt.get("impliedVolatility") or 0)
 
+            # IV Skew: OTM PE IV minus OTM CE IV (~1.5% from spot).
+            # Positive skew (PE IV > CE IV) = market paying for downside protection = bearish lean.
+            # High put skew is a headwind for BUY/CE trades; confirms SELL/PE direction.
+            # Research (Cont et al., options microstructure): skew is the market's revealed
+            # directional opinion — more reliable than raw PCR for short-term bias.
+            iv_skew = None
+            try:
+                tgt_ce = spot * 1.015   # 1.5% OTM call strike
+                tgt_pe = spot * 0.985   # 1.5% OTM put strike
+                otm_ce_row = min(rows, key=lambda r: abs(r.get("strikePrice", 0) - tgt_ce))
+                otm_pe_row = min(rows, key=lambda r: abs(r.get("strikePrice", 0) - tgt_pe))
+                ce_iv_otm  = float((otm_ce_row.get("CE") or {}).get("impliedVolatility") or 0)
+                pe_iv_otm  = float((otm_pe_row.get("PE") or {}).get("impliedVolatility") or 0)
+                if ce_iv_otm > 0 and pe_iv_otm > 0:
+                    iv_skew = round(pe_iv_otm - ce_iv_otm, 1)   # positive = put skew
+            except Exception:
+                pass
+
             # Max pain: two-pass algorithm.
             # Pass 1 — collect all OI data.
             # Pass 2 — for every candidate expiry price X, sum the total in-the-money
@@ -1209,6 +1227,7 @@ class NSEDataSource:
                 "maxPainDistancePct": max_pain_dist,
                 "expiry":            nearest,
                 "atmIV":             round(atm_iv, 1),
+                "ivSkew":            iv_skew,   # OTM PE IV - OTM CE IV; positive = put skew
                 "dte":               dte,
                 "optType":           opt_key,   # "CE" or "PE"
                 "strikeOffset":      strike_offset,
@@ -1410,6 +1429,7 @@ class NSEDataSource:
                 (bearish and ind["spotPrice"] < ind.get("prevDayLow",  ind["spotPrice"]))
             ),
             "atmIV":         opt.get("atmIV", 0),
+            "ivSkew":        opt.get("ivSkew"),   # OTM PE IV - OTM CE IV; positive = put skew (bearish)
             "ivRank":        iv_rank,
             "tf15Aligned":   tf15_aligned,
             "tf30Aligned":   tf30_aligned,

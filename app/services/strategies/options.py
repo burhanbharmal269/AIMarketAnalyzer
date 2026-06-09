@@ -90,12 +90,15 @@ class OptionsTradingStrategy(BaseSignalStrategy):
     # ── Post-filter: sector concentration ────────────────────────────────────
 
     def _post_filter(self, approved_list: list[dict]) -> list[dict]:
-        """Keep only the highest-scoring signal per sector.
+        """Keep only the highest-scoring signal per sector, then apply index correlation check.
 
-        Indices (NIFTY, BANKNIFTY) are exempt — they are independent products
-        that don't add sector correlation. List is already score-sorted so the
-        first occurrence per sector is always the strongest.
+        Pass 1 — Sector concentration: max 1 signal per sector (indices exempt).
+        Pass 2 — Index correlation: if NIFTY and BANKNIFTY both approved in the same
+                  direction, downgrade the lower-scoring one to Grade B (65% size).
+                  They are highly correlated (r ≈ 0.85+) — doubling index exposure in
+                  the same direction is a hidden concentration risk.
         """
+        # ── Pass 1: sector cap ────────────────────────────────────────────────
         sector_seen: set[str] = set()
         deduped:     list     = []
 
@@ -113,5 +116,35 @@ class OptionsTradingStrategy(BaseSignalStrategy):
                 item.setdefault("rejectionReasons", []).append(
                     f"Sector cap: a higher-scoring {sector.upper()} signal is already approved."
                 )
+
+        # ── Pass 2: NIFTY + BANKNIFTY same-direction correlation risk ─────────
+        # If both fire in the same direction, the lower-scoring one gets Grade B
+        # (65% size). They can both be traded — just not both at full size.
+        index_items = {
+            item["candidate"]["underlying"]: item
+            for item in deduped
+            if item["candidate"].get("underlying") in ("NIFTY", "BANKNIFTY")
+        }
+        if len(index_items) == 2:
+            nifty_dir  = index_items["NIFTY"]["candidate"]["direction"]
+            bnk_dir    = index_items["BANKNIFTY"]["candidate"]["direction"]
+            if nifty_dir == bnk_dir:
+                # Downgrade the lower-scoring index to Grade B if it was Grade A
+                nifty_score = index_items["NIFTY"]["score"]["total"]
+                bnk_score   = index_items["BANKNIFTY"]["score"]["total"]
+                weaker_key  = "NIFTY" if nifty_score <= bnk_score else "BANKNIFTY"
+                weaker_item = index_items[weaker_key]
+                if weaker_item.get("grade") == "A":
+                    weaker_item["grade"] = "B"
+                    # Recompute lots at 65%
+                    old_lots = weaker_item["sizing"]["lots"]
+                    new_lots = max(1, int(old_lots * 0.65))
+                    weaker_item["sizing"]["lots"]      = new_lots
+                    weaker_item["sizing"]["quantity"]  = new_lots * weaker_item["candidate"]["lotSize"]
+                    weaker_item["sizing"]["grade"]     = "B"
+                    weaker_item["sizing"]["gradeNote"] = (
+                        f"Reduced to 65% — correlated index risk: NIFTY and BANKNIFTY "
+                        f"both {nifty_dir}. Sizing down the lower-scoring index."
+                    )
 
         return deduped

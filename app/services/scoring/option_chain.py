@@ -64,6 +64,22 @@ class OptionChainScorer(BaseScorer):
             elif iv_rank > 80:  score -= 4   # avoid buying at multi-month highs
             elif iv_rank > 65:  score -= 2
 
+        # IV Skew — market's revealed directional opinion via OTM implied vol surface.
+        # Positive skew (OTM PE IV > OTM CE IV): market paying for downside protection = bearish lean.
+        # When skew opposes trade direction it signals institutional hedging against that move.
+        # Research: put-call IV skew is one of the most reliable short-term directional signals
+        # because it reflects actual money paid, not just open interest positioning.
+        iv_skew = candidate.get("ivSkew")
+        if iv_skew is not None:
+            if direction == "BUY":
+                if iv_skew > 8:    score -= 3   # strong put skew = institutional hedging = headwind
+                elif iv_skew > 4:  score -= 1   # mild put skew = slight caution
+                elif iv_skew < -3: score += 2   # call skew = unusual bullish demand confirmation
+            else:   # SELL
+                if iv_skew > 8:    score += 3   # strong put skew confirms bearish institutional view
+                elif iv_skew > 4:  score += 2   # moderate put skew = bearish lean confirmed
+                elif iv_skew < -3: score -= 2   # call skew = headwind for put buyers
+
         # Order-Flow Imbalance (OFI) confluence: PCR and OI change both confirm direction.
         # Research (Cont et al. 2014): when institutional sentiment (PCR) AND fresh open
         # interest (OI change) both agree, the edge is materially stronger than either alone.

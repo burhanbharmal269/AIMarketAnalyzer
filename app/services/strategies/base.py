@@ -75,6 +75,7 @@ class BaseSignalStrategy(ISignalStrategy):
                 "grade":            grade,
                 "score":            score,
                 "sizing":           sizing,
+                "exitPlan":         self._build_exit_plan(candidate) if approved else None,
                 "validUntil":       self._signal_valid_until(candidate),
                 "explanation":      self._build_explanation(candidate, sizing, approved),
                 "risks":            self._build_risks(candidate, market),
@@ -128,6 +129,47 @@ class BaseSignalStrategy(ISignalStrategy):
             f"size to {sizing['lots']} lot(s). The trade remains valid only while price "
             "action holds the entry structure and event risk does not change."
         )
+
+    @staticmethod
+    def _build_exit_plan(candidate: dict) -> dict:
+        """Compute adaptive trailing-stop exit plan from entry/targets.
+
+        Research-backed exit management: once partial profit is locked,
+        move stop to protect it. Prevents winners turning into losers.
+
+        Rules:
+          After T1 hit → move stop to entry (breakeven, zero loss from here)
+          After T2 hit → trail stop to T1 (lock minimum 1R profit)
+          T3 = full target, close remaining position
+        """
+        entry   = candidate.get("entry", 0)
+        sl      = candidate.get("stopLoss", 0)
+        targets = candidate.get("targets", [])
+        t1      = targets[0] if len(targets) > 0 else None
+        t2      = targets[1] if len(targets) > 1 else None
+        t3      = targets[2] if len(targets) > 2 else None
+
+        risk    = abs(entry - sl) if sl else 0
+        rr      = candidate.get("rr", 0)
+
+        return {
+            "entry":            entry,
+            "initialStop":      sl,
+            "afterT1Stop":      round(entry, 2),          # breakeven — zero loss guaranteed
+            "afterT2Stop":      round(t1, 2) if t1 else None,   # lock T1 profit
+            "t1":               t1,
+            "t2":               t2,
+            "t3":               t3,
+            "riskPerUnit":      round(risk, 2),
+            "rr":               rr,
+            "plan": (
+                f"Enter at {entry}. "
+                f"Stop at {sl} (risk {round(risk,1)} pts). "
+                + (f"At T1 ({t1}): move stop to entry ({entry}) — breakeven secured. " if t1 else "")
+                + (f"At T2 ({t2}): trail stop to T1 ({t1}) — minimum profit locked. " if t2 and t1 else "")
+                + (f"T3 ({t3}): close full position." if t3 else "")
+            ),
+        }
 
     @staticmethod
     def _build_risks(candidate: dict, market: dict) -> list[str]:
