@@ -1322,7 +1322,7 @@ class NSEDataSource:
             "maxPainDistancePct": opt["maxPainDistancePct"],
             "marketSentiment":  market_sentiment,
             "rr":               rr,
-            "eventRisk":        False,
+            "eventRisk":        self._has_upcoming_earnings(symbol),
             "supertrendBullish": ind.get("supertrendBullish", True),
             "pdBreakout": (
                 (bullish and ind["spotPrice"] > ind.get("prevDayHigh", ind["spotPrice"]))
@@ -1717,6 +1717,7 @@ class NSEDataSource:
             "breadth":        breadth,
             "globalSentiment": "Neutral",
             "eventCalendar":  self._build_event_calendar(),
+            "earningsCalendar": {s: d.isoformat() for s, d in self.get_earnings_calendar().items()},
             "news": [
                 f"India VIX at {vix}. {'Calm conditions support directional trades.' if vix < 16 else 'Elevated volatility — use tighter stops.'}",
                 "Live market data sourced from NSE.",
@@ -1812,6 +1813,57 @@ class NSEDataSource:
 
         result = self._cached("breadth", fetch)
         return result if result is not None else 1.0
+
+    def _has_upcoming_earnings(self, symbol: str, days: int = 2) -> bool:
+        """True if symbol has a financial-results board meeting within `days` calendar days."""
+        try:
+            cal = self.get_earnings_calendar()
+            meeting = cal.get(symbol)
+            if meeting is None:
+                return False
+            today = datetime.now(IST).date()
+            return 0 <= (meeting - today).days <= days
+        except Exception:
+            return False
+
+    def get_earnings_calendar(self) -> dict[str, "_date"]:
+        """Return upcoming financial-results board meetings for all NSE-listed companies.
+
+        Source: /api/event-calendar (upcoming board meetings, ~14-day lookahead).
+        Filters for meetings whose purpose contains 'result' (Financial Results,
+        Quarterly Results, Annual Results). Cached for 4 hours — board meetings
+        are filed days or weeks ahead and don't change intraday.
+
+        Returns {symbol: meeting_date} for meetings within the next 7 calendar days.
+        """
+        _TTL_EARNINGS = 4 * 3600
+
+        def fetch():
+            data = self._get("event-calendar")
+            if not data:
+                return {}
+            rows = data if isinstance(data, list) else data.get("data", [])
+            today = datetime.now(IST).date()
+            cutoff = today.toordinal() + 7
+            result: dict[str, "_date"] = {}
+            for row in rows:
+                purpose = (row.get("purpose") or row.get("bm_purpose") or "").lower()
+                if "result" not in purpose and "financial" not in purpose and "quarterly" not in purpose:
+                    continue
+                symbol = row.get("symbol") or row.get("bm_symbol")
+                raw_dt = row.get("date") or row.get("bm_date")
+                if not symbol or not raw_dt:
+                    continue
+                try:
+                    meeting_date = datetime.strptime(raw_dt.strip(), "%d-%b-%Y").date()
+                except ValueError:
+                    continue
+                if today <= meeting_date and meeting_date.toordinal() <= cutoff:
+                    result[symbol] = meeting_date
+            return result
+
+        cached = self._cached("earnings_calendar", fetch, ttl=_TTL_EARNINGS)
+        return cached or {}
 
     def is_available(self) -> bool:
         """Quick check whether NSE API is reachable."""

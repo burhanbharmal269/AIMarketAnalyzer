@@ -407,7 +407,10 @@ def hard_gate_failures(candidate, market, risk_state, settings):
     if candidate["spreadPct"] > settings["maxSpread"]:
         failures.append("Bid-ask spread is excessive.")
     if event_blocked(candidate, market, settings):
-        failures.append("Major event risk is too close or manually flagged.")
+        if candidate.get("eventRisk"):
+            failures.append("Earnings / board meeting scheduled within 2 days — event risk.")
+        else:
+            failures.append("Major market event risk is too close (RBI MPC, expiry, or flagged event).")
     if market["indiaVix"] >= 22:
         failures.append("India VIX is elevated beyond directional buying threshold.")
 
