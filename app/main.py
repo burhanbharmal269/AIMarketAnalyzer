@@ -20,7 +20,10 @@ from app.services.ai import (
     openai_enabled,
 )
 from app.services.backtest import backtest_snapshot
-from app.services.scanner import CATEGORY_MAX, scan_market
+from app.services.scanner import CATEGORY_MAX, _SCORE_MAX_RAW, scan_market
+
+# Category maxima normalised to 100 for frontend bar widths.
+_CATEGORY_MAX_NORM = {k: round(v / _SCORE_MAX_RAW * 100) for k, v in CATEGORY_MAX.items()}
 from app.services.storage import (
     add_journal_entry,
     compute_risk_state,
@@ -308,7 +311,7 @@ def build_scan(settings_payload: dict | None = None, persist: bool = True) -> di
                 item["candidate"], item["score"], market
             )
 
-    result = {"market": market, "categoryMax": CATEGORY_MAX, "dataSource": "live",
+    result = {"market": market, "categoryMax": _CATEGORY_MAX_NORM, "dataSource": "live",
               "lossStreak": journal_streak, **scan}
 
     if persist:

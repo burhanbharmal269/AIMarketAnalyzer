@@ -631,6 +631,8 @@ class NSEDataSource:
             avg_vol_raw = df_daily["Volume"].rolling(20).mean().iloc[-1]
             avg_vol     = float(avg_vol_raw) if pd.notna(avg_vol_raw) else 0.0
             last_vol    = float(df_daily["Volume"].iloc[-1])
+            # rel_vol computed here as daily fallback; overwritten below when
+            # angel_candles are available (today's intraday volume is more relevant).
             rel_vol     = round(last_vol / avg_vol, 2) if avg_vol > 0 and pd.notna(last_vol) else 1.0
             prev_high   = float(high_d.iloc[-2]) if len(high_d) >= 2 else float(high_d.iloc[-1])
             prev_low    = float(low_d.iloc[-2])  if len(low_d)  >= 2 else float(low_d.iloc[-1])
@@ -667,6 +669,19 @@ class NSEDataSource:
 
                 spot   = float(c5["close"].iloc[-1])
                 close5 = c5["close"]
+
+                # Today's cumulative intraday volume vs daily average.
+                # A session running 6.25 hours has ~6.25 hours of volume.
+                # Normalize: annualized daily avg / 6.25 hours per session.
+                # This compares today's actual intraday participation to what
+                # a normal full-day session averages — more meaningful than
+                # yesterday's closing volume.
+                if avg_vol > 0:
+                    intra_vol      = float(c5["volume"].sum())
+                    hours_elapsed  = max((c5.index[-1] - c5.index[0]).total_seconds() / 3600, 0.25)
+                    daily_avg_rate = avg_vol / 6.25   # shares per hour over a full session
+                    projected_vol  = intra_vol / hours_elapsed * 6.25
+                    rel_vol        = round(projected_vol / avg_vol, 2)
 
                 # 5-min EMA9/21 — captured for research comparison vs 15-min
                 tf5_bull = False
@@ -1100,13 +1115,9 @@ class NSEDataSource:
             stop_loss        = round(entry * (1 - pct_floor), 1)
             option_stop_dist = entry - stop_loss
 
-        t1 = round(entry + option_stop_dist,     1)
-        t2 = round(entry + 2 * option_stop_dist, 1)
-        t3 = round(entry + 3 * option_stop_dist, 1)
-        _risk = abs(entry - stop_loss)
-        rr = round(abs(t2 - entry) / _risk, 2) if _risk > 0 else 2.0
+        _risk = max(abs(entry - stop_loss), 0.1)
 
-        # ── Black-Scholes Greeks ──────────────────────────────────────────────
+        # ── Black-Scholes Greeks (needed for delta-based target calc) ─────────
         greeks = _bs_greeks(
             spot=ind["spotPrice"],
             strike=float(strike),
@@ -1114,6 +1125,35 @@ class NSEDataSource:
             iv_pct=opt.get("atmIV", 15.0),
             opt_type=opt_type,
         )
+
+        # ── S/R-anchored targets ──────────────────────────────────────────────
+        # T1 = nearest resistance (BUY) or support (SELL) converted to option
+        # premium move via delta. This grounds targets in actual price structure
+        # rather than arbitrary multiples of the stop.
+        # T2 / T3 are 1.8× and 2.8× of the T1 distance (next S/R or breakout).
+        # If no S/R data, fall back to 1.5× risk (still better than 1×).
+        delta_abs = abs(greeks["delta"]) if greeks.get("delta") else 0.35
+        spot_now  = ind["spotPrice"]
+
+        if bullish and sr and sr.get("resistance"):
+            spot_target_dist = max(sr["resistance"] - spot_now, 0)
+        elif bearish and sr and sr.get("support"):
+            spot_target_dist = max(spot_now - sr["support"], 0)
+        else:
+            spot_target_dist = 0.0
+
+        if spot_target_dist > 0 and delta_abs > 0.05:
+            option_t1_dist = round(spot_target_dist * delta_abs, 1)
+            # Bound: T1 must be at least 1:1 and at most 3:1 vs the stop
+            option_t1_dist = max(option_t1_dist, _risk * 1.0)
+            option_t1_dist = min(option_t1_dist, _risk * 3.0)
+        else:
+            option_t1_dist = round(_risk * 1.5, 1)   # fallback: 1.5:1
+
+        t1 = round(entry + option_t1_dist,           1)
+        t2 = round(entry + option_t1_dist * 1.8,     1)
+        t3 = round(entry + option_t1_dist * 2.8,     1)
+        rr = round(option_t1_dist / _risk, 2)
 
         # ── price action description ─────────────────────────────────────────
         rsi = ind["rsi"]

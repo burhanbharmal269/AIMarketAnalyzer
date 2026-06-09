@@ -12,6 +12,11 @@ CATEGORY_MAX = {
     "news":         5,   # AI news sentiment — directional news alignment bonus/penalty
 }
 
+# Raw scores sum to 110 max. Normalise to 100 so UI, minScore, and user
+# perception are consistent. All comparisons (minScore=70) are against the
+# normalised total, not the raw sum.
+_SCORE_MAX_RAW = sum(CATEGORY_MAX.values())   # 110
+
 
 DEFAULT_SETTINGS = {
     "accountCapital": 100000,  # 1 lakh — realistic F&O minimum (30K can't fund even 1 NIFTY lot)
@@ -338,14 +343,18 @@ def sentiment_score(candidate, market):
 
 
 def risk_reward_score(candidate):
+    # rr is now S/R-anchored (T1 = nearest resistance/support translated via delta).
+    # Previously always 2.0 by construction. Now genuinely variable: 1.0–3.0+.
     rr = candidate["rr"]
-    if rr >= 3:
-        return 10
     if rr >= 2.5:
+        return 10   # T1 reaches well past the first S/R — strong structure
+    if rr >= 2.0:
         return 8
-    if rr >= 2:
-        return 6
-    return 0
+    if rr >= 1.5:
+        return 5
+    if rr >= 1.0:
+        return 2    # minimum acceptable — T1 just reaches S/R
+    return 0        # below 1:1 — hard gate will reject anyway (rr < 2 gate)
 
 
 def score_candidate(candidate, market):
@@ -358,7 +367,9 @@ def score_candidate(candidate, market):
         "riskReward":  risk_reward_score(candidate),
         "news":        news_score(candidate),
     }
-    return {"scores": scores, "total": sum(scores.values())}
+    raw   = sum(scores.values())
+    total = round(raw / _SCORE_MAX_RAW * 100)   # normalise 110 → 100
+    return {"scores": scores, "total": total, "rawTotal": raw}
 
 
 def event_blocked(candidate, market, settings):
@@ -382,8 +393,8 @@ def hard_gate_failures(candidate, market, risk_state, settings):
         failures.append("Weekly drawdown limit reached.")
     if risk_state["monthlyDrawdownPct"] >= settings["maxMonthlyDrawdownPct"]:
         failures.append("Monthly drawdown limit reached.")
-    if candidate["rr"] < 2:
-        failures.append("Risk reward is below 1:2.")
+    if candidate["rr"] < 1.5:
+        failures.append("Risk reward is below 1:1.5 (S/R target too close to entry).")
     if not aligned:
         failures.append("Trend is not aligned with trade direction.")
     if candidate["optionVolume"] < settings["minVolume"]:
