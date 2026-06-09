@@ -449,12 +449,37 @@ def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
         vol_str  = f"relVol={round(rel_vol, 1)}" if (rel_vol is not None and rel_vol > 0) else "relVol=n/a(closed)"
         vwap_str = "vwap=yes" if c.get('vwapConfirmed') else ("vwap=n/a(closed)" if (rel_vol or 0) == 0 else "vwap=no")
         tf15 = c.get('tf15Aligned', False)
+        # Pivot context (above/below PP and R1/S1 proximity)
+        spot     = c.get('spotPrice', 0) or 0
+        pp       = c.get('pivotPP', 0) or 0
+        r1       = c.get('pivotR1', 0) or 0
+        s1       = c.get('pivotS1', 0) or 0
+        if spot > 0 and pp > 0:
+            pct_from_pp = round((spot - pp) / pp * 100, 1)
+            pivot_tag = f"pp{pct_from_pp:+.1f}%"
+            if r1 > 0 and abs(spot - r1) / r1 < 0.003:
+                pivot_tag += "/nearR1"
+            if s1 > 0 and abs(spot - s1) / s1 < 0.003:
+                pivot_tag += "/nearS1"
+        else:
+            pivot_tag = "pivot=n/a"
+        # POC context
+        poc_pct = c.get('priceVsPoc')
+        poc_tag = f"poc{poc_pct:+.1f}%" if poc_pct is not None else "poc=n/a(closed)"
+        # OFI: PCR + OI alignment check
+        pcr_val = c.get('pcr', 0) or 0
+        oi_chg_val = c.get('oiChangePct', 0) or 0
+        ofi_tag = "ofi=aligned" if (
+            (c['direction'] == 'BUY'  and pcr_val >= 1.0 and oi_chg_val >= 4) or
+            (c['direction'] == 'SELL' and pcr_val <= 0.9 and oi_chg_val >= 4)
+        ) else "ofi=neutral"
         rows.append(
             f"{sym}: dir={c['direction']} ema={ema_tag} rsi={c['rsi'] or 50} "
             f"adx={c['adx'] or 0} adxRising={c.get('adxRising') or False} "
             f"macd={'confirms' if macd_ok else 'diverges'} "
             f"tf15={'aligned' if tf15 else 'mixed'} "
             f"{vol_str} {iv_str} {vwap_str} "
+            f"{pivot_tag} {poc_tag} {ofi_tag} "
             f"eventRisk={c.get('eventRisk') or False} "
             f"sector={SECTOR_MAP.get(sym, 'other')}"
         )
@@ -529,14 +554,18 @@ UNIVERSAL HARD GATES (skip regardless of strategy):
 3. EMA alignment required for non-mean-reversion strategies: direction must match EMA stack.
    (Mean reversion is the only strategy where mixed EMA is acceptable.)
 
-QUALITY SCORING for {strat_name} — score 0-6 pts, shortlist highest scorers:
+QUALITY SCORING for {strat_name} — score 0-8 pts, shortlist highest scorers:
 +2  ADX >= {min_adx + 5} (strong trend for this strategy). ADX {min_adx}-{min_adx + 4} = +1. Below {min_adx} = +0.
 +1  RSI in strategy zone: BUY = {rsi_lo}-{rsi_hi}, SELL = {100 - rsi_hi}-{100 - rsi_lo}.
 +1  MACD confirms direction (macd=confirms).
 +1  tf15=aligned (15-min Supertrend confirms daily direction — multi-timeframe confluence).
 +1  relVol >= 0.9. relVol=n/a(closed) = neutral (+0), do NOT penalise missing data.
 +1  vwap=yes. vwap=n/a(closed) = neutral (+0), do NOT penalise missing data.
++1  POC: price decisively above POC (poc>+0.5% for BUY) or below (poc<-0.5% for SELL).
+    poc=n/a(closed) = neutral (+0). POC near current price = range-bound risk (deduct if hugging).
++1  OFI=aligned: PCR and OI change both confirm direction (strongest institutional signal).
 NOTE: Low ivRank is GOOD (cheap options). Only gate on ivRank > {iv_max}, don't use in scoring.
+NOTE: Pivot levels — price above PP (pp>0%) is bullish bias; price near R1/S1 (nearR1/nearS1) is a headwind — lower priority for entries at those levels.
 
 SELECTION RULES:
 - Shortlist candidates scoring >= 3 points (ensures multi-signal confluence — higher win rate).
