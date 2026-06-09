@@ -73,9 +73,16 @@ def trend_score(candidate):
         if candidate.get("volumeSpike"):
             score += 2
 
-    # 15-min EMA9/21 short-term confluence
+    # 15-min EMA9/21 — primary intraday signal (RSI/MACD also computed from 15-min)
     if candidate.get("tf15Aligned"):
         score += 3
+
+    # 30-min EMA5/EMA10 — macro intraday trend gate
+    # All 3 timeframes aligned (15-min + 30-min + daily) = high-conviction multi-TF setup
+    if candidate.get("tf30Aligned"):
+        score += 2
+        if candidate.get("tf15Aligned"):
+            score += 1   # 3-TF confluence bonus: 15m + 30m + daily all agree
 
     # S/R breakout — spot cleared a former swing-high resistance (confirmed by daily OHLCV)
     # Near-support for BUY or near-resistance for SELL scores lower (approaching friction)

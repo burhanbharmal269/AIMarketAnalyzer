@@ -594,17 +594,21 @@ class NSEDataSource:
 
     def _compute_indicators(self, df_daily, intraday_closes=None,
                             symbol: str = "", angel_candles=None) -> dict | None:
-        """Compute all technical indicators from daily OHLCV + intraday data.
+        """Compute all technical indicators using a 3-timeframe model.
 
-        Data source priority:
-          Fast indicators (EMA20/50, RSI, MACD, VWAP, 15m):
-            1. Angel One 5-min candles (passed in as angel_candles — already fetched)
-            2. NSE chart 1-min closes (intraday_closes fallback)
-            3. Daily OHLCV (last resort — stale but better than nothing)
-          Slow indicators (EMA200, ADX, ATR, RelVol): always daily OHLCV
+        Timeframe model (research: 15-min is optimal for Indian F&O signals):
+          5-min  (Angel candles)  → VWAP, spot price, gap detection
+          15-min (resampled)      → RSI(14), MACD(12,26,9), EMA20, tf15 confluence
+          30-min (resampled)      → EMA5/EMA10 trend gate (tf30)
+          Daily  (yfinance cache) → EMA50, EMA200, ADX, ATR, Supertrend, RelVol
 
-        Consolidating into angel_candles eliminates the separate NSE chart API
-        call and the separate VWAP fetch — one Angel One call per symbol covers all.
+        Why 15-min for RSI/MACD:
+          5-min RSI(14)  = 70-min lookback  → too noisy, extremely reactive
+          15-min RSI(14) = 210-min lookback → stable, institutional-grade signal
+          15-min MACD has ~3x fewer false crossovers than 5-min MACD
+
+        Single getCandleData(FIVE_MINUTE) call covers all 3 intraday timeframes
+        via pandas resample — no extra API calls.
         """
         if not _TA or df_daily is None or len(df_daily) < 52:
             return None
@@ -615,12 +619,13 @@ class NSEDataSource:
             high_d  = df_daily["High"]
             low_d   = df_daily["Low"]
 
-            # ── Slow indicators — daily OHLCV (15-min lag irrelevant for these) ──
+            # ── Slow indicators — always from daily OHLCV ─────────────────────
             ema200 = (
                 ta.trend.EMAIndicator(close_d, window=200).ema_indicator().iloc[-1]
                 if len(close_d) >= 200 else
                 ta.trend.EMAIndicator(close_d, window=50).ema_indicator().iloc[-1]
             )
+            ema50_d     = ta.trend.EMAIndicator(close_d, window=50).ema_indicator().iloc[-1]
             adx_val     = ta.trend.ADXIndicator(high_d, low_d, close_d).adx().iloc[-1]
             atr_val     = ta.volatility.AverageTrueRange(high_d, low_d, close_d).average_true_range().iloc[-1]
             avg_vol_raw = df_daily["Volume"].rolling(20).mean().iloc[-1]
@@ -630,57 +635,142 @@ class NSEDataSource:
             prev_high   = float(high_d.iloc[-2]) if len(high_d) >= 2 else float(high_d.iloc[-1])
             prev_low    = float(low_d.iloc[-2])  if len(low_d)  >= 2 else float(low_d.iloc[-1])
             prev_close  = float(close_d.iloc[-2]) if len(close_d) >= 2 else float(close_d.iloc[-1])
+            st_dir      = _supertrend_direction(high_d, low_d, close_d)
 
-            # ── Fast source selection: Angel 5-min > NSE 1-min > daily ──────────
-            # Angel One 5-min candles are fetched once in _fetch_candidate and passed
-            # here — no extra API call. Close series used for EMA/RSI/MACD.
-            fast_src = None
-            data_age = "daily-fallback"
-
-            if angel_candles is not None and len(angel_candles) >= 10:
-                fast_src = angel_candles.set_index("datetime")["close"]
-                data_age = "angel-5min"
-            elif intraday_closes is not None and len(intraday_closes) >= 26:
-                fast_src = intraday_closes
-                data_age = "nse-1min"
-
-            if fast_src is None or len(fast_src) < 14:
-                fast_src = close_d
-                data_age = "daily-fallback"
-
-            ema20  = ta.trend.EMAIndicator(fast_src, window=20).ema_indicator().iloc[-1]
-            ema50_ = ta.trend.EMAIndicator(fast_src, window=50).ema_indicator().iloc[-1] if len(fast_src) >= 50 else ema20
-            st_dir = _supertrend_direction(high_d, low_d, close_d)
-            if st_dir is None:
-                st_dir = 1 if float(ema20) > float(ema200) else -1
-            rsi      = ta.momentum.RSIIndicator(fast_src, window=14).rsi().iloc[-1]
-            macd_i   = ta.trend.MACD(fast_src)
-            macd_val = macd_i.macd().iloc[-1]
-            macd_sig = macd_i.macd_signal().iloc[-1]
-            spot     = float(fast_src.iloc[-1])
-            logger.debug("Indicators [%s] source=%s spot=%s", symbol, data_age, round(spot))
-
-            # ── 15-min EMA confluence — resample fast source ──────────────────
-            # 5-min → 15-min (3 bars); 1-min → 15-min (15 bars). Same resample call.
+            # ── Multi-timeframe intraday analysis ─────────────────────────────
+            # All three intraday timeframes derived from a single 5-min Angel fetch.
+            data_age  = "daily-fallback"
+            spot      = float(close_d.iloc[-1])
+            ema20     = float(ema50_d)   # placeholder — overwritten below
+            rsi       = 50.0
+            macd_val  = 0.0
+            macd_sig  = 0.0
+            tf10_bull = False
+            tf10_bear = False
+            rsi10     = 50.0
             tf15_bull = False
             tf15_bear = False
-            resample_src = angel_candles.set_index("datetime")["close"] if angel_candles is not None \
-                           else intraday_closes
-            if resample_src is not None and len(resample_src) >= 9:
-                try:
-                    c15 = resample_src.resample("15min").last().dropna()
-                    if len(c15) >= 9:
-                        ema9_15   = c15.ewm(span=9,  adjust=False).mean()
-                        ema21_15  = c15.ewm(span=21, adjust=False).mean()
-                        tf15_bull = float(ema9_15.iloc[-1]) > float(ema21_15.iloc[-1])
-                        tf15_bear = float(ema9_15.iloc[-1]) < float(ema21_15.iloc[-1])
-                except Exception as exc:
-                    logger.debug("15-min resample failed [%s]: %s", symbol, exc)
-
-            # ── VWAP from Angel One candles (already fetched — no extra call) ──
-            vwap = None
+            tf30_bull = False
+            tf30_bear = False
+            vwap      = None
             vwap_bullish = None
-            if angel_candles is not None:
+            today_open   = None
+            gap_up = gap_down = False
+            gap_pct = 0.0
+
+            if angel_candles is not None and len(angel_candles) >= 10:
+                # ── 5-min base ───────────────────────────────────────────────
+                c5 = angel_candles.copy()
+                if "datetime" in c5.columns:
+                    c5 = c5.set_index("datetime")
+                c5.index = pd.to_datetime(c5.index)
+
+                spot   = float(c5["close"].iloc[-1])
+                close5 = c5["close"]
+
+                # 5-min EMA9/21 — captured for research comparison vs 15-min
+                tf5_bull = False
+                tf5_bear = False
+                if len(close5) >= 9:
+                    e9_5  = float(close5.ewm(span=9,  adjust=False).mean().iloc[-1])
+                    e21_5 = float(close5.ewm(span=21, adjust=False).mean().iloc[-1])
+                    tf5_bull = e9_5 > e21_5
+                    tf5_bear = e9_5 < e21_5
+                rsi5 = 50.0
+                if len(close5) >= 15:
+                    rsi5_s = ta.momentum.RSIIndicator(close5, window=14).rsi().dropna()
+                    rsi5   = float(rsi5_s.iloc[-1]) if len(rsi5_s) > 0 else 50.0
+
+                # ── 15-min resample — primary signal timeframe ────────────────
+                # RSI and MACD are computed here (not on noisy 5-min data).
+                # 15-min gives ~25 bars/session — enough for RSI(14) and MACD(12,26).
+                try:
+                    c15 = c5.resample("15min").agg(
+                        {"open": "first", "high": "max", "low": "min",
+                         "close": "last", "volume": "sum"}
+                    ).dropna(subset=["close"])
+                except Exception:
+                    c15 = c5
+
+                close15 = c15["close"]
+                data_age = "angel-15min"
+
+                # EMA20 from 15-min (20 bars = 300 min, spans full session)
+                ema20 = float(ta.trend.EMAIndicator(close15, window=min(20, len(close15))).ema_indicator().iloc[-1])
+
+                # RSI(14) from 15-min — 210 min lookback, stable institutional signal
+                if len(close15) >= 15:
+                    rsi_series = ta.momentum.RSIIndicator(close15, window=14).rsi().dropna()
+                    rsi = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 else 50.0
+                elif len(close15) >= 5:
+                    rsi_series = ta.momentum.RSIIndicator(close15, window=len(close15) - 1).rsi().dropna()
+                    rsi = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 else 50.0
+
+                # MACD(12,26,9) from 15-min — fewer false crossovers than 5-min
+                # Falls back to shorter periods early in session when < 26 bars available
+                if len(close15) >= 26:
+                    macd_i   = ta.trend.MACD(close15, window_fast=12, window_slow=26, window_sign=9)
+                elif len(close15) >= 9:
+                    macd_i   = ta.trend.MACD(close15, window_fast=6,  window_slow=13, window_sign=5)
+                else:
+                    macd_i = None
+
+                if macd_i is not None:
+                    m_series = macd_i.macd().dropna()
+                    s_series = macd_i.macd_signal().dropna()
+                    if len(m_series) > 0:
+                        macd_val = float(m_series.iloc[-1])
+                    if len(s_series) > 0:
+                        macd_sig = float(s_series.iloc[-1])
+
+                # tf15: EMA9 vs EMA21 on 15-min bars (intraday trend confluence)
+                if len(close15) >= 9:
+                    ema9_15   = float(close15.ewm(span=9,  adjust=False).mean().iloc[-1])
+                    ema21_15  = float(close15.ewm(span=21, adjust=False).mean().iloc[-1])
+                    tf15_bull = ema9_15 > ema21_15
+                    tf15_bear = ema9_15 < ema21_15
+
+                # ── 10-min resample — intermediate TF (research data) ────────
+                # Not used for scoring but captured in tfData for strategy research.
+                # Lets us compare which TF best predicted signal outcome over time.
+                tf10_bull = False
+                tf10_bear = False
+                rsi10     = 50.0
+                try:
+                    c10 = c5.resample("10min").agg(
+                        {"open": "first", "high": "max", "low": "min",
+                         "close": "last", "volume": "sum"}
+                    ).dropna(subset=["close"])
+                    close10 = c10["close"]
+                    if len(close10) >= 9:
+                        e9_10  = float(close10.ewm(span=9,  adjust=False).mean().iloc[-1])
+                        e21_10 = float(close10.ewm(span=21, adjust=False).mean().iloc[-1])
+                        tf10_bull = e9_10 > e21_10
+                        tf10_bear = e9_10 < e21_10
+                    if len(close10) >= 15:
+                        rsi10_s = ta.momentum.RSIIndicator(close10, window=14).rsi().dropna()
+                        rsi10   = float(rsi10_s.iloc[-1]) if len(rsi10_s) > 0 else 50.0
+                except Exception as exc:
+                    logger.debug("10-min resample failed [%s]: %s", symbol, exc)
+
+                # ── 30-min resample — macro trend gate ───────────────────────
+                # EMA5 vs EMA10 on 30-min confirms broader intraday direction.
+                # Prevents entries that fight the 2-hour trend cycle.
+                try:
+                    c30 = c5.resample("30min").agg(
+                        {"open": "first", "high": "max", "low": "min",
+                         "close": "last", "volume": "sum"}
+                    ).dropna(subset=["close"])
+                    close30 = c30["close"]
+                    if len(close30) >= 5:
+                        ema5_30  = float(close30.ewm(span=5,  adjust=False).mean().iloc[-1])
+                        ema10_30 = float(close30.ewm(span=10, adjust=False).mean().iloc[-1])
+                        tf30_bull = ema5_30 > ema10_30
+                        tf30_bear = ema5_30 < ema10_30
+                except Exception as exc:
+                    logger.debug("30-min resample failed [%s]: %s", symbol, exc)
+
+                # ── VWAP from 5-min — most accurate (78 bars/session) ────────
                 try:
                     from app.data_sources.angel import compute_vwap
                     vwap = compute_vwap(angel_candles)
@@ -689,29 +779,77 @@ class NSEDataSource:
                 except Exception as exc:
                     logger.debug("VWAP compute failed [%s]: %s", symbol, exc)
 
-            # ── Opening gap vs previous day close ──────────────────────────────
-            gap_up = gap_down = False
-            gap_pct = 0.0
-            today_open = None
-            try:
-                if angel_candles is not None and len(angel_candles) > 0:
+                # ── Opening gap from first 5-min candle ──────────────────────
+                try:
                     today_open = float(angel_candles["open"].iloc[0])
-                else:
-                    today_open = float(df_daily["Open"].iloc[-1])
+                    if today_open and prev_close:
+                        gap_pct  = round((today_open - prev_close) / prev_close * 100, 2)
+                        gap_up   = gap_pct >= 0.5
+                        gap_down = gap_pct <= -0.5
+                except Exception:
+                    pass
+
+            elif intraday_closes is not None and len(intraday_closes) >= 26:
+                # ── Fallback: NSE 1-min closes (resample to 15-min) ──────────
+                data_age = "nse-15min"
+                try:
+                    c15_fb = intraday_closes.resample("15min").last().dropna()
+                    close15_fb = c15_fb if len(c15_fb) >= 9 else intraday_closes
+                except Exception:
+                    close15_fb = intraday_closes
+
+                spot  = float(intraday_closes.iloc[-1])
+                ema20 = float(ta.trend.EMAIndicator(close15_fb, window=min(20, len(close15_fb))).ema_indicator().iloc[-1])
+                if len(close15_fb) >= 15:
+                    rsi_s = ta.momentum.RSIIndicator(close15_fb, window=14).rsi().dropna()
+                    rsi   = float(rsi_s.iloc[-1]) if len(rsi_s) > 0 else 50.0
+                if len(close15_fb) >= 13:
+                    mi    = ta.trend.MACD(close15_fb)
+                    ms    = mi.macd().dropna()
+                    ss    = mi.macd_signal().dropna()
+                    macd_val = float(ms.iloc[-1]) if len(ms) > 0 else 0.0
+                    macd_sig = float(ss.iloc[-1]) if len(ss) > 0 else 0.0
+                if len(close15_fb) >= 9:
+                    e9  = float(close15_fb.ewm(span=9,  adjust=False).mean().iloc[-1])
+                    e21 = float(close15_fb.ewm(span=21, adjust=False).mean().iloc[-1])
+                    tf15_bull = e9 > e21
+                    tf15_bear = e9 < e21
+
+            else:
+                # ── Daily fallback: all intraday signals unavailable ──────────
+                data_age = "daily-fallback"
+                spot  = float(close_d.iloc[-1])
+                ema20 = float(ta.trend.EMAIndicator(close_d, window=20).ema_indicator().iloc[-1])
+                rsi_s = ta.momentum.RSIIndicator(close_d, window=14).rsi().dropna()
+                rsi   = float(rsi_s.iloc[-1]) if len(rsi_s) > 0 else 50.0
+                mi    = ta.trend.MACD(close_d)
+                ms    = mi.macd().dropna()
+                ss    = mi.macd_signal().dropna()
+                macd_val = float(ms.iloc[-1]) if len(ms) > 0 else 0.0
+                macd_sig = float(ss.iloc[-1]) if len(ss) > 0 else 0.0
+                today_open = float(df_daily["Open"].iloc[-1])
                 if today_open and prev_close:
-                    gap_pct   = round((today_open - prev_close) / prev_close * 100, 2)
-                    gap_up    = gap_pct >= 0.5
-                    gap_down  = gap_pct <= -0.5
-            except Exception:
-                pass
+                    gap_pct  = round((today_open - prev_close) / prev_close * 100, 2)
+                    gap_up   = gap_pct >= 0.5
+                    gap_down = gap_pct <= -0.5
+
+            # EMA50 always from daily (needs 50+ days — intraday can't provide this)
+            # EMA200 always from daily (200+ days)
+            if st_dir is None:
+                st_dir = 1 if ema20 > float(ema200) else -1
+
+            logger.debug("Indicators [%s] source=%s spot=%.0f rsi=%.1f tf15=%s tf30=%s",
+                         symbol, data_age, spot, rsi,
+                         "bull" if tf15_bull else ("bear" if tf15_bear else "flat"),
+                         "bull" if tf30_bull else ("bear" if tf30_bear else "flat"))
 
             return {
-                "ema20":             round(float(ema20), 2),
-                "ema50":             round(float(ema50_), 2),
+                "ema20":             round(ema20, 2),
+                "ema50":             round(float(ema50_d), 2),
                 "ema200":            round(float(ema200), 2),
-                "rsi":               round(float(rsi), 1),
-                "macd":              round(float(macd_val), 4),
-                "macdSignal":        round(float(macd_sig), 4),
+                "rsi":               round(rsi, 1),
+                "macd":              round(macd_val, 4),
+                "macdSignal":        round(macd_sig, 4),
                 "adx":               round(float(adx_val), 1),
                 "atr":               round(float(atr_val), 4),
                 "relativeVolume":    rel_vol,
@@ -727,11 +865,25 @@ class NSEDataSource:
                 "gapPct":            gap_pct,
                 "tf15Bull":          tf15_bull,
                 "tf15Bear":          tf15_bear,
+                "tf30Bull":          tf30_bull,
+                "tf30Bear":          tf30_bear,
                 "vwap":              vwap,
                 "vwapBullish":       vwap_bullish,
+                # Research dataset: all intraday TFs captured per signal.
+                # Stored in signal_log so we can later compare which TF combination
+                # best predicted actual outcome (win rate analysis over time).
+                "tfData": {
+                    "tf5":  {"ema9_bull": tf5_bull,  "ema9_bear": tf5_bear,
+                             "rsi": round(rsi5, 1)},
+                    "tf10": {"ema9_bull": tf10_bull,  "ema9_bear": tf10_bear,
+                             "rsi": round(rsi10, 1)},
+                    "tf15": {"ema9_bull": tf15_bull,  "ema9_bear": tf15_bear,
+                             "rsi": round(rsi, 1), "macd_bull": macd_val > macd_sig},
+                    "tf30": {"ema5_bull": tf30_bull,  "ema5_bear": tf30_bear},
+                },
             }
         except Exception as exc:
-            logger.warning("Indicator computation failed: %s", exc)
+            logger.warning("Indicator computation failed [%s]: %s", symbol, exc)
             return None
 
     def _compute_support_resistance(self, df_daily, spot: float) -> dict:
@@ -991,10 +1143,16 @@ class NSEDataSource:
         store_iv_reading(symbol, atm_iv)
         iv_rank = get_iv_rank(symbol)   # None until 20+ days of history
 
-        # ── 15-min confluence flag ────────────────────────────────────────────
+        # ── Timeframe confluence flags ────────────────────────────────────────
+        # tf15: 15-min EMA9 vs EMA21 — primary intraday signal (resampled from 5-min)
         tf15_aligned = (
             (bullish and ind.get("tf15Bull", False)) or
             (bearish and ind.get("tf15Bear", False))
+        )
+        # tf30: 30-min EMA5 vs EMA10 — macro intraday trend confirmation
+        tf30_aligned = (
+            (bullish and ind.get("tf30Bull", False)) or
+            (bearish and ind.get("tf30Bear", False))
         )
 
         # ── VWAP alignment ────────────────────────────────────────────────────
@@ -1050,6 +1208,7 @@ class NSEDataSource:
             "atmIV":         opt.get("atmIV", 0),
             "ivRank":        iv_rank,
             "tf15Aligned":   tf15_aligned,
+            "tf30Aligned":   tf30_aligned,
             "volumeSpike":   volume_spike,
             "vwap":          vwap,
             "vwapConfirmed": vwap_confirmed,
@@ -1070,6 +1229,10 @@ class NSEDataSource:
             "gapPct":            ind.get("gapPct", 0.0),
             "notes":         [f"Live data. Spot: {ind['spotPrice']:.0f}. DTE: {dte}."
                               + (f" VWAP: {vwap:.0f}." if vwap else "")],
+            # Multi-TF research data: 5/10/15/30-min indicators stored for
+            # post-trade accuracy analysis. Tells us which TF was most predictive.
+            "tfData":        ind.get("tfData", {}),
+            "dataAge":       ind.get("dataAge", "unknown"),
         }
 
     # ── public API ────────────────────────────────────────────────────────────
@@ -1079,8 +1242,8 @@ class NSEDataSource:
         try:
             df_d = self.get_ohlcv_daily(symbol)
 
-            # Fetch Angel One 5-min candles when available — single call covers
-            # EMA20/50, RSI, MACD, VWAP, 15-min confluence, and opening gap.
+            # Fetch Angel One 5-min candles — single call covers all timeframes:
+            # 5-min (VWAP) + resampled 10-min + 15-min (RSI/MACD/EMA) + 30-min (trend).
             # Falls back to NSE 1-min chart API when Angel One is not configured.
             angel_candles = None
             intraday      = None
