@@ -394,6 +394,159 @@ def generate_trade_explanation(candidate: dict, score: dict, market: dict) -> st
     return text
 
 
+def get_candidate_shortlist(candidates: list[dict], market: dict) -> dict:
+    """Use AI to shortlist the most promising candidates before Angel One option chain calls.
+
+    Reduces Angel One API calls from 41 → 10-12 by filtering out candidates that
+    don't meet proven F&O criteria given the current regime.
+
+    Returns:
+        {
+          "shortlist": ["NIFTY", "BANKNIFTY", ...],   # symbols to fetch OC for
+          "skipped":   {"WIPRO": "ADX 12 no trend", ...},
+          "regimeNote": "...",
+          "source": "ai" | "fallback"
+        }
+    On any AI failure, returns source="fallback" with all candidate symbols so the
+    scan degrades gracefully to the original brute-force behaviour.
+    """
+    all_symbols = [c["underlying"] for c in candidates]
+
+    if not openai_enabled():
+        return {"shortlist": all_symbols, "skipped": {}, "regimeNote": "", "source": "fallback"}
+
+    from app.core.constants import SECTOR_MAP
+    from app.services.signal_analytics import get_performance_context
+
+    # ── Build compact candidate table for the prompt ──────────────────────────
+    rows = []
+    for c in candidates:
+        sym      = c["underlying"]
+        ema_bull = c["ema20"] > c.get("ema50", 0) > c.get("ema200", 0)
+        ema_bear = c["ema20"] < c.get("ema50", float("inf")) < c.get("ema200", float("inf"))
+        ema_tag  = "aligned" if (ema_bull or ema_bear) else "mixed"
+        macd_ok  = (c["macd"] > c.get("macdSignal", 0)) if c["direction"] == "BUY" \
+                   else (c["macd"] < c.get("macdSignal", 0))
+        rows.append(
+            f"{sym}: dir={c['direction']} ema={ema_tag} rsi={c['rsi'] or 50} "
+            f"adx={c['adx'] or 0} adxRising={c.get('adxRising') or False} "
+            f"macd={'confirms' if macd_ok else 'diverges'} "
+            f"relVol={round(c.get('relativeVolume') or 1, 1)} "
+            f"ivRank={round(c.get('ivRank') or 50)} "
+            f"vwap={'yes' if c.get('vwapConfirmed') else 'no'} "
+            f"eventRisk={c.get('eventRisk') or False} "
+            f"sector={SECTOR_MAP.get(sym, 'other')}"
+        )
+    candidate_table = "\n".join(rows)
+
+    # ── Layer 2: historical performance context (empty until trades accumulate) ─
+    perf = get_performance_context()
+    perf_block = ""
+    if perf:
+        perf_block = (
+            f"\n\nYour historical performance ({perf['dataWindow']}, {perf['totalTrades']} trades, "
+            f"{perf['overallWinRate']}% win rate):\n"
+            f"By symbol: {perf['bySymbol']}\n"
+            f"By score bucket: {perf['byScoreBucket']}\n"
+            "Use this to down-rank symbols/score-ranges that historically underperform."
+        )
+
+    # ── Layer 3: regime-conditioned rules ─────────────────────────────────────
+    vix       = market.get("indiaVix", 15)
+    regime    = market.get("regime", "neutral")
+    ai_action = market.get("aiAction", "selective")
+    bias      = market.get("bias", "neutral")
+
+    if vix > 20:
+        regime_rule = (
+            "VIX > 20: HIGH VOLATILITY. Only return NIFTY and BANKNIFTY. "
+            "No individual stocks — wide spreads and gamma risk make stock options unfavourable."
+        )
+        max_candidates = 4
+    elif vix > 16:
+        regime_rule = (
+            f"VIX {vix:.1f}: ELEVATED VOLATILITY. Prefer index options. "
+            "Accept max 2 stock options only if EMA fully aligned + ADX > 25."
+        )
+        max_candidates = 8
+    else:
+        regime_rule = (
+            f"VIX {vix:.1f}: NORMAL. Balanced mix of index and liquid stocks allowed."
+        )
+        max_candidates = 12
+
+    if ai_action == "avoid":
+        regime_rule += " AI regime action=AVOID: return only NIFTY/BANKNIFTY as hedges, nothing else."
+        max_candidates = 2
+    elif ai_action == "reduce":
+        max_candidates = min(max_candidates, 6)
+        regime_rule += " AI regime action=REDUCE: cut shortlist to preserve capital."
+
+    system = """You are a senior NSE F&O desk analyst. Your job is to shortlist the most \
+promising option-chain candidates from a raw scan list, so we only fetch expensive \
+Angel One API calls for symbols that actually meet professional entry criteria.
+
+HARD RULES (non-negotiable — skip any symbol that violates these):
+1. EMA must be fully aligned with direction (20>50>200 for BUY, reverse for SELL). \
+   Mixed EMA = skip.
+2. ADX must be >= 20. Below 20 means no trend — options bleed theta without directional move.
+3. RSI must be 45-72 for BUY, 28-55 for SELL. Outside range = overbought/oversold, skip.
+4. MACD must confirm the direction. Diverging MACD = momentum stalling, skip.
+5. IV Rank must be <= 50. Buying options when IV > 50 means paying inflated premium, skip.
+6. Skip any symbol with eventRisk=True (earnings within 2 days = binary risk).
+7. Relative volume >= 1.1 required — no volume participation means weak conviction.
+
+QUALITY RULES (prefer symbols that satisfy these):
+- VWAP confirmed = strong intraday anchor, strongly prefer.
+- ADX rising = trend accelerating, prefer over flat ADX.
+- Indices (NIFTY, BANKNIFTY) are always preferred when EMA aligned — highest liquidity.
+- Pick max 1 symbol per sector (banking, IT, pharma, etc.) — correlated sectors move together.
+
+REGIME RULE (override everything based on current market):
+""" + regime_rule + f"""
+
+Current market: regime={regime}, bias={bias}, VIX={vix:.1f}
+Return at most {max_candidates} symbols.""" + perf_block + """
+
+OUTPUT: Respond with valid JSON only. No markdown, no explanation outside the JSON.
+{
+  "shortlist": ["SYM1", "SYM2", ...],
+  "skipped": {"SYM": "one-line reason", ...},
+  "regimeNote": "one sentence on how regime shaped the shortlist"
+}"""
+
+    user = f"Candidate indicators:\n{candidate_table}"
+
+    raw = _call(system, user, max_tokens=600)
+    if not raw:
+        logger.warning("AI shortlist: empty response — falling back to all candidates")
+        return {"shortlist": all_symbols, "skipped": {}, "regimeNote": "", "source": "fallback"}
+
+    try:
+        import json, re
+        # Strip any markdown code fences the model might add
+        cleaned = re.sub(r"```(?:json)?|```", "", raw).strip()
+        data    = json.loads(cleaned)
+        shortlist = [s.upper() for s in data.get("shortlist", []) if s]
+        # Safety: ensure shortlist only contains symbols from original list
+        shortlist = [s for s in shortlist if s in all_symbols]
+        if not shortlist:
+            raise ValueError("Empty shortlist after validation")
+        logger.info(
+            "AI shortlist: %d/%d candidates selected (%s skipped)",
+            len(shortlist), len(all_symbols), len(data.get("skipped", {}))
+        )
+        return {
+            "shortlist":   shortlist,
+            "skipped":     data.get("skipped", {}),
+            "regimeNote":  data.get("regimeNote", ""),
+            "source":      "ai",
+        }
+    except Exception as exc:
+        logger.warning("AI shortlist parse failed (%s) — falling back to all candidates", exc)
+        return {"shortlist": all_symbols, "skipped": {}, "regimeNote": "", "source": "fallback"}
+
+
 def generate_market_summary(scan: dict, market: dict) -> dict:
     """Daily market summary. Uses AI when available, else rule-based."""
     approved_count = len(scan["approved"])

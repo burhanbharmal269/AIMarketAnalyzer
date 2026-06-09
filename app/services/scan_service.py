@@ -142,6 +142,26 @@ def build_scan(
         except Exception as exc:
             logger.warning("AI regime skipped: %s", exc)
 
+    # ── AI: candidate shortlist — filter before Angel One option chain calls ──
+    # Reduces Angel One API calls from 41 → 10-12 using proven F&O rules +
+    # current regime. Falls back to all candidates if AI is unavailable.
+    shortlist_result = {"shortlist": None, "skipped": {}, "regimeNote": "", "source": "fallback"}
+    if openai_enabled():
+        try:
+            from app.services.ai import get_candidate_shortlist
+            shortlist_result = get_candidate_shortlist(candidates, market)
+            shortlist_syms   = set(shortlist_result["shortlist"])
+            before           = len(candidates)
+            candidates       = [c for c in candidates if c["underlying"] in shortlist_syms]
+            logger.info(
+                "AI shortlist (%s): %d/%d candidates — skipped %d. RegimeNote: %s",
+                shortlist_result["source"], len(candidates), before,
+                len(shortlist_result["skipped"]),
+                shortlist_result.get("regimeNote", "")[:80],
+            )
+        except Exception as exc:
+            logger.warning("AI shortlist skipped: %s", exc)
+
     # ── AI: batch news sentiment for all underlyings (one call) ───────────────
     if openai_enabled():
         try:
@@ -180,6 +200,7 @@ def build_scan(
         "categoryMax": CATEGORY_MAX_NORM,
         "dataSource":  "live",
         "lossStreak":  journal_streak,
+        "aiShortlist": shortlist_result,
         **scan,
     }
 
