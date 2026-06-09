@@ -230,12 +230,17 @@ def _notify_scan_failure(reason: str) -> None:
 
 
 def _auto_paper_trade(item: dict, signal_id: int | None = None) -> None:
-    """Log an approved signal as a paper trade if not already open for that instrument.
+    """Log an approved signal as a paper trade if not already open for that underlying.
+    Deduplicates by underlying (not just exact instrument) so NIFTY 23200 PE and
+    NIFTY 23300 PE don't both get journalled on the same day — we only trade one
+    direction per underlying at a time.
     Links trade_journal row ↔ signal_log row via signal_id."""
     c = item["candidate"]
     instrument = c.get("instrument", "")
+    underlying = c.get("underlying", instrument.split()[0] if instrument else "")
     existing = [e for e in get_journal_entries(limit=50)
-                if e["instrument"] == instrument and e["status"] in ("open", "paper")]
+                if (e["instrument"].split()[0] == underlying or e["instrument"] == instrument)
+                and e["status"] in ("open", "paper")]
     if existing:
         # Still link the signal to the existing journal entry if not yet linked
         if signal_id and not existing[0].get("signal_id"):

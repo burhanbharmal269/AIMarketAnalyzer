@@ -47,8 +47,25 @@ try:
 except ImportError:
     _PANDAS = False
 
-_SESSION_TTL = 23 * 3600   # refresh before 24h JWT expiry
-_RATE_LIMIT_SLEEP = 0.35   # Angel One allows ~3 req/sec
+_SESSION_TTL      = 23 * 3600   # refresh before 24h JWT expiry
+_RATE_LIMIT_SLEEP = 0.35        # Angel One allows ~3 req/sec (1 call per 0.35s)
+
+# Global rate limiter — prevents burst violations when 8 threads fire simultaneously.
+# Per-function time.sleep() doesn't help in parallel scans: each thread sleeps 0.35s
+# locally but all call the API at the same time.  This lock + timestamp serialises
+# every Angel One API call across all threads so the 3 req/sec limit is never breached.
+_rate_lock       = threading.Lock()
+_last_angel_call: float = 0.0
+
+
+def _throttle() -> None:
+    """Block the calling thread until the global Angel One rate window allows a call."""
+    global _last_angel_call
+    with _rate_lock:
+        gap = _RATE_LIMIT_SLEEP - (time.time() - _last_angel_call)
+        if gap > 0:
+            time.sleep(gap)
+        _last_angel_call = time.time()
 
 
 # ── NSE index tokens (cash segment) ──────────────────────────────────────────
@@ -210,7 +227,7 @@ class AngelOneSession:
         if not client:
             return None
         try:
-            time.sleep(_RATE_LIMIT_SLEEP)
+            _throttle()
             resp = client.searchScrip("NSE", symbol)
             if resp and resp.get("status") and resp.get("data"):
                 for row in resp["data"]:
@@ -321,7 +338,7 @@ def get_option_chain(symbol: str) -> dict | None:
     expiry_str = _guess_expiry(symbol)
 
     # Angel One rate limit: sleep before each call
-    time.sleep(_RATE_LIMIT_SLEEP)
+    _throttle()
 
     resp = None
     for fmt in [expiry_str, expiry_str.upper()]:
@@ -331,7 +348,6 @@ def get_option_chain(symbol: str) -> dict | None:
                 break
         except Exception as exc:
             logger.debug("Angel optionGreek %s [%s] error: %s", symbol, fmt, exc)
-        time.sleep(0.3)
 
     if not resp or not resp.get("data"):
         logger.warning("Angel OC failed for %s (expiry %s)", symbol, expiry_str)
@@ -441,7 +457,7 @@ def get_intraday_candles(symbol: str, interval: str = "FIVE_MINUTE") -> "pd.Data
     from_date = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
     to_date   = now_ist
 
-    time.sleep(_RATE_LIMIT_SLEEP)
+    _throttle()
     try:
         resp = client.getCandleData({
             "exchange":    exchange,
@@ -498,7 +514,7 @@ def get_ltp(symbol: str) -> float | None:
         return None
 
     exchange, token = token_info
-    time.sleep(_RATE_LIMIT_SLEEP)
+    _throttle()
     try:
         resp = client.ltpData(exchange, symbol, token)
         if resp and resp.get("status") is not False:
@@ -529,7 +545,7 @@ def get_ltp_batch(symbols: list[str]) -> dict[str, float]:
     if not exchange_tokens:
         return {}
 
-    time.sleep(_RATE_LIMIT_SLEEP)
+    _throttle()
     try:
         resp = client.getMarketData("LTP", exchange_tokens)
         if not resp or resp.get("status") is False:
@@ -570,7 +586,7 @@ def get_option_ltp(underlying: str, strike: float, opt_type: str,
         return None
 
     expiry_str = expiry_hint or _guess_expiry(underlying)
-    time.sleep(_RATE_LIMIT_SLEEP)
+    _throttle()
 
     for fmt in [expiry_str, expiry_str.upper()]:
         try:
@@ -604,6 +620,66 @@ def get_option_ltp(underlying: str, strike: float, opt_type: str,
             logger.debug("Angel option LTP [%s] %s %s %s error: %s",
                          fmt, underlying, strike, opt_type, exc)
     return None
+
+
+# ── Historical daily OHLCV ───────────────────────────────────────────────────
+
+def get_daily_ohlcv(symbol: str, days: int = 400) -> "pd.DataFrame | None":
+    """Fetch historical daily OHLCV from Angel One getCandleData (ONE_DAY interval).
+
+    Returns DataFrame indexed by Date with columns Open/High/Low/Close/Volume —
+    same format as yfinance so nse.py's get_ohlcv_daily() can use it directly.
+    Returns None if Angel One unavailable or call fails.
+
+    days=400 gives 200+ trading days (covers EMA200 + 60-day S/R window with buffer).
+    """
+    if not _PANDAS:
+        return None
+    client = angel_session.get_client()
+    if client is None:
+        return None
+
+    token_info = angel_session.get_token(symbol)
+    if not token_info:
+        logger.debug("No token for %s — cannot fetch daily OHLCV", symbol)
+        return None
+
+    exchange, token = token_info
+    today     = date.today()
+    from_date = today - timedelta(days=days)
+
+    _throttle()
+    try:
+        resp = client.getCandleData({
+            "exchange":    exchange,
+            "symboltoken": token,
+            "interval":    "ONE_DAY",
+            "fromdate":    from_date.strftime("%Y-%m-%d 09:00"),
+            "todate":      today.strftime("%Y-%m-%d 16:00"),
+        })
+        if not resp or resp.get("status") is False or not resp.get("data"):
+            logger.debug("Angel daily OHLCV %s: empty response", symbol)
+            return None
+
+        df = pd.DataFrame(
+            resp["data"],
+            columns=["datetime", "Open", "High", "Low", "Close", "Volume"],
+        )
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["Date"] = pd.to_datetime(df["datetime"]).dt.date
+        df = df.drop(columns=["datetime"]).set_index("Date")
+        df.index = pd.to_datetime(df.index)
+        df = df.dropna(subset=["Close"])
+        if len(df) < 60:
+            logger.debug("Angel daily OHLCV %s: too few rows (%d)", symbol, len(df))
+            return None
+        logger.debug("Angel daily OHLCV %s: %d rows", symbol, len(df))
+        return df
+
+    except Exception as exc:
+        logger.debug("Angel daily OHLCV %s failed: %s", symbol, exc)
+        return None
 
 
 # ── F&O universe ──────────────────────────────────────────────────────────────

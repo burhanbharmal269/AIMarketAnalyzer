@@ -198,10 +198,25 @@ def _check_positions(nse_data, send_fn) -> None:
                     logger.debug("signal_log outcome update failed: %s", exc)
             _send_alert(send_fn, "T2 HIT — AUTO CLOSED", instrument, entry_px, current, t2_px, pnl_r)
 
-        # T1 hit — alert only, let trade run toward T2/T3
+        # T1 hit — move stop to breakeven, let trade run to T2/T3
         elif t1_px > 0 and current >= t1_px and (eid, "t1") not in _alerted:
             _alerted.add((eid, "t1"))
-            _send_alert(send_fn, "T1 HIT — Trail stop to entry", instrument, entry_px, current, t1_px, _pnl(current))
+            # Trail: stop moves from original SL to entry price (guaranteed breakeven).
+            # Only update if current stop is still below entry (not already trailed).
+            if sl_px < entry_px:
+                update_journal_entry(eid, {"stop_loss": round(entry_px, 1)})
+                if sig_id:
+                    try:
+                        from app.services.storage import get_connection
+                        with get_connection() as conn:
+                            conn.execute(
+                                "UPDATE signal_log SET stop_loss = ? WHERE id = ? AND outcome IS NULL",
+                                (round(entry_px, 1), sig_id),
+                            )
+                    except Exception:
+                        pass
+            _send_alert(send_fn, "T1 HIT — Stop trailed to breakeven",
+                        instrument, entry_px, current, t1_px, _pnl(current))
 
 
 def _session_healthy(nse_data) -> bool:

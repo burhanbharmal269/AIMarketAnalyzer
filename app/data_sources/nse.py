@@ -541,7 +541,30 @@ class NSEDataSource:
             logger.debug("OHLCV cache hit: %s (%d rows)", symbol, len(cached))
             return _rows_to_df(cached)
 
-        # ── 2. Fetch from yfinance with retry/backoff ────────────────────────
+        # ── 2. Angel One daily OHLCV (primary — no rate limit issues, no yfinance) ─
+        try:
+            from app.data_sources.angel import get_daily_ohlcv as _angel_daily, ANGEL_AVAILABLE
+            if ANGEL_AVAILABLE:
+                df_angel = _angel_daily(symbol, days=400)
+                if df_angel is not None and len(df_angel) >= 60:
+                    rows = [
+                        {
+                            "date":   str(idx.date()),
+                            "Open":   float(row["Open"]),
+                            "High":   float(row["High"]),
+                            "Low":    float(row["Low"]),
+                            "Close":  float(row["Close"]),
+                            "Volume": float(row["Volume"]),
+                        }
+                        for idx, row in df_angel.iterrows()
+                    ]
+                    set_ohlcv_cache(symbol, rows)
+                    logger.debug("OHLCV cached from Angel One: %s (%d rows)", symbol, len(rows))
+                    return df_angel
+        except Exception as exc:
+            logger.debug("Angel One daily OHLCV failed for %s: %s — falling back to yfinance", symbol, exc)
+
+        # ── 3. Fetch from yfinance with retry/backoff ────────────────────────
         if not _YFINANCE:
             return None
 
