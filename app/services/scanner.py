@@ -126,6 +126,14 @@ def trend_score(candidate):
                        (candidate["direction"] == "SELL" and not st15)
         score += 3 if st15_matches else -2
 
+    # Opening Range Breakout — spot cleared the first 15-min auction range.
+    # Breakout = institutional participation beyond the opening price discovery zone.
+    # Only available from Angel One 5-min candles (orHigh/orLow absent on daily fallback).
+    if candidate.get("orbBreakout"):
+        score += 3
+    elif candidate.get("orbAgainst"):
+        score -= 2   # trading against the OR direction — counter-trend risk
+
     return clamp(score, 0, CATEGORY_MAX["trend"])
 
 
@@ -182,6 +190,10 @@ def momentum_score(candidate):
         score += 3
     elif adx >= 14:
         score += 1
+
+    # ADX direction — rising ADX means trend is strengthening, not exhausting
+    if candidate.get("adxRising") and adx >= 18:
+        score += 2
 
     return clamp(score, 0, CATEGORY_MAX["momentum"])
 
@@ -525,6 +537,42 @@ def build_risks(candidate, market):
     return risks[:5]
 
 
+# Sector map for the 40-symbol scan universe.
+# Used to cap at 1 approved signal per sector — prevents correlated blowups
+# (e.g. HDFCBANK + ICICIBANK + AXISBANK all shorting on the same RBI day).
+# Indices are exempt — NIFTY and BANKNIFTY are independent products.
+_SECTOR_MAP: dict[str, str] = {
+    "NIFTY": "index", "BANKNIFTY": "index",
+    # Banking
+    "HDFCBANK": "banking", "ICICIBANK": "banking", "AXISBANK": "banking",
+    "KOTAKBANK": "banking", "SBIN": "banking", "INDUSINDBK": "banking",
+    # Finance (NBFC / insurance — correlated with banking but distinct)
+    "BAJFINANCE": "finance", "BAJAJFINSV": "finance", "HDFCLIFE": "finance",
+    # IT
+    "INFY": "it", "TCS": "it", "WIPRO": "it", "HCLTECH": "it", "TECHM": "it",
+    # Oil & Gas
+    "RELIANCE": "oil_gas", "ONGC": "oil_gas",
+    # Telecom
+    "BHARTIARTL": "telecom",
+    # Auto
+    "MARUTI": "auto", "EICHERMOT": "auto",
+    # Pharma
+    "SUNPHARMA": "pharma", "DRREDDY": "pharma", "CIPLA": "pharma", "DIVISLAB": "pharma",
+    # FMCG
+    "HINDUNILVR": "fmcg", "NESTLEIND": "fmcg", "TATACONSUM": "fmcg",
+    # Infra / Power / Ports
+    "LT": "infra", "ADANIPORTS": "infra", "POWERGRID": "infra", "NTPC": "infra",
+    # Metals
+    "JSWSTEEL": "metals", "TATASTEEL": "metals", "HINDALCO": "metals",
+    # Cement & Conglomerate
+    "ULTRACEMCO": "cement", "GRASIM": "cement",
+    # Consumer / Lifestyle / Healthcare
+    "ASIANPAINT": "consumer", "TITAN": "consumer", "APOLLOHOSP": "consumer",
+    # Large conglomerates — standalone
+    "M&M": "auto",
+}
+
+
 def scan_market(candidates, market, risk_state, settings=None):
     settings  = merged_settings(settings)
     min_score = settings["minScore"]
@@ -563,6 +611,26 @@ def scan_market(candidates, market, risk_state, settings=None):
         key=lambda item: item["score"]["total"],
         reverse=True,
     )[: settings["maxSignals"]]
+
+    # Sector concentration: keep only the highest-scoring signal per sector.
+    # Indices (NIFTY/BANKNIFTY) are exempt — they are independent products.
+    # List is already score-sorted so first occurrence per sector wins.
+    _sector_seen: set[str] = set()
+    _sector_deduped: list  = []
+    for item in approved_list:
+        underlying = item["candidate"].get(
+            "underlying", item["candidate"]["instrument"].split()[0]
+        )
+        sector = _SECTOR_MAP.get(underlying, underlying)   # unknown → own sector
+        if sector == "index" or sector not in _sector_seen:
+            _sector_seen.add(sector)
+            _sector_deduped.append(item)
+        else:
+            item["approved"] = False
+            item.setdefault("rejectionReasons", []).append(
+                f"Sector cap: a higher-scoring {sector.upper()} signal is already approved."
+            )
+    approved_list = _sector_deduped
 
     approved_ids = {item["candidate"]["id"] for item in approved_list}
     rejected     = [item for item in evaluated if item["candidate"]["id"] not in approved_ids]

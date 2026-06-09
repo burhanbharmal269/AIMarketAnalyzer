@@ -678,7 +678,9 @@ class NSEDataSource:
                 ta.trend.EMAIndicator(close_d, window=50).ema_indicator().iloc[-1]
             )
             ema50_d     = ta.trend.EMAIndicator(close_d, window=50).ema_indicator().iloc[-1]
-            adx_val     = ta.trend.ADXIndicator(high_d, low_d, close_d).adx().iloc[-1]
+            _adx_s      = ta.trend.ADXIndicator(high_d, low_d, close_d).adx().dropna()
+            adx_val     = float(_adx_s.iloc[-1]) if len(_adx_s) > 0 else 0.0
+            adx_rising  = len(_adx_s) >= 2 and float(_adx_s.iloc[-1]) > float(_adx_s.iloc[-2])
             atr_val     = ta.volatility.AverageTrueRange(high_d, low_d, close_d).average_true_range().iloc[-1]
             avg_vol_raw = df_daily["Volume"].rolling(20).mean().iloc[-1]
             avg_vol     = float(avg_vol_raw) if pd.notna(avg_vol_raw) else 0.0
@@ -702,6 +704,8 @@ class NSEDataSource:
             macd_hist           = 0.0
             macd_hist_expanding = False
             st15_dir  = None
+            or_high   = None
+            or_low    = None
             tf5_bull  = False
             tf5_bear  = False
             rsi5      = 50.0
@@ -878,6 +882,22 @@ class NSEDataSource:
                 except Exception:
                     pass
 
+                # ── Opening Range (OR): 9:15–9:30 first 3 bars of 5-min ──────
+                # OR defines the auction range for the first 15 minutes.
+                # Spot above OR high = breakout (bullish); below OR low = breakdown.
+                # Data from Angel One getCandleData(FIVE_MINUTE).
+                try:
+                    mkt_open_ts = c5.index[0].replace(hour=9, minute=15,
+                                                       second=0, microsecond=0)
+                    or_end_ts   = c5.index[0].replace(hour=9, minute=30,
+                                                       second=0, microsecond=0)
+                    or_bars = c5[(c5.index >= mkt_open_ts) & (c5.index <= or_end_ts)]
+                    if len(or_bars) >= 1:
+                        or_high = float(or_bars["high"].max())
+                        or_low  = float(or_bars["low"].min())
+                except Exception as exc:
+                    logger.debug("OR compute failed [%s]: %s", symbol, exc)
+
             elif intraday_closes is not None and len(intraday_closes) >= 26:
                 # ── Fallback: NSE 1-min closes (resample to 15-min) ──────────
                 data_age = "nse-15min"
@@ -942,6 +962,7 @@ class NSEDataSource:
                 "macdHistogram":     round(macd_hist, 4),
                 "macdHistExpanding": macd_hist_expanding,
                 "adx":               round(float(adx_val), 1),
+                "adxRising":         adx_rising,
                 "atr":               round(float(atr_val), 4),
                 "relativeVolume":    rel_vol,
                 "spotPrice":         round(spot, 2),
@@ -961,6 +982,8 @@ class NSEDataSource:
                 "tf30Bear":          tf30_bear,
                 "vwap":              vwap,
                 "vwapBullish":       vwap_bullish,
+                "orHigh":            round(or_high, 2) if or_high else None,
+                "orLow":             round(or_low, 2)  if or_low  else None,
                 # Research dataset: all intraday TFs captured per signal.
                 # Stored in signal_log so we can later compare which TF combination
                 # best predicted actual outcome (win rate analysis over time).
@@ -1340,6 +1363,7 @@ class NSEDataSource:
             "macdHistogram":    ind.get("macdHistogram", 0),
             "macdHistExpanding": ind.get("macdHistExpanding", False),
             "adx":              round(adx, 1),
+            "adxRising":        ind.get("adxRising", False),
             "relativeVolume":   ind["relativeVolume"],
             "oiChangePct":      opt["oiChangePct"],
             "pcr":              opt["pcr"],
@@ -1378,6 +1402,19 @@ class NSEDataSource:
             "gapUp":             ind.get("gapUp", False),
             "gapDown":           ind.get("gapDown", False),
             "gapPct":            ind.get("gapPct", 0.0),
+            # Opening Range (9:15–9:30) from Angel One 5-min candles
+            "orHigh":            ind.get("orHigh"),
+            "orLow":             ind.get("orLow"),
+            "orbBreakout":       (
+                (bullish and ind.get("orHigh") is not None and ind["spotPrice"] > ind["orHigh"])
+                or
+                (bearish and ind.get("orLow")  is not None and ind["spotPrice"] < ind["orLow"])
+            ),
+            "orbAgainst":        (
+                (bullish and ind.get("orLow")  is not None and ind["spotPrice"] < ind["orLow"])
+                or
+                (bearish and ind.get("orHigh") is not None and ind["spotPrice"] > ind["orHigh"])
+            ),
             "notes":         [f"Live data. Spot: {ind['spotPrice']:.0f}. DTE: {dte}."
                               + (f" VWAP: {vwap:.0f}." if vwap else "")],
             # Multi-TF research data: 5/10/15/30-min indicators stored for
