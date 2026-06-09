@@ -1,9 +1,39 @@
 import json
 import logging
 import re
+import time
 from datetime import date
 
 from app.config import settings
+
+# ── global market snapshot (S&P 500 + USD/INR) ───────────────────────────────
+_GLOBAL_CACHE: dict = {}   # {"data": {...}, "ts": float}
+_GLOBAL_TTL = 900          # 15 min — stale enough to not hammer yfinance
+
+def _get_global_context() -> str:
+    """Return a one-line string with S&P 500 overnight change and USD/INR for AI context."""
+    global _GLOBAL_CACHE
+    if _GLOBAL_CACHE and time.time() - _GLOBAL_CACHE["ts"] < _GLOBAL_TTL:
+        return _GLOBAL_CACHE["data"]
+    try:
+        import yfinance as yf
+        tickers = yf.download("^GSPC USDINR=X", period="5d", interval="1d",
+                              progress=False, auto_adjust=True)
+        closes = tickers["Close"].dropna(how="all")
+        sp_series = closes["^GSPC"].dropna()
+        usd_series = closes["USDINR=X"].dropna()
+        parts = []
+        if len(sp_series) >= 2:
+            sp_chg = round((sp_series.iloc[-1] / sp_series.iloc[-2] - 1) * 100, 2)
+            parts.append(f"S&P 500 prev session: {sp_chg:+.2f}%")
+        if len(usd_series) >= 1:
+            usd_inr = round(float(usd_series.iloc[-1]), 2)
+            parts.append(f"USD/INR: {usd_inr}")
+        line = " | ".join(parts)
+    except Exception:
+        line = ""
+    _GLOBAL_CACHE = {"data": line, "ts": time.time()}
+    return line
 
 # ── caches — all keyed with today's date so they reset each trading day ───────
 _EXPLANATION_CACHE: dict = {}   # (instrument, score_bucket, date) -> str
@@ -208,6 +238,8 @@ def get_market_regime_ai(market: dict) -> dict:
     events = [e["name"] for e in market.get("eventCalendar", [])
               if e.get("minutesAway", 9999) <= 240]   # events within 4 hours
 
+    global_ctx = _get_global_context()
+
     system = (
         "You are a market regime classifier for Indian F&O intraday traders. "
         "Reply with valid JSON only — no prose, no markdown."
@@ -217,7 +249,8 @@ def get_market_regime_ai(market: dict) -> dict:
         f"Advance/Decline ratio: {market.get('breadth')}\n"
         f"Rule-based regime: {market.get('regime')}\n"
         f"Upcoming events (within 4h): {events}\n"
-        f"{news_block}\n\n"
+        + (f"Global: {global_ctx}\n" if global_ctx else "")
+        + f"{news_block}\n\n"
         "Classify the current market environment for directional F&O option buying.\n"
         "Reply as JSON:\n"
         '{"regime": "trending_bull|trending_bear|range_bound|volatile",\n'
