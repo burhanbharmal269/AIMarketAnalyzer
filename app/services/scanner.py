@@ -89,10 +89,15 @@ def trend_score(candidate):
         if candidate.get("tf15Aligned"):
             score += 1   # 3-TF confluence bonus: 15m + 30m + daily all agree
 
-    # S/R breakout — spot cleared a former swing-high resistance (confirmed by daily OHLCV)
-    # Near-support for BUY or near-resistance for SELL scores lower (approaching friction)
+    # S/R breakout — spot cleared a former swing-high resistance (confirmed by daily OHLCV).
+    # Multi-touch breakouts (level tested 2+ times) score higher: more institutional memory
+    # = more sellers trapped above = stronger follow-through when level breaks.
     if candidate.get("srBreakout"):
-        score += 3
+        touches = (
+            candidate.get("resistanceTouches", 0) if candidate["direction"] == "BUY"
+            else candidate.get("supportTouches", 0)
+        )
+        score += 4 if touches >= 2 else 2   # 4 pts for proven multi-touch breakout
     if candidate["direction"] == "BUY" and candidate.get("nearResistance"):
         score -= 2   # approaching overhead supply — exit risk
     if candidate["direction"] == "SELL" and candidate.get("nearSupport"):

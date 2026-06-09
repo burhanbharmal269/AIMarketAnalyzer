@@ -126,6 +126,35 @@ _NSE_CHART_INDEX_MAP = {
 }
 
 
+# NSE intraday cumulative volume distribution (minutes from 9:15 → fraction of daily vol).
+# Indian markets follow a pronounced U-shape: heavy at open (discovery, gap-fills) and
+# close (institutional rebalancing), thin midday.  Using a uniform linear projection at
+# 11 AM would assume only 32% of daily vol has been traded; the real figure is ~43%.
+# Correcting for this prevents false-high RelVol readings in the opening hour and
+# false-low readings during midday thin periods.
+_VOL_PROFILE = [
+    (0,   0.00),   # 9:15 market open
+    (45,  0.28),   # 10:00 — first 45 min: ~28% of daily vol (discovery + gap fills)
+    (105, 0.43),   # 11:00
+    (165, 0.53),   # 12:00
+    (225, 0.61),   # 13:00
+    (285, 0.69),   # 14:00
+    (315, 0.78),   # 14:30
+    (375, 1.00),   # 15:30 close
+]
+
+
+def _expected_vol_fraction(elapsed_minutes: float) -> float:
+    """Interpolate expected cumulative volume fraction from NSE U-shape profile."""
+    elapsed_minutes = max(1.0, min(375.0, elapsed_minutes))
+    for i in range(len(_VOL_PROFILE) - 1):
+        t0, f0 = _VOL_PROFILE[i]
+        t1, f1 = _VOL_PROFILE[i + 1]
+        if t0 <= elapsed_minutes <= t1:
+            return max(f0 + (f1 - f0) * (elapsed_minutes - t0) / (t1 - t0), 0.01)
+    return 1.0
+
+
 def _bs_greeks(spot: float, strike: float, dte: float, iv_pct: float, opt_type: str) -> dict:
     """Black-Scholes Delta, Theta (per calendar day), Vega (per 1% IV move).
     Uses only the standard library — no scipy dependency.
@@ -670,18 +699,21 @@ class NSEDataSource:
                 spot   = float(c5["close"].iloc[-1])
                 close5 = c5["close"]
 
-                # Today's cumulative intraday volume vs daily average.
-                # A session running 6.25 hours has ~6.25 hours of volume.
-                # Normalize: annualized daily avg / 6.25 hours per session.
-                # This compares today's actual intraday participation to what
-                # a normal full-day session averages — more meaningful than
-                # yesterday's closing volume.
+                # Today's volume vs 20-day average — U-shape corrected.
+                # NSE volume follows a U-shape (heavy open/close, thin midday).
+                # Linear projection (vol/hours * 6.25) overestimates in the morning
+                # and underestimates at midday.  Instead, divide by the expected
+                # cumulative fraction at the current time-of-day using _VOL_PROFILE.
+                # A "normal volume day" always returns rel_vol ≈ 1.0 regardless of
+                # when during the session the scan runs.
                 if avg_vol > 0:
-                    intra_vol      = float(c5["volume"].sum())
-                    hours_elapsed  = max((c5.index[-1] - c5.index[0]).total_seconds() / 3600, 0.25)
-                    daily_avg_rate = avg_vol / 6.25   # shares per hour over a full session
-                    projected_vol  = intra_vol / hours_elapsed * 6.25
-                    rel_vol        = round(projected_vol / avg_vol, 2)
+                    intra_vol     = float(c5["volume"].sum())
+                    now_ist_local = datetime.now(IST)
+                    market_open   = now_ist_local.replace(hour=9, minute=15, second=0, microsecond=0)
+                    elapsed_min   = max((now_ist_local - market_open).total_seconds() / 60, 1.0)
+                    expected_frac = _expected_vol_fraction(elapsed_min)
+                    projected_vol = intra_vol / expected_frac
+                    rel_vol       = round(projected_vol / avg_vol, 2)
 
                 # 5-min EMA9/21 — captured for research comparison vs 15-min
                 tf5_bull = False
@@ -902,19 +934,20 @@ class NSEDataSource:
             return None
 
     def _compute_support_resistance(self, df_daily, spot: float) -> dict:
-        """Find nearest S/R levels using swing highs/lows from last 60 trading days.
+        """Find S/R levels using swing highs/lows from last 60 trading days.
 
-        A swing high is a bar whose high is the highest in a ±5-bar window.
-        A swing low  is a bar whose low  is the lowest  in a ±5-bar window.
-        Returns nearest resistance above spot and nearest support below spot.
+        Quality filter: prefer levels tested 2+ times within a 0.5% price band
+        (multi-touch = institutional memory). Falls back to single-touch when
+        no multi-touch level exists on that side of spot.
         """
         _empty = {"resistance": None, "support": None,
-                  "nearResistance": False, "nearSupport": False, "srBreakout": False}
+                  "nearResistance": False, "nearSupport": False, "srBreakout": False,
+                  "resistanceTouches": 0, "supportTouches": 0}
         if df_daily is None or len(df_daily) < 15 or spot <= 0:
             return _empty
         try:
-            highs = df_daily["High"].tail(60).values
-            lows  = df_daily["Low"].tail(60).values
+            highs  = df_daily["High"].tail(60).values
+            lows   = df_daily["Low"].tail(60).values
             window = 5
 
             swing_highs, swing_lows = [], []
@@ -924,26 +957,48 @@ class NSEDataSource:
                 if lows[i]  == min(lows[i  - window: i + window + 1]):
                     swing_lows.append(round(lows[i], 1))
 
-            resistances = sorted(h for h in swing_highs if h > spot * 1.001)
-            supports    = sorted((l for l in swing_lows  if l < spot * 0.999), reverse=True)
+            # Count bars that tested each level within ±0.5%.
+            # A level touched 2+ times shows institutional memory (repeated rejection/support).
+            all_prices = list(highs) + list(lows)
 
-            nearest_r = resistances[0] if resistances else None
-            nearest_s = supports[0]    if supports    else None
+            def _touches(level: float) -> int:
+                return sum(1 for p in all_prices if level > 0 and abs(p - level) / level <= 0.005)
 
-            # "Near": within 0.75% of spot — approaching key level
+            def _ranked_levels(candidates: list, above_spot: bool):
+                scored = [(lvl, _touches(lvl)) for lvl in candidates]
+                for min_t in (2, 1):   # try multi-touch first, fall back to single
+                    side = [
+                        (lvl, t) for lvl, t in scored
+                        if t >= min_t and (lvl > spot * 1.001 if above_spot else lvl < spot * 0.999)
+                    ]
+                    if side:
+                        side.sort(key=lambda x: x[0] if above_spot else -x[0])
+                        return side
+                return []
+
+            r_ranked = _ranked_levels(swing_highs, above_spot=True)
+            s_ranked = _ranked_levels(swing_lows,  above_spot=False)
+
+            nearest_r, r_touches = (r_ranked[0][0], r_ranked[0][1]) if r_ranked else (None, 0)
+            nearest_s, s_touches = (s_ranked[0][0], s_ranked[0][1]) if s_ranked else (None, 0)
+
             near_r = bool(nearest_r and (nearest_r - spot) / spot <= 0.0075)
             near_s = bool(nearest_s and (spot - nearest_s) / spot <= 0.0075)
 
-            # S/R breakout: spot just cleared a former resistance (now within 1%)
             former_resist = [h for h in swing_highs if spot * 0.999 <= h <= spot * 1.01]
             sr_breakout   = len(former_resist) > 0
 
+            logger.debug("S/R [spot=%.0f] R=%.0f(%dt) S=%.0f(%dt)",
+                         spot, nearest_r or 0, r_touches, nearest_s or 0, s_touches)
+
             return {
-                "resistance":    nearest_r,
-                "support":       nearest_s,
-                "nearResistance": near_r,
-                "nearSupport":   near_s,
-                "srBreakout":    sr_breakout,
+                "resistance":        nearest_r,
+                "support":           nearest_s,
+                "nearResistance":    near_r,
+                "nearSupport":       near_s,
+                "srBreakout":        sr_breakout,
+                "resistanceTouches": r_touches,
+                "supportTouches":    s_touches,
             }
         except Exception as exc:
             logger.debug("S/R computation failed: %s", exc)
@@ -986,11 +1041,17 @@ class NSEDataSource:
             target_idx = max(0, min(len(all_strikes) - 1, atm_idx + strike_offset))
             target_strike = all_strikes[target_idx]
 
-            # PCR from filtered totals
-            filt       = oc_data.get("filtered", {})
-            tot_ce_oi  = filt.get("CE", {}).get("totOI", 1) or 1
-            tot_pe_oi  = filt.get("PE", {}).get("totOI", 0)
-            pcr        = round(tot_pe_oi / tot_ce_oi, 2)
+            # PCR from all OI rows of the nearest expiry.
+            # More accurate than the "filtered" totals which include all expiries
+            # and can be distorted by far-month OI accumulation.
+            tot_ce_oi = sum(float((r.get("CE") or {}).get("openInterest") or 0) for r in rows)
+            tot_pe_oi = sum(float((r.get("PE") or {}).get("openInterest") or 0) for r in rows)
+            if tot_ce_oi == 0:
+                # Fallback to filtered totals when row-level OI is absent
+                filt      = oc_data.get("filtered", {})
+                tot_ce_oi = filt.get("CE", {}).get("totOI", 1) or 1
+                tot_pe_oi = filt.get("PE", {}).get("totOI", 0)
+            pcr = round(tot_pe_oi / max(tot_ce_oi, 1), 2)
 
             # Target strike row
             target_row = min(rows, key=lambda r: abs(r.get("strikePrice", 0) - target_strike))
@@ -1256,11 +1317,13 @@ class NSEDataSource:
             "theta":         greeks["theta"],
             "vega":          greeks["vega"],
             # S/R levels from swing-high/low analysis of last 60 daily bars
-            "resistance":        (sr or {}).get("resistance"),
-            "support":           (sr or {}).get("support"),
-            "nearResistance":    (sr or {}).get("nearResistance", False),
-            "nearSupport":       (sr or {}).get("nearSupport", False),
-            "srBreakout":        (sr or {}).get("srBreakout", False),
+            "resistance":           (sr or {}).get("resistance"),
+            "support":              (sr or {}).get("support"),
+            "nearResistance":       (sr or {}).get("nearResistance", False),
+            "nearSupport":          (sr or {}).get("nearSupport", False),
+            "srBreakout":           (sr or {}).get("srBreakout", False),
+            "resistanceTouches":    (sr or {}).get("resistanceTouches", 0),
+            "supportTouches":       (sr or {}).get("supportTouches", 0),
             # Opening gap vs previous day close
             "prevClose":         ind.get("prevClose"),
             "todayOpen":         ind.get("todayOpen"),
