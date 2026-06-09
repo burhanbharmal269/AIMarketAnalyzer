@@ -201,10 +201,11 @@ def _add_column_if_missing(conn, table: str, column: str, col_def: str):
 
 # ── scan audit ────────────────────────────────────────────────────────────────
 
-def record_scan(scan: dict):
+def record_scan(scan: dict) -> int:
+    """Insert scan summary and return the new scan_audit row id."""
     init_db()
     with get_connection() as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO scan_audit
                 (created_at, approved_count, rejected_count, no_trade, payload_json)
@@ -218,6 +219,7 @@ def record_scan(scan: dict):
                 json.dumps(scan),
             ),
         )
+        return cursor.lastrowid
 
 
 def recent_scans(limit: int = 10) -> list[dict]:
@@ -486,6 +488,21 @@ def get_ohlcv_cache(symbol: str, min_rows: int = 150, max_stale_days: int = 5) -
     ]
 
 
+def invalidate_ohlcv_today() -> int:
+    """Delete today's IST daily_ohlcv rows so next scan fetches the completed EOD candle.
+
+    Called at 16:05 IST after market close. yfinance usually publishes the
+    day's complete candle within 30 min of 15:30 close.
+    """
+    today = datetime.now(IST).date().isoformat()
+    with get_connection() as conn:
+        cursor = conn.execute("DELETE FROM daily_ohlcv WHERE date = ?", (today,))
+        deleted = cursor.rowcount
+    if deleted:
+        logger.info("daily_ohlcv invalidated %d rows for %s (EOD refresh)", deleted, today)
+    return deleted
+
+
 def set_ohlcv_cache(symbol: str, rows: list[dict]) -> None:
     """Upsert daily OHLCV rows for a symbol. Each row must have keys:
     date (YYYY-MM-DD), Open, High, Low, Close, Volume."""
@@ -515,16 +532,34 @@ def record_approved_signals(scan_id: int | None, approved: list[dict], market: d
     """
     init_db()
     inserted_ids: list[int] = []
-    nifty_dir = market.get("niftyDirection")  # set by get_live_candidates if available
+    nifty_dir   = market.get("niftyDirection")
+    # Today's IST midnight in UTC — for deduplication check
+    today_utc = (
+        datetime.now(IST)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .astimezone(timezone.utc)
+        .isoformat()
+    )
 
     for item in approved:
         c  = item.get("candidate", {})
         sc = item.get("score", {})
         scores = sc.get("scores", {})
         targets = c.get("targets", [0, 0, 0])
+        instrument = c.get("instrument", "")
 
         try:
             with get_connection() as conn:
+                # Skip duplicate: same instrument already logged today without an outcome
+                existing = conn.execute(
+                    "SELECT id FROM signal_log WHERE instrument = ? AND created_at >= ? AND outcome IS NULL",
+                    (instrument, today_utc),
+                ).fetchone()
+                if existing:
+                    inserted_ids.append(existing["id"])
+                    logger.debug("signal_log dedup: %s already logged today (id=%s)", instrument, existing["id"])
+                    continue
+
                 cursor = conn.execute(
                     """
                     INSERT INTO signal_log (
@@ -611,7 +646,7 @@ def record_approved_signals(scan_id: int | None, approved: list[dict], market: d
                 )
                 inserted_ids.append(cursor.lastrowid)
         except Exception as exc:
-            logger.warning("signal_log insert failed [%s]: %s", c.get("instrument"), exc)
+            logger.warning("signal_log insert failed [%s]: %s", instrument, exc)
 
     return inserted_ids
 

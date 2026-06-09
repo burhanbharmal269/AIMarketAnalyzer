@@ -32,6 +32,7 @@ from app.services.storage import (
     get_recent_signals,
     get_signal_analytics,
     init_db,
+    invalidate_ohlcv_today,
     link_signal_to_journal,
     prune_scan_audit,
     recent_scans,
@@ -316,7 +317,11 @@ def build_scan(settings_payload: dict | None = None, persist: bool = True) -> di
 
     if persist:
         # Persist scan summary and prune old audit rows (keep 30 days)
-        record_scan(scan)
+        scan_id: int | None = None
+        try:
+            scan_id = record_scan(scan)
+        except Exception as exc:
+            logger.warning("record_scan failed: %s", exc)
         try:
             prune_scan_audit(keep_days=30)
         except Exception as exc:
@@ -327,7 +332,7 @@ def build_scan(settings_payload: dict | None = None, persist: bool = True) -> di
         # Record every approved signal with full context, then auto-journal
         signal_ids: list[int] = []
         try:
-            signal_ids = record_approved_signals(None, scan["approved"], market)
+            signal_ids = record_approved_signals(scan_id, scan["approved"], market)
         except Exception as exc:
             logger.warning("record_approved_signals failed: %s", exc)
 
@@ -567,6 +572,16 @@ def signals_export():
         media_type="text/csv",
         headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
+
+
+# ── API: admin / cache management ────────────────────────────────────────────
+
+@app.post("/api/admin/ohlcv-refresh")
+def admin_ohlcv_refresh():
+    """Manually invalidate today's daily_ohlcv cache so the next scan
+    re-fetches the completed EOD candle from yfinance."""
+    deleted = invalidate_ohlcv_today()
+    return {"deleted": deleted, "message": f"Cleared {deleted} today-dated OHLCV rows"}
 
 
 # ── static fallback ───────────────────────────────────────────────────────────

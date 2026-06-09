@@ -43,6 +43,17 @@ def _make_eod_job(scan_fn, send_fn):
     return job
 
 
+def _make_ohlcv_refresh_job():
+    def job():
+        try:
+            from app.services.storage import invalidate_ohlcv_today
+            n = invalidate_ohlcv_today()
+            logger.info("EOD ohlcv cache invalidated: %d rows cleared", n)
+        except Exception as exc:
+            logger.error("OHLCV refresh job failed: %s", exc)
+    return job
+
+
 def _make_monitor_job(nse_data, send_fn):
     def job():
         try:
@@ -89,6 +100,12 @@ def create_scheduler(scan_fn, send_fn=None, nse_data=None):
         _make_eod_job(scan_fn, _send),
         "cron", day_of_week="mon-fri", hour=15, minute=20,
         id="eod_scan",
+    )
+    # 16:05 — invalidate today's daily_ohlcv so next-day first scan fetches complete EOD candle
+    scheduler.add_job(
+        _make_ohlcv_refresh_job(),
+        "cron", day_of_week="mon-fri", hour=16, minute=5,
+        id="ohlcv_refresh",
     )
     # Price monitor — every 2 min during market hours (gate check is inside the job)
     if nse_data is not None and IntervalTrigger is not None:

@@ -22,7 +22,7 @@ class Settings:
 
     # Standard OpenAI (used only when Azure fields are not set)
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    openai_model: str   = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    openai_model: str   = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     # Azure OpenAI (takes priority over standard OpenAI when all three are set)
     azure_openai_api_key:    str = os.getenv("AZURE_OPENAI_API_KEY", "")
