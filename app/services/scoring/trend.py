@@ -109,7 +109,7 @@ class TrendScorer(BaseScorer):
         if spot > 0 and pivot_pp:
             tolerance = spot * 0.003   # 0.3% proximity band
             if direction == "BUY":
-                if spot > pivot_r1 if pivot_r1 else False:
+                if pivot_r1 and spot > pivot_r1:
                     score += 3   # broken above R1 — strong bullish breakout
                 elif spot > pivot_pp:
                     score += 2   # above PP — bias confirmed

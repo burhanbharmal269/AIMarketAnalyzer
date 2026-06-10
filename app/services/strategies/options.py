@@ -136,11 +136,13 @@ class OptionsTradingStrategy(BaseSignalStrategy):
                 weaker_item = index_items[weaker_key]
                 if weaker_item.get("grade") == "A":
                     weaker_item["grade"] = "B"
-                    # Recompute lots at 65%
-                    old_lots = weaker_item["sizing"]["lots"]
-                    new_lots = max(1, int(old_lots * 0.65))
+                    # Recompute sizing at 65%
+                    old_lots     = weaker_item["sizing"]["lots"]
+                    new_lots     = max(1, int(old_lots * 0.65))
+                    lot_risk     = weaker_item["sizing"].get("lotRisk", 0)
                     weaker_item["sizing"]["lots"]      = new_lots
                     weaker_item["sizing"]["quantity"]  = new_lots * weaker_item["candidate"]["lotSize"]
+                    weaker_item["sizing"]["rupeeRisk"] = round(new_lots * lot_risk)
                     weaker_item["sizing"]["grade"]     = "B"
                     weaker_item["sizing"]["gradeNote"] = (
                         f"Reduced to 65% — correlated index risk: NIFTY and BANKNIFTY "
