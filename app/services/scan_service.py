@@ -6,6 +6,7 @@ Previously embedded in main.py — extracted here so the HTTP layer stays thin.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 from app.core.constants import SCAN_CACHE_TTL_SECS, SCAN_AUDIT_KEEP_DAYS, SCORE_CATEGORIES, SCORE_MAX_RAW, SP500_GATE_PCT
@@ -132,6 +133,14 @@ def build_scan(
 
     candidates, market = _live_data()
 
+    # ── Market-level PCR from NIFTY option chain (no extra API call) ─────────
+    # NIFTY's total PE OI / CE OI = the market's institutional PCR signal.
+    # PCR >1.2 = put writers dominant (hedging) → contrarian bullish.
+    # PCR <0.8 = call writers dominant → contrarian bearish / bullish caution.
+    nifty_cand = next((c for c in candidates if c.get("underlying") == "NIFTY"), None)
+    if nifty_cand and nifty_cand.get("pcr"):
+        market["marketPcr"] = nifty_cand["pcr"]
+
     # ── Global cues gate: block BUY/CE when S&P 500 prev session < -1% ───────
     # A US drop of >1% overnight correlates with NSE gap-down opens and elevated
     # CE risk. On such days only SELL/PE setups are permitted.
@@ -155,25 +164,50 @@ def build_scan(
         else:
             market["globalCuesGate"] = {"triggered": False, "sp500Change": sp_chg}
     except Exception as exc:
-        logger.debug("Global cues gate skipped: %s", exc)
+        logger.warning("Global cues gate skipped (S&P 500 data unavailable): %s", exc)
+        market["globalCuesGate"] = {"triggered": False, "sp500Change": None, "error": str(exc)}
 
-    # ── AI: regime classification (one call, injected into market dict) ───────
-    if openai_enabled():
-        try:
-            regime = get_market_regime_ai(market)
-            market.update(regime)
-            logger.info("AI regime injected: action=%s regime=%s",
-                        regime.get("aiAction"), regime.get("aiRegime"))
-        except Exception as exc:
-            logger.warning("AI regime skipped: %s", exc)
-
-    # ── AI: candidate shortlist — filter before Angel One option chain calls ──
-    # Reduces Angel One API calls from 41 → 10-12 using proven F&O rules +
-    # current regime. Falls back to all candidates if AI is unavailable.
+    # ── AI: regime + shortlist + news sentiment — run in parallel ────────────
+    # Previously sequential (regime → shortlist → news = ~15-25s total).
+    # Now: regime and news headlines fetch run concurrently; shortlist uses
+    # regime result which is ready by the time shortlist needs it.
     shortlist_result = {"shortlist": None, "skipped": {}, "regimeNote": "", "source": "fallback"}
     if openai_enabled():
+        from app.services.ai import get_candidate_shortlist
+        from app.data_sources.news import get_headlines
+
+        underlyings = list({c.get("underlying", "") for c in candidates if c.get("underlying")})
+
+        def _fetch_regime():
+            try:
+                r = get_market_regime_ai(market)
+                logger.info("AI regime: action=%s regime=%s", r.get("aiAction"), r.get("aiRegime"))
+                return ("regime", r)
+            except Exception as exc:
+                logger.warning("AI regime skipped: %s", exc)
+                return ("regime", {})
+
+        def _fetch_headlines():
+            try:
+                result = {sym: get_headlines(sym) for sym in underlyings}
+                return ("headlines", result)
+            except Exception as exc:
+                logger.warning("News headlines skipped: %s", exc)
+                return ("headlines", {})
+
+        # Run regime + headline fetches concurrently
+        symbol_headlines: dict = {}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_fetch_regime), pool.submit(_fetch_headlines)]
+            for f in as_completed(futures):
+                key, val = f.result()
+                if key == "regime":
+                    market.update(val)
+                else:
+                    symbol_headlines = val
+
+        # Shortlist uses regime result (now ready), news sentiment batched together
         try:
-            from app.services.ai import get_candidate_shortlist
             shortlist_result = get_candidate_shortlist(candidates, market)
             shortlist_syms   = set(shortlist_result["shortlist"])
             before           = len(candidates)
@@ -187,13 +221,14 @@ def build_scan(
         except Exception as exc:
             logger.warning("AI shortlist skipped: %s", exc)
 
-    # ── AI: batch news sentiment for all underlyings (one call) ───────────────
-    if openai_enabled():
+        # Batch news sentiment (one AI call for all underlyings)
         try:
-            from app.data_sources.news import get_headlines
-            underlyings       = list({c.get("underlying", "") for c in candidates if c.get("underlying")})
-            symbol_headlines  = {sym: get_headlines(sym) for sym in underlyings}
-            sentiments        = get_batch_news_sentiment(symbol_headlines)
+            filtered_headlines = {
+                sym: symbol_headlines[sym]
+                for sym in {c.get("underlying", "") for c in candidates}
+                if sym in symbol_headlines
+            }
+            sentiments = get_batch_news_sentiment(filtered_headlines)
             for c in candidates:
                 c["newsSentiment"] = sentiments.get(c.get("underlying", ""), 0)
             logger.info("News sentiment injected for %d underlyings", len(sentiments))
@@ -213,19 +248,40 @@ def build_scan(
 
     scan = scan_market(candidates, market, risk_state, settings_payload)
 
-    # ── AI: per-signal trade explanations ────────────────────────────────────
-    if openai_enabled():
-        for item in scan["approved"]:
-            item["explanation"] = generate_trade_explanation(
-                item["candidate"], item["score"], market
-            )
+    # ── AI: per-signal trade explanations — parallel across all signals ──────
+    # Previously serial (5 signals × ~3s = 15s). Now parallel: all signals
+    # sent concurrently, total time = slowest single explanation (~3-5s).
+    if openai_enabled() and scan["approved"]:
+        def _explain(item):
+            try:
+                item["explanation"] = generate_trade_explanation(
+                    item["candidate"], item["score"], market
+                )
+            except Exception as exc:
+                logger.warning("Explanation failed for %s: %s",
+                               item.get("candidate", {}).get("instrument"), exc)
 
+        with ThreadPoolExecutor(max_workers=min(5, len(scan["approved"]))) as pool:
+            list(pool.map(_explain, scan["approved"]))
+
+    # ── Data source diagnostics — visible in UI so nothing is hidden ─────────
+    from app.data_sources.kite import KITE_AVAILABLE
+    diagnostics = {
+        "kiteConnected":  KITE_AVAILABLE,
+        "kiteOcScope":    "full F&O universe via Kite Connect",
+        "aiEnabled":      openai_enabled(),
+        "globalCuesGate": market.get("globalCuesGate", {}),
+    }
+
+    funnel_log = scan.pop("funnelLog", {})
     result = {
         "market":      market,
         "categoryMax": CATEGORY_MAX_NORM,
         "dataSource":  "live",
         "lossStreak":  journal_streak,
         "aiShortlist": shortlist_result,
+        "diagnostics": diagnostics,
+        "funnelLog":   funnel_log,
         **scan,
     }
 

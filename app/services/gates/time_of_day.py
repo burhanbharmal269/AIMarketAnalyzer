@@ -28,10 +28,10 @@ class OpeningVolatilityGate(BaseGate):
 
 
 class ClosingVolatilityGate(BaseGate):
-    """Block new entries in the last 45 minutes to avoid close-driven spikes."""
+    """Block new entries in the last 30 minutes to avoid close-driven spikes."""
 
     def check(self, candidate, market, risk_state, settings) -> str | None:
         now = datetime.now(ZoneInfo("Asia/Kolkata")).time()
         if _CLOSING_START <= now <= _CLOSING_END:
-            return "Closing volatility window (14:45–15:30 IST) — avoid new entries near close."
+            return "Closing volatility window (15:00–15:30 IST) — avoid new entries near close."
         return None

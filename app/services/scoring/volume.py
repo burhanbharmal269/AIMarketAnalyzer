@@ -12,7 +12,10 @@ class VolumeScorer(BaseScorer):
         rel_vol = candidate["relativeVolume"]
 
         # Relative equity volume vs 20-day average
-        if rel_vol >= 2.0:   score += 9   # explicit volume spike
+        # Scale logarithmically above 2× — 3× and 4× are materially stronger signals
+        if rel_vol >= 4.0:   score += 11  # extreme institutional surge
+        elif rel_vol >= 3.0: score += 10  # very strong participation
+        elif rel_vol >= 2.0: score += 9   # explicit volume spike
         elif rel_vol >= 1.6: score += 7
         elif rel_vol >= 1.3: score += 5
         elif rel_vol >= 1.0: score += 3
@@ -21,9 +24,15 @@ class VolumeScorer(BaseScorer):
         if candidate.get("volumeSpike"):
             score += 3
 
-        # Option contract liquidity
+        # Option contract liquidity — fall back to OI when today's volume is 0
+        # (Angel One resets totalTradedVolume at open; Wednesday post-expiry fresh
+        # weekly contracts won't have volume until ~10:30 but OI is already populated)
         opt_vol = candidate["optionVolume"]
-        if opt_vol >= 100_000:   score += 6
+        if opt_vol == 0:
+            oi_pct = candidate.get("oiChangePct", 0)
+            if oi_pct > 0:
+                score += 2   # OI present — contract is live, award minimum liquidity pts
+        elif opt_vol >= 100_000: score += 6
         elif opt_vol >= 50_000:  score += 4
         elif opt_vol >= 20_000:  score += 2
 

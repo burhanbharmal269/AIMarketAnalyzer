@@ -287,6 +287,17 @@ class NSEDataSource:
     # ── live market data ──────────────────────────────────────────────────────
 
     def get_india_vix(self) -> float:
+        # Primary: Kite Connect (fast, no scraping)
+        try:
+            from app.data_sources.kite import get_india_vix as _kite_vix, KITE_AVAILABLE
+            if KITE_AVAILABLE:
+                vix = _kite_vix()
+                if vix and vix > 0:
+                    return vix
+        except Exception:
+            pass
+
+        # Fallback: NSE allIndices scrape
         def fetch():
             data = self._get("allIndices")
             if not data:
@@ -306,18 +317,19 @@ class NSEDataSource:
         nse_symbol = "NIFTY FIN SERVICE" if symbol == "FINNIFTY" else symbol
 
         def fetch():
-            # ── Primary: Angel One SmartAPI (fast, no Akamai blocking) ────────
+            # ── Primary: Kite Connect (index + stock, parallel-safe) ─────────
             try:
-                from app.data_sources.angel import (
-                    get_option_chain as angel_oc, ANGEL_AVAILABLE,
+                from app.data_sources.kite import (
+                    get_option_chain as kite_oc, KITE_AVAILABLE,
                 )
-                if ANGEL_AVAILABLE:
-                    data = angel_oc(symbol)
+                if KITE_AVAILABLE:
+                    data = kite_oc(symbol)
                     if data and data.get("records", {}).get("data"):
-                        logger.debug("OC source: Angel One [%s]", symbol)
+                        logger.info("OC source: Kite Connect [%s]", symbol)
                         return data
+                    logger.warning("Kite OC returned no data for %s — falling back to NSE", symbol)
             except Exception as exc:
-                logger.debug("Angel One OC %s failed, falling back to NSE: %s", symbol, exc)
+                logger.warning("Kite OC %s error: %s — falling back to NSE", symbol, exc)
 
             # ── Fallback: jugaad-data (NSE scraping via Akamai workaround) ────
             if _JUGAAD:
@@ -330,14 +342,16 @@ class NSEDataSource:
                     else:
                         data = client.equities_option_chain(symbol)
                     if data and data.get("records", {}).get("data"):
-                        logger.debug("OC source: jugaad-data [%s]", symbol)
+                        logger.info("OC source: jugaad-data [%s]", symbol)
                         return data
+                    logger.warning("jugaad-data OC returned empty data for %s", symbol)
                     self._jugaad = None
                 except Exception as exc:
-                    logger.debug("jugaad-data OC %s failed: %s", symbol, exc)
+                    logger.warning("jugaad-data OC %s failed: %s — trying direct NSE", symbol, exc)
                     self._jugaad = None
 
             # ── Last resort: direct NSE API ────────────────────────────────────
+            logger.info("OC source: direct NSE API [%s]", symbol)
             endpoint = "option-chain-indices" if symbol in INDEX_SYMBOLS else "option-chain-equities"
             return self._get(endpoint, params={"symbol": nse_symbol})
 
@@ -453,8 +467,21 @@ class NSEDataSource:
         return list(self._NSE_DEFAULT_SYMBOLS[:max_symbols])
 
     def get_lot_sizes(self) -> dict[str, int]:
-        """Fetch current F&O lot sizes from the NSE bhavcopy CSV.
-        Falls back to _LOT_SIZE_FALLBACK if the file is unreachable."""
+        """Fetch current F&O lot sizes. Primary: Kite instruments cache.
+        Fallback: NSE bhavcopy CSV. Always merges with _LOT_SIZE_FALLBACK."""
+        # Primary: Kite Connect instruments cache (zero extra API call)
+        try:
+            from app.data_sources.kite import get_lot_sizes as _kite_lots, KITE_AVAILABLE
+            if KITE_AVAILABLE:
+                lots = _kite_lots()
+                if lots:
+                    merged = _LOT_SIZE_FALLBACK.copy()
+                    merged.update(lots)
+                    return merged
+        except Exception:
+            pass
+
+        # Fallback: NSE bhavcopy CSV
         def fetch():
             try:
                 resp = requests.get(_LOT_SIZE_CSV_URL, timeout=15, headers={"User-Agent": _HEADERS["User-Agent"]})
@@ -541,12 +568,17 @@ class NSEDataSource:
             logger.debug("OHLCV cache hit: %s (%d rows)", symbol, len(cached))
             return _rows_to_df(cached)
 
-        # ── 2. Angel One daily OHLCV (primary — no rate limit issues, no yfinance) ─
+        # ── 2. Kite Connect daily OHLCV (primary — fast, reliable, no scraping) ─
         try:
-            from app.data_sources.angel import get_daily_ohlcv as _angel_daily, ANGEL_AVAILABLE
-            if ANGEL_AVAILABLE:
-                df_angel = _angel_daily(symbol, days=400)
-                if df_angel is not None and len(df_angel) >= 60:
+            from app.data_sources.kite import get_daily_ohlcv as _kite_daily, KITE_AVAILABLE
+            if KITE_AVAILABLE:
+                import pandas as pd
+                raw = _kite_daily(symbol, days=400)
+                if raw and len(raw) >= 60:
+                    df_kite = pd.DataFrame(raw)
+                    df_kite["date"] = pd.to_datetime(df_kite["date"])
+                    df_kite = df_kite.set_index("date").rename_axis("Date")
+                    df_kite.columns = [c.capitalize() for c in df_kite.columns]
                     rows = [
                         {
                             "date":   str(idx.date()),
@@ -556,13 +588,13 @@ class NSEDataSource:
                             "Close":  float(row["Close"]),
                             "Volume": float(row["Volume"]),
                         }
-                        for idx, row in df_angel.iterrows()
+                        for idx, row in df_kite.iterrows()
                     ]
                     set_ohlcv_cache(symbol, rows)
-                    logger.debug("OHLCV cached from Angel One: %s (%d rows)", symbol, len(rows))
-                    return df_angel
+                    logger.debug("OHLCV cached from Kite: %s (%d rows)", symbol, len(rows))
+                    return df_kite
         except Exception as exc:
-            logger.debug("Angel One daily OHLCV failed for %s: %s — falling back to yfinance", symbol, exc)
+            logger.debug("Kite daily OHLCV failed for %s: %s — falling back to yfinance", symbol, exc)
 
         # ── 3. Fetch from yfinance with retry/backoff ────────────────────────
         if not _YFINANCE:
@@ -645,7 +677,7 @@ class NSEDataSource:
     # ── technical indicators ──────────────────────────────────────────────────
 
     def _compute_indicators(self, df_daily, intraday_closes=None,
-                            symbol: str = "", angel_candles=None) -> dict | None:
+                            symbol: str = "", intraday_candles=None) -> dict | None:
         """Compute all technical indicators using a 3-timeframe model.
 
         Timeframe model (research: 15-min is optimal for Indian F&O signals):
@@ -686,7 +718,7 @@ class NSEDataSource:
             avg_vol     = float(avg_vol_raw) if pd.notna(avg_vol_raw) else 0.0
             last_vol    = float(df_daily["Volume"].iloc[-1])
             # rel_vol computed here as daily fallback; overwritten below when
-            # angel_candles are available (today's intraday volume is more relevant).
+            # intraday_candles are available (today's intraday volume is more relevant).
             rel_vol     = round(last_vol / avg_vol, 2) if avg_vol > 0 and pd.notna(last_vol) else 1.0
             prev_high   = float(high_d.iloc[-2]) if len(high_d) >= 2 else float(high_d.iloc[-1])
             prev_low    = float(low_d.iloc[-2])  if len(low_d)  >= 2 else float(low_d.iloc[-1])
@@ -734,12 +766,20 @@ class NSEDataSource:
             gap_up = gap_down = False
             gap_pct = 0.0
 
-            if angel_candles is not None and len(angel_candles) >= 10:
+            if intraday_candles is not None and len(intraday_candles) >= 10:
                 # ── 5-min base ───────────────────────────────────────────────
-                c5 = angel_candles.copy()
-                if "datetime" in c5.columns:
+                # Accept either list[dict] (Kite) or DataFrame (legacy)
+                if isinstance(intraday_candles, list):
+                    c5 = pd.DataFrame(intraday_candles)
+                    if "date" in c5.columns:
+                        c5 = c5.rename(columns={"date": "datetime"})
+                    c5["datetime"] = pd.to_datetime(c5["datetime"])
                     c5 = c5.set_index("datetime")
-                c5.index = pd.to_datetime(c5.index)
+                else:
+                    c5 = intraday_candles.copy()
+                    if "datetime" in c5.columns:
+                        c5 = c5.set_index("datetime")
+                    c5.index = pd.to_datetime(c5.index)
 
                 spot   = float(c5["close"].iloc[-1])
                 close5 = c5["close"]
@@ -877,20 +917,19 @@ class NSEDataSource:
 
                 # ── VWAP from 5-min — most accurate (78 bars/session) ────────
                 try:
-                    from app.data_sources.angel import compute_vwap
-                    vwap = compute_vwap(angel_candles)
+                    from app.data_sources.kite import compute_vwap
+                    vwap = compute_vwap(intraday_candles if isinstance(intraday_candles, list)
+                                        else c5.reset_index().rename(columns={"datetime": "date"}).to_dict("records"))
                     if vwap and spot > 0:
                         vwap_bullish = spot > vwap
                 except Exception as exc:
                     logger.debug("VWAP compute failed [%s]: %s", symbol, exc)
 
                 # ── Intraday Volume Profile POC ───────────────────────────────
-                # POC = highest-volume price in today's session. Trending moves
-                # accelerate when price breaks cleanly above/below POC.
-                # Same candles as VWAP — zero extra API calls.
                 try:
-                    from app.data_sources.angel import compute_poc_from_candles
-                    poc = compute_poc_from_candles(angel_candles)
+                    from app.data_sources.kite import compute_poc_from_candles
+                    poc = compute_poc_from_candles(intraday_candles if isinstance(intraday_candles, list)
+                                                   else c5.reset_index().rename(columns={"datetime": "date"}).to_dict("records"))
                     if poc and poc > 0 and spot > 0:
                         price_vs_poc = round((spot - poc) / poc * 100, 2)
                 except Exception as exc:
@@ -898,7 +937,7 @@ class NSEDataSource:
 
                 # ── Opening gap from first 5-min candle ──────────────────────
                 try:
-                    today_open = float(angel_candles["open"].iloc[0])
+                    today_open = float(c5["open"].iloc[0])
                     if today_open and prev_close:
                         gap_pct  = round((today_open - prev_close) / prev_close * 100, 2)
                         gap_up   = gap_pct >= 0.5
@@ -1356,11 +1395,12 @@ class NSEDataSource:
         vix_penalty      = 0 if vix <= 16 else (2 if vix <= 20 else 4)
         market_sentiment = max(0, min(10, (7 if bullish else 6) - vix_penalty))
 
-        # ── IV rank (built up over time from stored daily readings) ──────────
-        from app.services.storage import store_iv_reading, get_iv_rank
+        # ── IV rank + trend (built up over time from stored daily readings) ─────
+        from app.services.storage import store_iv_reading, get_iv_rank, get_iv_trend
         atm_iv = opt.get("atmIV", 0)
         store_iv_reading(symbol, atm_iv)
-        iv_rank = get_iv_rank(symbol)   # None until 20+ days of history
+        iv_rank  = get_iv_rank(symbol)    # None until 20+ days of history
+        iv_trend = get_iv_trend(symbol)   # 'expanding' / 'contracting' / 'neutral' / None
 
         # ── Timeframe confluence flags ────────────────────────────────────────
         # tf15: 15-min EMA9 vs EMA21 — primary intraday signal (resampled from 5-min)
@@ -1431,6 +1471,7 @@ class NSEDataSource:
             "atmIV":         opt.get("atmIV", 0),
             "ivSkew":        opt.get("ivSkew"),   # OTM PE IV - OTM CE IV; positive = put skew (bearish)
             "ivRank":        iv_rank,
+            "ivTrend":       iv_trend,
             "tf15Aligned":   tf15_aligned,
             "tf30Aligned":   tf30_aligned,
             "volumeSpike":   volume_spike,
@@ -1489,24 +1530,24 @@ class NSEDataSource:
         try:
             df_d = self.get_ohlcv_daily(symbol)
 
-            # Fetch Angel One 5-min candles — single call covers all timeframes:
+            # Fetch Kite 5-min candles — single call covers all timeframes:
             # 5-min (VWAP) + resampled 10-min + 15-min (RSI/MACD/EMA) + 30-min (trend).
-            # Falls back to NSE 1-min chart API when Angel One is not configured.
-            angel_candles = None
-            intraday      = None
+            # Falls back to NSE 1-min chart API when Kite is not connected.
+            kite_candles = None
+            intraday     = None
             try:
-                from app.data_sources.angel import (
-                    get_intraday_candles as _angel_candles, ANGEL_AVAILABLE,
+                from app.data_sources.kite import (
+                    get_intraday_candles as _kite_candles, KITE_AVAILABLE,
                 )
-                if ANGEL_AVAILABLE:
-                    angel_candles = _angel_candles(symbol, interval="FIVE_MINUTE")
+                if KITE_AVAILABLE:
+                    kite_candles = _kite_candles(symbol, interval="5minute")
                 else:
                     intraday = self.get_intraday_closes(symbol)
             except Exception as exc:
-                logger.debug("Angel candles unavailable [%s]: %s — falling back to NSE chart", symbol, exc)
+                logger.debug("Kite candles unavailable [%s]: %s — falling back to NSE chart", symbol, exc)
                 intraday = self.get_intraday_closes(symbol)
 
-            ind = self._compute_indicators(df_d, intraday, symbol=symbol, angel_candles=angel_candles)
+            ind = self._compute_indicators(df_d, intraday, symbol=symbol, intraday_candles=kite_candles)
             if not ind:
                 logger.info("Skip %s: indicators unavailable", symbol)
                 return []
@@ -1564,20 +1605,20 @@ class NSEDataSource:
 
         Workflow:
           Phase 0 — Build universe.
-                    Angel One available: use full 40-symbol list directly.
-                    Angel One unavailable: dynamic NSE constituents + OI spurts, or static fallback.
+                    Kite available: use full 60-symbol F&O universe.
+                    Kite unavailable: dynamic NSE constituents + OI spurts, or static fallback.
           Phase 1 — Option chain pre-fetch.
-                    Angel One: parallel fetch (no Akamai blocking, no per-symbol timeout needed).
+                    Kite: parallel fetch (no Akamai blocking, no per-symbol timeout needed).
                     NSE scraping: serial fetch with 15s timeout per symbol.
           Phase 2 — Parallel OHLCV + indicator + VWAP computation.
         """
-        from app.data_sources.angel import ANGEL_AVAILABLE, get_fo_universe
+        from app.data_sources.kite import KITE_AVAILABLE, get_fo_universe as kite_fo_universe
 
         if scan_list:
             instruments = scan_list
-        elif ANGEL_AVAILABLE:
-            instruments = get_fo_universe()
-            logger.info("Universe source: Angel One (%d symbols)", len(instruments))
+        elif KITE_AVAILABLE:
+            instruments = kite_fo_universe()
+            logger.info("Universe source: Kite Connect (%d symbols)", len(instruments))
         else:
             instruments = self._build_dynamic_universe(max_symbols=top_n)
 
@@ -1585,13 +1626,13 @@ class NSEDataSource:
         lot_sizes = self.get_lot_sizes()
 
         # ── Phase 1: option chain pre-fetch ──────────────────────────────────────
-        if ANGEL_AVAILABLE:
-            # Angel One: parallel fetch — no Akamai, no serial bottleneck
-            logger.info("Phase 1: parallel OC fetch via Angel One (%d symbols)", len(instruments))
+        if KITE_AVAILABLE:
+            # Kite: parallel fetch — no Akamai, no serial bottleneck
+            logger.info("Phase 1: parallel OC fetch via Kite Connect (%d symbols)", len(instruments))
             with ThreadPoolExecutor(max_workers=8) as pool:
                 futures = {pool.submit(self.get_option_chain, sym): sym for sym in instruments}
                 fetched = sum(1 for fut in as_completed(futures) if fut.result() is not None)
-            logger.info("Phase 1 complete: %d/%d option chains fetched (Angel One)", fetched, len(instruments))
+            logger.info("Phase 1 complete: %d/%d option chains fetched (Kite)", fetched, len(instruments))
         else:
             # NSE scraping: serial with per-symbol timeout (Akamai blocking requires fresh sessions)
             logger.info("Phase 1: serial OC fetch via NSE jugaad-data (%d symbols)", len(instruments))
@@ -1619,24 +1660,21 @@ class NSEDataSource:
             logger.info("Phase 1 complete: %d/%d option chains fetched (NSE jugaad)", fetched, len(instruments))
 
         # ── Phase 1.5: NIFTY direction as master market filter ───────────────────
-        # When NIFTY indicators are computable, stock signals that trade against
-        # the NIFTY trend are suppressed — they fight the macro tape.
-        # Indices are still scanned independently (their own option signals).
         nifty_direction: str | None = None
         try:
             df_nifty = self.get_ohlcv_daily("NIFTY")
             intraday_nifty = None
-            angel_nifty    = None
+            kite_nifty     = None
             try:
-                from app.data_sources.angel import get_intraday_candles as _ac, ANGEL_AVAILABLE
-                if ANGEL_AVAILABLE:
-                    angel_nifty = _ac("NIFTY", interval="FIVE_MINUTE")
+                from app.data_sources.kite import get_intraday_candles as _kc, KITE_AVAILABLE
+                if KITE_AVAILABLE:
+                    kite_nifty = _kc("NIFTY", interval="5minute")
                 else:
                     intraday_nifty = self.get_intraday_closes("NIFTY")
             except Exception:
                 intraday_nifty = self.get_intraday_closes("NIFTY")
             ind_nifty = self._compute_indicators(df_nifty, intraday_nifty,
-                                                  symbol="NIFTY", angel_candles=angel_nifty)
+                                                  symbol="NIFTY", intraday_candles=kite_nifty)
             if ind_nifty:
                 nifty_direction = "BUY" if ind_nifty["ema20"] > ind_nifty["ema200"] else "SELL"
                 self.last_nifty_direction = nifty_direction

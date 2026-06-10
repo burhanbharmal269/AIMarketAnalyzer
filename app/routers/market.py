@@ -1,4 +1,5 @@
 """Market data routes — /api/health, /api/data-status, /api/summary, /api/option-ltp."""
+# Angel One removed; all live data now via Kite Connect (Zerodha)
 import logging
 from datetime import datetime
 from typing import Optional
@@ -19,14 +20,19 @@ _IST = ZoneInfo("Asia/Kolkata")
 
 @router.get("/health")
 def health():
-    from app.data_sources.angel import ANGEL_AVAILABLE, angel_session
+    from app.data_sources.kite import KITE_AVAILABLE, kite_session
+    from app.core.app_state import state
+    kite_status = kite_session.status() if kite_session else {
+        "connected": False, "configured": False, "message": "Credentials missing"
+    }
     return {
         "status":        "ok",
+        "ready":         state["ready"],
         "pythonBackend": True,
         "database":      str(settings.database_path),
         "ai":            ai_status(),
         "telegram":      telegram_status(),
-        "angelOne":      angel_session.status(),
+        "kite":          kite_status,
     }
 
 
@@ -37,25 +43,27 @@ def option_ltp(
     opt_type: str,
     expiry: Optional[str] = None,
 ):
-    """Real-time Angel One option quote.
+    """Real-time Kite option LTP.
 
     Examples:
       /api/option-ltp?underlying=NIFTY&strike=23200&opt_type=PE
-      /api/option-ltp?underlying=BANKNIFTY&strike=52000&opt_type=CE&expiry=12Jun2026
+      /api/option-ltp?underlying=BANKNIFTY&strike=52000&opt_type=CE&expiry=26Jun2025
     """
-    from app.data_sources.angel import get_option_ltp
+    from app.data_sources.kite import get_option_ltp, KITE_AVAILABLE
     opt_type = opt_type.upper()
     if opt_type not in ("CE", "PE"):
         return {"error": "opt_type must be CE or PE"}
-    result = get_option_ltp(underlying.upper(), strike, opt_type, expiry_hint=expiry)
-    if result is None:
+    if not KITE_AVAILABLE:
+        return {"error": "Kite not configured — set KITE_API_KEY and KITE_API_SECRET in .env"}
+    ltp = get_option_ltp(underlying.upper(), strike, opt_type, expiry_hint=expiry)
+    if ltp is None:
         return {
-            "error":      "No data — market may be closed, option expired, or Angel One disconnected",
+            "error":      "No data — market may be closed, option expired, or Kite session expired (visit /api/kite/login)",
             "underlying": underlying,
             "strike":     strike,
             "optType":    opt_type,
         }
-    return result
+    return {"ltp": ltp, "underlying": underlying, "strike": strike, "optType": opt_type}
 
 
 def _is_market_open() -> bool:

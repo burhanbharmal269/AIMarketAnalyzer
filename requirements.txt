@@ -10,7 +10,10 @@ APScheduler>=3.10.0
 python-telegram-bot>=21.0
 beautifulsoup4>=4.12.0
 yfinance>=0.2.40
-# Angel One SmartAPI
+tzdata>=2024.1
+# Zerodha Kite Connect
+kiteconnect>=5.0.0
+# Angel One SmartAPI (kept for fallback reference)
 smartapi-python>=1.5.0
 pyotp>=2.9.0
 logzero>=1.7.0

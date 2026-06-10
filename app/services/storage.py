@@ -418,6 +418,35 @@ def get_iv_rank(symbol: str) -> float | None:
     return round((current - lo) / (hi - lo) * 100, 1)
 
 
+def get_iv_trend(symbol: str, lookback: int = 5) -> str | None:
+    """IV trend direction over the last `lookback` sessions.
+
+    Returns 'expanding', 'contracting', or None when history is insufficient.
+
+    Option buyers benefit from expanding IV (bigger moves coming, option value
+    increases). Contracting IV signals crush risk — option loses value even
+    when price moves modestly in the right direction.
+    """
+    init_db()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT iv_pct FROM iv_history WHERE symbol = ? ORDER BY date DESC LIMIT ?",
+            (symbol, lookback + 1),
+        ).fetchall()
+    if len(rows) < 3:
+        return None
+    ivs     = [float(r[0]) for r in rows]
+    current = ivs[0]
+    avg     = sum(ivs[1:]) / len(ivs[1:])
+    if avg <= 0:
+        return None
+    if current > avg * 1.08:    # IV expanded >8% from recent average
+        return "expanding"
+    if current < avg * 0.92:    # IV contracted >8% from recent average
+        return "contracting"
+    return "neutral"
+
+
 # ── telegram retry queue ──────────────────────────────────────────────────────
 
 def enqueue_alert(message: str) -> None:

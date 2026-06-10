@@ -87,12 +87,17 @@
     els.scanButton.disabled = loading;
     if (loading) {
       els.scanButton.classList.add("loading");
-      els.scanButton.innerHTML = "<span class=\"scan-spinner\"></span>Scanning…";
-      if (els.scanBar) els.scanBar.classList.remove("hidden");
+      els.scanButton.innerHTML = "<span class=\"scan-spinner\"></span>Scanning… 0s";
+      if (els.scanBar) {
+        els.scanBar.className    = "scan-bar";
+        els.scanBar.textContent  = "Fetching live market data… 0s";
+      }
+      _startElapsedTimer();
     } else {
+      _stopPolling();
       els.scanButton.classList.remove("loading");
       els.scanButton.textContent = "Run Scan";
-      if (els.scanBar) els.scanBar.classList.add("hidden");
+      if (els.scanBar) els.scanBar.className = "scan-bar hidden";
     }
   }
 
@@ -622,12 +627,84 @@
     if (bar) bar.className = "scan-bar hidden";
   }
 
+  // ── Scan polling state ────────────────────────────────────────────────────
+  let _scanPollTimer   = null;
+  let _scanElapsedTimer = null;
+  let _scanPollCount   = 0;
+  let _scanStartedAt   = 0;
+  const _POLL_INTERVAL_MS  = 5000;
+  const _POLL_MAX_ATTEMPTS = 24;    // give up after 2 min (24 × 5s)
+
+  function _stopPolling() {
+    if (_scanPollTimer)    { clearInterval(_scanPollTimer);    _scanPollTimer    = null; }
+    if (_scanElapsedTimer) { clearInterval(_scanElapsedTimer); _scanElapsedTimer = null; }
+    _scanPollCount = 0;
+  }
+
+  function _startElapsedTimer() {
+    _scanStartedAt = Date.now();
+    _scanElapsedTimer = setInterval(function () {
+      const secs = Math.floor((Date.now() - _scanStartedAt) / 1000);
+      const bar  = els.scanBar;
+      if (bar && !bar.classList.contains("hidden")) {
+        bar.textContent = "Fetching live market data… " + secs + "s";
+      }
+      // Update button label with elapsed time
+      const btn = els.scanButton;
+      if (btn && btn.disabled) {
+        btn.innerHTML = "<span class=\"scan-spinner\"></span>Scanning… " + secs + "s";
+      }
+    }, 1000);
+  }
+
+  function _handleScanPayload(payload) {
+    if (payload.dataSource && payload.dataSource !== "live") {
+      showScanError("Non-live data returned. Do NOT trade on this scan.");
+      return false;
+    }
+    clearScanError();
+    renderAll(normalizeApiScan(payload), payload.market);
+    syncLossStreak(payload.lossStreak);
+    loadAnalytics();
+    const n = payload.approved.length;
+    showToast(
+      n > 0
+        ? "Scan complete — " + n + " signal" + (n > 1 ? "s" : "") + " approved"
+        : "Scan complete — no approved signals",
+      n > 0 ? "success" : "info"
+    );
+    return true;
+  }
+
+  async function _pollScanResult() {
+    _scanPollCount++;
+    if (_scanPollCount > _POLL_MAX_ATTEMPTS) {
+      _stopPolling();
+      setScanLoading(false);
+      showScanError("Scan is taking too long — NSE may be slow. Try again in 30s.");
+      return;
+    }
+    try {
+      const res = await fetch("/api/scan");
+      if (!res.ok) return;   // still running or error — keep polling
+      const payload = await res.json();
+      // If scan still running (no market data yet), keep polling
+      if (payload.scanStatus === "running" && !payload.market) return;
+      // Got a result — stop polling and render
+      _stopPolling();
+      setScanLoading(false);
+      _handleScanPayload(payload);
+    } catch (_) {
+      // Network blip — keep polling, don't show error yet
+    }
+  }
+
   async function runScan() {
-    // If server is completely unreachable, show error — never silently use sample data
     if (!apiAvailable) {
       showScanError("Backend server is offline. Start the server before scanning.");
       return;
     }
+    _stopPolling();
     setScanLoading(true);
     clearScanError();
     try {
@@ -638,25 +715,22 @@
       });
       if (!response.ok) {
         const err = await response.json().catch(function () { return {}; });
-        const reason = (err.detail) || ("HTTP " + response.status);
-        showScanError("Live scan failed — " + reason + ". Do NOT trade without fresh data.");
+        showScanError("Live scan failed — " + ((err.detail) || ("HTTP " + response.status)) + ". Do NOT trade without fresh data.");
+        setScanLoading(false);
         return;
       }
       const payload = await response.json();
-      if (payload.dataSource && payload.dataSource !== "live") {
-        showScanError("Non-live data returned. Do NOT trade on this scan.");
+      // If scan result is already ready (cached or fast), render immediately
+      if (payload.market) {
+        setScanLoading(false);
+        _handleScanPayload(payload);
         return;
       }
-      clearScanError();
-      renderAll(normalizeApiScan(payload), payload.market);
-      syncLossStreak(payload.lossStreak);
-      loadAnalytics();
-      const n = payload.approved.length;
-      showToast(n > 0 ? "Scan complete — " + n + " signal" + (n > 1 ? "s" : "") + " approved" : "Scan complete — no approved signals", n > 0 ? "success" : "info");
+      // Scan is running in background — auto-poll every 5s, spinner stays on
+      _scanPollTimer = setInterval(_pollScanResult, _POLL_INTERVAL_MS);
     } catch (_) {
-      showScanError("Server unreachable — check that the backend is running. Do NOT trade without live data.");
-    } finally {
       setScanLoading(false);
+      showScanError("Server unreachable — check that the backend is running. Do NOT trade without live data.");
     }
   }
 

@@ -55,15 +55,15 @@ def _get_option_price(nse_data, instrument: str) -> float | None:
     except ValueError:
         return None
 
-    # ── Primary: Angel One (fast single-strike lookup) ─────────────────────────
+    # ── Primary: Kite (fast single-strike lookup) ─────────────────────────────
     try:
-        from app.data_sources.angel import get_option_ltp, ANGEL_AVAILABLE
-        if ANGEL_AVAILABLE:
+        from app.data_sources.kite import get_option_ltp, KITE_AVAILABLE
+        if KITE_AVAILABLE:
             ltp = get_option_ltp(underlying, strike, opt_type)
             if ltp is not None and ltp > 0:
                 return ltp
     except Exception as exc:
-        logger.debug("Angel option LTP failed for %s: %s", instrument, exc)
+        logger.debug("Kite option LTP failed for %s: %s", instrument, exc)
 
     # ── Fallback: full NSE option chain (slow) ─────────────────────────────────
     oc = nse_data.get_option_chain(underlying)

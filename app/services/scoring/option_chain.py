@@ -64,13 +64,26 @@ class OptionChainScorer(BaseScorer):
             elif iv_rank > 80:  score -= 4   # avoid buying at multi-month highs
             elif iv_rank > 65:  score -= 2
 
+        # IV Trend — direction of implied volatility over last 5 sessions.
+        # Option buyers want IV expanding (bigger moves coming, vega gains).
+        # Contracting IV = crush risk: the option loses value even on correct moves.
+        iv_trend = candidate.get("ivTrend")
+        if iv_trend == "expanding":
+            score += 2
+        elif iv_trend == "contracting":
+            score -= 2
+
         # IV Skew — market's revealed directional opinion via OTM implied vol surface.
         # Positive skew (OTM PE IV > OTM CE IV): market paying for downside protection = bearish lean.
         # When skew opposes trade direction it signals institutional hedging against that move.
         # Research: put-call IV skew is one of the most reliable short-term directional signals
         # because it reflects actual money paid, not just open interest positioning.
+        # IMPORTANT: At low IV Rank (<20), skew is noise — everyone's cheap, nobody's hedging
+        # directionally. Gate skew scoring to regimes where it carries information.
         iv_skew = candidate.get("ivSkew")
-        if iv_skew is not None:
+        iv_rank = candidate.get("ivRank")
+        skew_informative = iv_rank is None or iv_rank >= 20
+        if iv_skew is not None and skew_informative:
             if direction == "BUY":
                 if iv_skew > 8:    score -= 3   # strong put skew = institutional hedging = headwind
                 elif iv_skew > 4:  score -= 1   # mild put skew = slight caution
@@ -86,7 +99,7 @@ class OptionChainScorer(BaseScorer):
         # This is the "smart money" alignment signal.
         oi_positive = oi_chg >= 4   # fresh OI build-up — participants opening, not closing
         if direction == "BUY":
-            if pcr >= 1.0 and oi_positive:
+            if pcr >= 0.9 and oi_positive:
                 score += 5   # put writers + fresh call OI = dual institutional confirmation
         else:   # SELL
             if pcr <= 0.9 and oi_positive:

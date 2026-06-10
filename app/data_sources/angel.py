@@ -334,37 +334,37 @@ def _next_weekday(from_date: date, weekday: int) -> date:
     return from_date + timedelta(days=days_ahead)
 
 
-def _last_thursday_of_month(year: int, month: int) -> date:
-    """Last Thursday of the given month — standard NSE stock monthly F&O expiry."""
+def _last_tuesday_of_month(year: int, month: int) -> date:
+    """Last Tuesday of the given month — NSE stock monthly F&O expiry (changed ~2024)."""
     if month == 12:
         last = date(year + 1, 1, 1) - timedelta(days=1)
     else:
         last = date(year, month + 1, 1) - timedelta(days=1)
-    return last - timedelta(days=(last.weekday() - 3) % 7)  # 3 = Thursday
+    return last - timedelta(days=(last.weekday() - 1) % 7)  # 1 = Tuesday
 
 
 def _nearest_stock_monthly_expiry(today: date) -> date:
-    """Last Thursday of current month, rolling to next month if already past."""
-    d = _last_thursday_of_month(today.year, today.month)
+    """Last Tuesday of current month, rolling to next month if already past."""
+    d = _last_tuesday_of_month(today.year, today.month)
     if d < today:
         nxt_month = today.month + 1 if today.month < 12 else 1
         nxt_year  = today.year if today.month < 12 else today.year + 1
-        d = _last_thursday_of_month(nxt_year, nxt_month)
+        d = _last_tuesday_of_month(nxt_year, nxt_month)
     return d
 
 
 def _guess_expiry(symbol: str) -> str:
-    """Return Angel One expiry string (e.g. '09Jun2026') for the nearest valid expiry.
+    """Return Angel One expiry string (e.g. '30Jun2026') for the nearest valid expiry.
 
     Expiry rules (NSE F&O schedule):
-      - Weekly index contracts (NIFTY, BANKNIFTY, etc.): nearest upcoming Tuesday.
-      - Stock monthly contracts: last Thursday of the current (or next) month.
+      - All F&O (index weekly + stock monthly): nearest upcoming Tuesday.
+        NSE unified weekly index expiry AND stock monthly expiry on last Tuesday.
     """
     today = date.today()
     if symbol in _WEEKLY_TUESDAY_EXPIRY:
-        d = _next_weekday(today, weekday=1)   # 1 = Tuesday
+        d = _next_weekday(today, weekday=1)   # nearest Tuesday (weekly)
     else:
-        d = _nearest_stock_monthly_expiry(today)
+        d = _nearest_stock_monthly_expiry(today)  # last Tuesday of month
     return d.strftime("%d%b%Y")
 
 
@@ -482,6 +482,185 @@ def get_option_chain(symbol: str) -> dict | None:
             "PE": {"totOI": total_pe_oi},
         },
         "_source": "angel",
+    }
+
+
+# ── ScripMaster-based stock option chain ─────────────────────────────────────
+# Angel One's optionGreek API only works for index F&O.
+# For stocks we use: ScripMaster JSON (OPTSTK token lookup) →
+# getMarketData FULL (batch quote for all strikes in one call).
+# This gives us LTP, OI, volume, bid/ask for every CE+PE strike.
+
+_SCRIP_MASTER_URL  = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+_scrip_master_data: list[dict] | None = None
+_scrip_master_at:   float             = 0.0
+_scrip_master_lock  = threading.Lock()
+_SCRIP_MASTER_TTL   = 6 * 3600   # refresh every 6 hours
+
+
+def _load_scrip_master() -> list[dict]:
+    """Download and cache Angel One ScripMaster JSON. Refreshed every 6 hours."""
+    global _scrip_master_data, _scrip_master_at
+    with _scrip_master_lock:
+        if _scrip_master_data and (time.time() - _scrip_master_at) < _SCRIP_MASTER_TTL:
+            return _scrip_master_data
+        try:
+            import urllib.request, json as _json
+            with urllib.request.urlopen(_SCRIP_MASTER_URL, timeout=15) as resp:
+                _scrip_master_data = _json.loads(resp.read())
+                _scrip_master_at   = time.time()
+                logger.info("ScripMaster loaded: %d instruments", len(_scrip_master_data))
+        except Exception as exc:
+            logger.warning("ScripMaster download failed: %s", exc)
+            if _scrip_master_data is None:
+                _scrip_master_data = []
+        return _scrip_master_data
+
+
+def get_stock_option_chain(symbol: str) -> dict | None:
+    """Fetch stock option chain via ScripMaster token lookup + getMarketData FULL.
+
+    Works for any OPTSTK symbol (RELIANCE, HDFCBANK, TCS, etc.).
+    Returns NSE-compatible dict so nse.py _parse_option_chain() works unchanged.
+    """
+    if not ANGEL_AVAILABLE:
+        return None
+
+    client = angel_session.get_client()
+    if client is None:
+        return None
+
+    expiry_str = _guess_expiry(symbol)   # e.g. "25Jun2026"
+    # ScripMaster uses DDMONYYYY uppercase: "25JUN2026"
+    expiry_scrip = expiry_str.upper()
+
+    # ── Step 1: filter ScripMaster for this symbol + expiry ──────────────────
+    master = _load_scrip_master()
+    contracts = [
+        r for r in master
+        if r.get("name", "").upper() == symbol.upper()
+        and r.get("instrumenttype") in ("OPTSTK", "OPTIDX")
+        and r.get("exch_seg") == "NFO"
+        and r.get("expiry", "").upper() == expiry_scrip
+    ]
+    if not contracts:
+        logger.warning("ScripMaster: no contracts found for %s expiry %s", symbol, expiry_scrip)
+        return None
+
+    # Build token → contract metadata map
+    token_map: dict[str, dict] = {}
+    for c in contracts:
+        tok = str(c.get("token", "")).strip()
+        if tok:
+            token_map[tok] = c
+
+    if not token_map:
+        logger.warning("ScripMaster: no valid tokens for %s", symbol)
+        return None
+
+    # ── Step 2: batch fetch all strikes via getMarketData FULL ───────────────
+    # Angel One limit: 50 tokens per call — chunk and merge
+    tokens = list(token_map.keys())
+    _BATCH_SIZE = 50
+    fetched: list[dict] = []
+    for i in range(0, len(tokens), _BATCH_SIZE):
+        chunk = tokens[i : i + _BATCH_SIZE]
+        _throttle()
+        try:
+            resp = client.getMarketData("FULL", {"NFO": chunk})
+        except Exception as exc:
+            logger.warning("getMarketData FULL failed for %s (chunk %d): %s", symbol, i, exc)
+            continue
+        if not resp or not resp.get("status"):
+            logger.warning("getMarketData FULL bad response for %s (chunk %d): %s", symbol, i, resp)
+            continue
+        fetched.extend(resp.get("data", {}).get("fetched", []))
+    if not fetched:
+        logger.warning("getMarketData FULL: no data fetched for %s", symbol)
+        return None
+
+    # ── Step 3: build NSE-compatible option chain structure ───────────────────
+    nse_expiry      = _expiry_to_nse_fmt(expiry_str)
+    strike_map: dict[float, dict] = {}   # strike → {CE: ..., PE: ...}
+
+    spot = 0.0
+    for q in fetched:
+        tok  = str(q.get("symbolToken", ""))
+        meta = token_map.get(tok)
+        if not meta:
+            continue
+
+        # ScripMaster has no optiontype field — extract CE/PE from symbol tail
+        sym_str  = meta.get("symbol", "")
+        opt_type = sym_str[-2:].upper() if len(sym_str) >= 2 else ""
+        # ScripMaster strike is in paise (×100 for stocks, ×100 for index)
+        try:
+            strike = float(meta.get("strike", 0)) / 100.0
+        except (TypeError, ValueError):
+            continue
+        if strike <= 0 or opt_type not in ("CE", "PE"):
+            continue
+
+        ltp  = float(q.get("ltp",  0) or 0)
+        oi   = float(q.get("opnInterest", 0) or 0)
+        # OI change: quote API gives net OI, not change — approximate from close
+        close_price = float(q.get("close", 0) or 0)
+        # Volume (tradeVolume from getMarketData FULL response)
+        vol  = float(q.get("tradeVolume", 0) or q.get("totTrdVal", 0) or 0)
+        # bid/ask from depth if available, else ±0.5%
+        depth = q.get("depth", {})
+        bid   = 0.0
+        ask   = 0.0
+        if depth:
+            buy_depth  = depth.get("buy",  [{}])
+            sell_depth = depth.get("sell", [{}])
+            bid = float((buy_depth[0]  if buy_depth  else {}).get("price", 0) or 0)
+            ask = float((sell_depth[0] if sell_depth else {}).get("price", 0) or 0)
+        if bid == 0 and ltp > 0:
+            bid = round(ltp * 0.995, 2)
+        if ask == 0 and ltp > 0:
+            ask = round(ltp * 1.005, 2)
+
+        iv = float(q.get("impliedVol", 0) or 0)
+        # underlyingValue: use NSE equity LTP if available, else 0 (nse.py has spotPrice)
+        if spot == 0:
+            spot = float(q.get("spotPrice", 0) or 0)
+
+        if strike not in strike_map:
+            strike_map[strike] = {"strikePrice": strike, "expiryDate": nse_expiry}
+
+        strike_map[strike][opt_type] = {
+            "lastPrice":             ltp,
+            "openInterest":          oi,
+            "changeinOpenInterest":  0.0,   # not available from quote API
+            "pchangeinOpenInterest": 0.0,
+            "totalTradedVolume":     vol,
+            "impliedVolatility":     iv,
+            "bidprice":              bid,
+            "askPrice":              ask,
+            "underlyingValue":       spot,
+        }
+
+    if not strike_map:
+        logger.warning("Angel One stock OC: parsed 0 strikes for %s", symbol)
+        return None
+
+    nse_rows = [v for v in strike_map.values() if "CE" in v or "PE" in v]
+    total_ce_oi = sum(r.get("CE", {}).get("openInterest", 0) for r in nse_rows)
+    total_pe_oi = sum(r.get("PE", {}).get("openInterest", 0) for r in nse_rows)
+
+    logger.info("Angel One stock OC [%s]: %d strikes, CE OI=%.0f PE OI=%.0f",
+                symbol, len(nse_rows), total_ce_oi, total_pe_oi)
+    return {
+        "records": {
+            "expiryDates": [nse_expiry],
+            "data": nse_rows,
+        },
+        "filtered": {
+            "CE": {"totOI": total_ce_oi},
+            "PE": {"totOI": total_pe_oi},
+        },
+        "_source": "angel_scrip",
     }
 
 

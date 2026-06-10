@@ -25,6 +25,21 @@ class SentimentScorer(BaseScorer):
         elif breadth >= 1.0:  score += 1
         elif breadth < 0.8:   score -= 1
 
+        # Market PCR (NIFTY total PE OI ÷ CE OI) — broad institutional sentiment.
+        # High PCR = institutions are buying puts (hedging longs) = contrarian bullish.
+        # Low PCR = institutions are buying calls aggressively = contrarian bearish signal.
+        market_pcr = market.get("marketPcr")
+        if market_pcr is not None:
+            direction = candidate.get("direction", "BUY")
+            if direction == "BUY":
+                if market_pcr >= 1.3:    score += 2   # heavy put hedging = smart money long
+                elif market_pcr >= 1.1:  score += 1
+                elif market_pcr < 0.7:   score -= 2   # call euphoria = caution for longs
+            else:   # SELL
+                if market_pcr <= 0.7:    score += 2   # call euphoria confirms bearish setup
+                elif market_pcr <= 0.9:  score += 1
+                elif market_pcr > 1.3:   score -= 2   # defensive hedging ≠ genuine distribution
+
         # AI regime — overrides rule-based bias when AI is configured
         ai_action = market.get("aiAction")
         if ai_action == "trade_full":

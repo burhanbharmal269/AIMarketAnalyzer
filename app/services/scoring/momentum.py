@@ -36,8 +36,12 @@ class MomentumScorer(BaseScorer):
         if candidate.get("macdHistExpanding") and hist != 0.0:
             if (direction == "BUY" and hist > 0) or (direction == "SELL" and hist < 0):
                 score += 3
-        elif hist != 0.0 and macd_abs > 0 and abs(hist) < 0.10 * macd_abs:
-            score -= 1   # histogram shrinking toward zero — momentum fading
+        elif hist != 0.0 and macd_abs > 0:
+            hist_ratio = abs(hist) / macd_abs
+            if hist_ratio < 0.05:
+                score -= 2   # histogram nearly collapsed — momentum exhausting fast
+            elif hist_ratio < 0.10:
+                score -= 1   # histogram shrinking toward zero — momentum fading
 
         # ADX — trend strength
         adx = candidate["adx"]

@@ -35,12 +35,16 @@ MARKET_OPEN_H,       MARKET_OPEN_M       = 9,  15
 MARKET_CLOSE_H,      MARKET_CLOSE_M      = 15, 30
 TIME_EXIT_H,         TIME_EXIT_M         = 14, 15
 OPENING_VOL_END_H,   OPENING_VOL_END_M   = 9,  30   # avoid first-15-min chop
-CLOSING_VOL_START_H, CLOSING_VOL_START_M = 14, 45   # avoid close volatility
+CLOSING_VOL_START_H, CLOSING_VOL_START_M = 15,  0   # avoid last-30-min close volatility
 EXPIRY_GATE_HOUR = 11    # Tuesday after 11:00 IST = weekly expiry gamma gate
 
 # ── VIX thresholds ────────────────────────────────────────────────────────────
-VIX_HARD_GATE  = 22    # above this: no directional option buying
-VIX_CAUTION    = 20
+# VIX thresholds: the hard gate (22) is calibrated for OPTION BUYERS —
+# above 22 is extreme fear where premiums are completely mispriced.
+# Research VIX <13 thresholds apply to CREDIT strategies (selling), not buying.
+# VIX 18-22 = elevated but moves are also larger, creating momentum opportunities.
+VIX_HARD_GATE  = 22    # above this: extreme fear, no directional option buying
+VIX_CAUTION    = 20    # elevated — OptionChainScorer already penalises high ATM IV
 VIX_ELEVATED   = 18
 VIX_CALM       = 16
 VIX_VERY_CALM  = 14
@@ -50,6 +54,13 @@ MAX_PNL_LOSS_CAP   = -3.0   # floor on recorded loss (in R units)
 MAX_PNL_WIN_CAP    =  5.0   # ceiling on recorded win
 MIN_IV_RANK_GATE   = 80     # IV Rank percentile hard cut-off
 
+# RSI extremes — hard blocks (research: RSI>80 = chasing overbought, high IV crush risk)
+RSI_OVERBOUGHT_GATE = 78    # BUY blocked above this (too extended, reversion likely)
+RSI_OVERSOLD_GATE   = 22    # SELL blocked below this (bounce risk, mean-reversion)
+
+# Transaction costs (research: must be factored into profit projections)
+STT_RATE_SELL = 0.0015      # 0.15% on option sell (exit) — post April 2026 NSE rate
+
 # ── Monitor daemon ────────────────────────────────────────────────────────────
 MONITOR_INTERVAL_SECS  = 60
 WATCHDOG_INTERVAL_SECS = 900
@@ -58,9 +69,9 @@ WATCHDOG_INTERVAL_SECS = 900
 TELEGRAM_RETRY_DELAYS = (30, 120)   # seconds: retry 1→2 wait, retry 2→3 wait
 TELEGRAM_DRAIN_SECS   = 15          # how often the retry thread wakes
 
-# ── Angel One ─────────────────────────────────────────────────────────────────
-ANGEL_RATE_LIMIT_SLEEP = 0.35           # 1/3 s → ≤3 req/sec
-ANGEL_SESSION_TTL_SECS = 23 * 3_600    # 23-hour JWT token TTL
+# ── Kite Connect ─────────────────────────────────────────────────────────────
+KITE_RATE_LIMIT_SLEEP  = 0.34           # ~3 req/sec
+KITE_TOKEN_EXPIRY_HOUR = 6              # 6 AM IST daily rollover (regulatory)
 
 # ── NSE scraper ───────────────────────────────────────────────────────────────
 NSE_BASE            = "https://www.nseindia.com"

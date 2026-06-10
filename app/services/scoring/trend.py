@@ -60,18 +60,26 @@ class TrendScorer(BaseScorer):
         if direction == "SELL" and candidate.get("nearSupport"):
             score -= 2   # approaching demand zone — bounce risk
 
-        # Prime entry window — research-validated high-probability IST windows.
-        # First-hour momentum (10:00–11:30): market has settled from open chop,
-        # directional moves are sustained. Post-lunch (13:00–14:00): breakout or
-        # continuation window before close-driven volatility starts at 14:30.
-        # Evidence: Gao et al. (2018) and our own prime-window guidance in AI prompt.
         now_ist = datetime.now(ZoneInfo("Asia/Kolkata")).time()
+
+        # ORB confirmation window: 9:30–10:00 — first 15-min candle has closed,
+        # breakout direction is confirmed with momentum. This is the highest-
+        # conviction ORB entry window (matches professional intraday group timing).
+        in_orb_window = dtime(9, 30) <= now_ist <= dtime(10, 0)
+
+        # Prime trend windows — validated high-probability IST slots.
+        # 10:00–11:30: post-open momentum (market settled, directional moves sustained).
+        # 13:00–14:00: post-lunch continuation (breakout window before close volatility).
         in_prime = (
             (dtime(10, 0) <= now_ist <= dtime(11, 30)) or
             (dtime(13, 0) <= now_ist <= dtime(14, 0))
         )
         if in_prime:
-            score += 2
+            score += 4   # was 2 — prime windows are materially higher-probability
+
+        # ORB breakout during the ORB window: extra confirmation bonus
+        if in_orb_window and candidate.get("orbBreakout"):
+            score += 3   # stacks with the +3 in ORB section below → +6 total
 
         # Opening gap in trade direction
         if direction == "BUY"  and candidate.get("gapUp"):
