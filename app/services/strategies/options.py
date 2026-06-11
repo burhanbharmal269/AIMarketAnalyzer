@@ -48,7 +48,9 @@ class OptionsTradingStrategy(BaseSignalStrategy):
             SpreadGate(),
             EventRiskGate(),
             VixGate(),
-            AiRegimeGate(),
+            # AiRegimeGate removed — AI regime is advisory (shown in UI) but must
+            # not hard-block: a single "avoid" call cached at 9:15 AM kills all
+            # signals for the entire day. Scoring already rewards/penalises regime.
             # Time-based gates
             OpeningVolatilityGate(),
             ClosingVolatilityGate(),

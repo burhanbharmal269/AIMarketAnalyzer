@@ -26,7 +26,7 @@ DEFAULT_SCAN_SETTINGS: dict = {
     "maxDailyLossPct":       3,
     "maxWeeklyDrawdownPct":  8,
     "maxMonthlyDrawdownPct": 15,
-    "minScore":              70,        # raw ≈ 81/116 after normalisation
+    "minScore":              65,        # raw ≈ 75/116 after normalisation
     "maxSignals":            5,
 }
 
@@ -52,7 +52,7 @@ VIX_VERY_CALM  = 14
 # ── Risk / money management ───────────────────────────────────────────────────
 MAX_PNL_LOSS_CAP   = -3.0   # floor on recorded loss (in R units)
 MAX_PNL_WIN_CAP    =  5.0   # ceiling on recorded win
-MIN_IV_RANK_GATE   = 80     # IV Rank percentile hard cut-off
+MIN_IV_RANK_GATE   = 90     # IV Rank percentile hard cut-off (raised from 80 — option buyers need movement, high IV is not always bad)
 
 # RSI extremes — hard blocks (research: RSI>80 = chasing overbought, high IV crush risk)
 RSI_OVERBOUGHT_GATE = 78    # BUY blocked above this (too extended, reversion likely)

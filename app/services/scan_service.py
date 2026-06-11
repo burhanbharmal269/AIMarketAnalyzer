@@ -206,16 +206,15 @@ def build_scan(
                 else:
                     symbol_headlines = val
 
-        # Shortlist uses regime result (now ready), news sentiment batched together
+        # AI shortlist — informational only, no longer filters candidates.
+        # The 4-stage funnel handles structural pre-filtering; AI shortlist
+        # was cutting the pool so aggressively (VIX>16 → max 8, avoid → max 2)
+        # that legitimate setups were never reaching the gate+score loop.
         try:
             shortlist_result = get_candidate_shortlist(candidates, market)
-            shortlist_syms   = set(shortlist_result["shortlist"])
-            before           = len(candidates)
-            candidates       = [c for c in candidates if c["underlying"] in shortlist_syms]
             logger.info(
-                "AI shortlist (%s): %d/%d candidates — skipped %d. RegimeNote: %s",
-                shortlist_result["source"], len(candidates), before,
-                len(shortlist_result["skipped"]),
+                "AI shortlist (advisory only, %s): would have kept %d/%d. RegimeNote: %s",
+                shortlist_result["source"], len(shortlist_result["shortlist"]), len(candidates),
                 shortlist_result.get("regimeNote", "")[:80],
             )
         except Exception as exc:

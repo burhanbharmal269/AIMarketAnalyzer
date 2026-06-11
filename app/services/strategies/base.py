@@ -49,10 +49,22 @@ class BaseSignalStrategy(ISignalStrategy):
         return None
 
     def _funnel_stage_breakout(self, c: dict, settings: dict) -> str | None:
-        """Stage 3: Price Breakout — EMA stack confirms trade direction."""
-        from app.core.utils import trend_aligned
-        if not trend_aligned(c):
-            return "EMA stack does not support trade direction"
+        """Stage 3: Price Breakout — EMA20 must be on correct side of EMA50.
+
+        Funnel uses a loose 2-EMA check (EMA20 vs EMA50 only) so candidates
+        reach the gate+score loop where TrendAlignmentGate enforces the full
+        EMA20>50>200 stack. Requiring the full stack here silently dropped
+        candidates in choppy markets before they could even be evaluated.
+        """
+        direction = c.get("direction", "")
+        ema20 = c.get("ema20", 0)
+        ema50 = c.get("ema50", 0)
+        if ema20 == 0 or ema50 == 0:
+            return None  # missing data — let gate handle it
+        if direction == "BUY" and ema20 < ema50:
+            return "EMA20 below EMA50 — price structure not bullish"
+        if direction == "SELL" and ema20 > ema50:
+            return "EMA20 above EMA50 — price structure not bearish"
         return None
 
     def _funnel_stage_option(self, c: dict, settings: dict) -> str | None:
