@@ -570,8 +570,13 @@ class NSEDataSource:
 
         # ── 2. Kite Connect daily OHLCV (primary — fast, reliable, no scraping) ─
         try:
-            from app.data_sources.kite import get_daily_ohlcv as _kite_daily, KITE_AVAILABLE
-            if KITE_AVAILABLE:
+            from app.data_sources.kite import get_daily_ohlcv as _kite_daily, KITE_AVAILABLE, kite_session
+            kite_connected = bool(
+                KITE_AVAILABLE
+                and kite_session
+                and kite_session.status().get("connected")
+            )
+            if kite_connected:
                 import pandas as pd
                 raw = _kite_daily(symbol, days=400)
                 if raw and len(raw) >= 60:
@@ -1537,9 +1542,16 @@ class NSEDataSource:
             intraday     = None
             try:
                 from app.data_sources.kite import (
-                    get_intraday_candles as _kite_candles, KITE_AVAILABLE,
+                    get_intraday_candles as _kite_candles,
+                    KITE_AVAILABLE,
+                    kite_session,
                 )
-                if KITE_AVAILABLE:
+                kite_connected = bool(
+                    KITE_AVAILABLE
+                    and kite_session
+                    and kite_session.status().get("connected")
+                )
+                if kite_connected:
                     kite_candles = _kite_candles(symbol, interval="5minute")
                 else:
                     intraday = self.get_intraday_closes(symbol)
@@ -1612,11 +1624,20 @@ class NSEDataSource:
                     NSE scraping: serial fetch with 15s timeout per symbol.
           Phase 2 — Parallel OHLCV + indicator + VWAP computation.
         """
-        from app.data_sources.kite import KITE_AVAILABLE, get_fo_universe as kite_fo_universe
+        from app.data_sources.kite import (
+            KITE_AVAILABLE,
+            kite_session,
+            get_fo_universe as kite_fo_universe,
+        )
+        kite_connected = bool(
+            KITE_AVAILABLE
+            and kite_session
+            and kite_session.status().get("connected")
+        )
 
         if scan_list:
             instruments = scan_list
-        elif KITE_AVAILABLE:
+        elif kite_connected:
             instruments = kite_fo_universe()
             logger.info("Universe source: Kite Connect (%d symbols)", len(instruments))
         else:
@@ -1626,7 +1647,7 @@ class NSEDataSource:
         lot_sizes = self.get_lot_sizes()
 
         # ── Phase 1: option chain pre-fetch ──────────────────────────────────────
-        if KITE_AVAILABLE:
+        if kite_connected:
             # Kite: single bulk fetch — 1 LTP call + ceil(N/490) quote batches
             logger.info("Phase 1: bulk OC fetch via Kite Connect (%d symbols)", len(instruments))
             from app.data_sources.kite import get_option_chain_bulk
@@ -1668,8 +1689,8 @@ class NSEDataSource:
             intraday_nifty = None
             kite_nifty     = None
             try:
-                from app.data_sources.kite import get_intraday_candles as _kc, KITE_AVAILABLE
-                if KITE_AVAILABLE:
+                from app.data_sources.kite import get_intraday_candles as _kc
+                if kite_connected:
                     kite_nifty = _kc("NIFTY", interval="5minute")
                 else:
                     intraday_nifty = self.get_intraday_closes("NIFTY")

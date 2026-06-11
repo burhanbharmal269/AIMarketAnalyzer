@@ -358,8 +358,14 @@ class KiteSession:
     @staticmethod
     def _save_session(info: dict) -> None:
         try:
-            _SESSION_FILE.write_text(json.dumps(info, indent=2))
-            _SESSION_FILE.chmod(0o600)   # owner read/write only
+            _SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp_file = _SESSION_FILE.with_suffix(".json.tmp")
+            tmp_file.write_text(json.dumps(info, indent=2), encoding="utf-8")
+            try:
+                tmp_file.chmod(0o600)   # owner read/write only where supported
+            except Exception:
+                pass
+            tmp_file.replace(_SESSION_FILE)
         except Exception as exc:
             logger.warning("Could not save Kite session to disk: %s", exc)
 
@@ -860,7 +866,31 @@ _FO_UNIVERSE: list[str] = [
 
 
 def get_fo_universe() -> list[str]:
-    return list(_FO_UNIVERSE)
+    """Return symbols that currently have tradable NFO option contracts.
+
+    The static universe can drift when NSE symbols change, demerge, or leave F&O.
+    Filtering against Kite's live NFO master prevents every scan from spending
+    time on stale names that will never produce an option chain.
+    """
+    if not KITE_AVAILABLE:
+        return list(_FO_UNIVERSE)
+    try:
+        kite = kite_session.get_client()
+    except RuntimeError:
+        return list(_FO_UNIVERSE)
+
+    tradable: list[str] = []
+    skipped: list[str] = []
+    for sym in _FO_UNIVERSE:
+        name = _INDEX_NFO_MAP.get(sym.upper(), sym.upper())
+        if _instrument_cache.nearest_expiry(kite, name):
+            tradable.append(sym)
+        else:
+            skipped.append(sym)
+
+    if skipped:
+        logger.info("Kite universe filtered: skipped non-F&O symbols %s", ", ".join(skipped))
+    return tradable or list(_FO_UNIVERSE)
 
 
 def get_lot_sizes() -> dict[str, int]:

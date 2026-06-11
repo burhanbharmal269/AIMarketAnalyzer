@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 data/
 .env
+.kite_session.json
 .pytest_cache/
 .mypy_cache/
 node_modules/

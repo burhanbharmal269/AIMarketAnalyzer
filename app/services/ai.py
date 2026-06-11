@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+import os
 from datetime import date
 
 from app.config import settings
@@ -57,6 +58,9 @@ _REGIME_CACHE:      dict = {}   # date -> dict
 
 logger = logging.getLogger(__name__)
 
+_AI_TIMEOUT_SECS = float(os.getenv("AI_TIMEOUT_SECS", "12"))
+_AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "0"))
+
 # ── client initialisation ─────────────────────────────────────────────────────
 # Azure OpenAI takes priority when all three Azure fields are set.
 # Falls back to standard OpenAI if only OPENAI_API_KEY is set.
@@ -79,12 +83,18 @@ try:
             api_key=settings.azure_openai_api_key,
             azure_endpoint=settings.azure_openai_endpoint,
             api_version=settings.azure_openai_api_version,
+            timeout=_AI_TIMEOUT_SECS,
+            max_retries=_AI_MAX_RETRIES,
         )
         _provider = "azure"
         logger.info("AI provider: Azure OpenAI (deployment=%s)", settings.azure_openai_deployment)
 
     elif settings.openai_api_key:
-        _client = OpenAI(api_key=settings.openai_api_key)
+        _client = OpenAI(
+            api_key=settings.openai_api_key,
+            timeout=_AI_TIMEOUT_SECS,
+            max_retries=_AI_MAX_RETRIES,
+        )
         _provider = "openai"
         logger.info("AI provider: OpenAI (model=%s)", settings.openai_model)
 
@@ -140,6 +150,7 @@ def _call(system: str, user: str, max_tokens: int = 400) -> str | None:
             ],
             max_tokens=max_tokens,
             temperature=0.3,
+            timeout=_AI_TIMEOUT_SECS,
         )
         return resp.choices[0].message.content.strip()
     except Exception as exc:

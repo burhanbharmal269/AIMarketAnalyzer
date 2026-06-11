@@ -142,6 +142,9 @@
   // ── score bars ────────────────────────────────────────────────────────────
 
   function scoreRows(item) {
+    if (!item.score || !item.score.scores || Object.keys(item.score.scores).length === 0) {
+      return "<div class=\"muted-note\">Not scored because this setup failed an early liquidity/structure filter.</div>";
+    }
     const labels = {
       trend: "Trend", momentum: "Momentum", volume: "Volume",
       optionChain: "Option Chain", sentiment: "Sentiment", riskReward: "Risk Reward",
@@ -256,9 +259,23 @@
 
   function renderRejectedCard(item) {
     const c = item.candidate;
-    const total = item.score.total;
+    const hasScore = item.score && item.score.scores && Object.keys(item.score.scores).length > 0;
+    const total = hasScore ? item.score.total : null;
     const scoreClass = total >= 85 ? "score-high" : total >= 72 ? "score-mid" : "score-low";
     const targets = c.targets || [0, 0, 0];
+    const scoreBadge = hasScore
+      ? [
+        "<div class=\"score-badge " + scoreClass + "\">",
+        "<span class=\"score-num\">" + total + "</span>",
+        "<span class=\"score-label\">/ 100</span>",
+        "</div>"
+      ].join("")
+      : [
+        "<div class=\"score-badge score-low\">",
+        "<span class=\"score-num\">N/A</span>",
+        "<span class=\"score-label\">pre-filter</span>",
+        "</div>"
+      ].join("");
     return [
       "<article class=\"signal-card rejected-card\">",
       "<div class=\"signal-head\">",
@@ -267,10 +284,7 @@
       "<h3>" + escapeHtml(c.instrument) + "</h3>",
       "<span style=\"font-size:0.78rem;color:var(--muted)\">" + escapeHtml(c.style) + "</span>",
       "</div>",
-      "<div class=\"score-badge " + scoreClass + "\">",
-      "<span class=\"score-num\">" + total + "</span>",
-      "<span class=\"score-label\">/ 100</span>",
-      "</div>",
+      scoreBadge,
       "</div>",
       "<div class=\"trade-levels\">",
       "<div class=\"level-entry\"><span>Entry</span><strong>₹" + c.entry + "</strong></div>",
