@@ -17,7 +17,7 @@ SCORE_MAX_RAW: int = sum(SCORE_CATEGORIES.values())   # 116
 
 # ── Scan defaults ─────────────────────────────────────────────────────────────
 DEFAULT_SCAN_SETTINGS: dict = {
-    "accountCapital":        100_000,   # 1 lakh minimum — F&O lot margin requirement
+    "accountCapital":        300_000,   # 3 lakh default — covers most F&O lot premiums
     "riskPercent":           2,
     "maxSpread":             1.5,
     "minVolume":             25_000,    # 25K minimum option volume

@@ -742,6 +742,7 @@
     }
     _stopPolling();
     _scanRequestedAt = Date.now();
+    _saveSettings();
     setScanLoading(true);
     clearScanError();
     try {
@@ -848,7 +849,10 @@
   // Persist settings across page refreshes
   _loadSettings();
   Object.values(els.settings).forEach(function (el) {
-    if (el) el.addEventListener("change", _saveSettings);
+    if (el) {
+      el.addEventListener("change", _saveSettings);
+      el.addEventListener("input",  _saveSettings);
+    }
   });
 
   // Boot

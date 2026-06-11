@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 
 class ScanSettings(BaseModel):
-    accountCapital: float = Field(default=100_000, ge=10_000)
+    accountCapital: float = Field(default=300_000, ge=10_000)
     riskPercent:    float = Field(default=2, ge=0.1, le=10)
     maxSpread:      float = Field(default=1.5, ge=0.5, le=10)
     minVolume:      int   = Field(default=25_000, ge=0)
