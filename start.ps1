@@ -57,7 +57,7 @@ $uvicorn_args = @(
 
 if ($Dev) {
     $uvicorn_args += "--reload"
-    Write-Host "[DEV]  Hot-reload enabled — changes take effect immediately" -ForegroundColor Magenta
+    Write-Host "[DEV]  Hot-reload enabled - changes take effect immediately" -ForegroundColor Magenta
 }
 
 # ── 4. Banner ─────────────────────────────────────────────────────────────────

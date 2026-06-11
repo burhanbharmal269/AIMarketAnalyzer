@@ -646,6 +646,7 @@
   let _scanElapsedTimer = null;
   let _scanPollCount   = 0;
   let _scanStartedAt   = 0;
+  let _scanRequestedAt = 0;   // ms epoch when user clicked Scan
   const _POLL_INTERVAL_MS  = 5000;
   const _POLL_MAX_ATTEMPTS = 48;    // give up after 4 min (48 × 5s)
 
@@ -704,7 +705,9 @@
       const payload = await res.json();
       // If scan still running (no market data yet), keep polling
       if (payload.scanStatus === "running" && !payload.market) return;
-      // Got a result — stop polling and render
+      // If the cached result is older than when we clicked Scan, keep polling
+      if (payload.cachedAt && new Date(payload.cachedAt).getTime() < _scanRequestedAt) return;
+      // Got a fresh result — stop polling and render
       _stopPolling();
       setScanLoading(false);
       _handleScanPayload(payload);
@@ -719,6 +722,7 @@
       return;
     }
     _stopPolling();
+    _scanRequestedAt = Date.now();
     setScanLoading(true);
     clearScanError();
     try {
