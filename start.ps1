@@ -1,4 +1,4 @@
-# start.ps1 — Indian Options Research Desk
+# start.ps1 - Indian Options Research Desk
 #
 # Usage:   .\start.ps1
 # Stop:    Ctrl+C
@@ -12,15 +12,14 @@
 param(
     [switch]$Dev,            # pass -Dev to enable --reload (hot-reload for development)
     [int]$Port = 8000,
-    [string]$Host = "127.0.0.1"
+    [string]$BindHost = "127.0.0.1"
 )
 
 $ErrorActionPreference = "Continue"
 $Host.UI.RawUI.WindowTitle = "Options Research Desk"
 
-$APP     = "app.main:app"
-$VENV    = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-$UVICORN = Join-Path $PSScriptRoot ".venv\Scripts\uvicorn.exe"
+$APP  = "app.main:app"
+$VENV = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 
 # ── 1. Verify virtual environment ─────────────────────────────────────────────
 if (-not (Test-Path $VENV)) {
@@ -49,7 +48,7 @@ if ($occupied) {
 $uvicorn_args = @(
     "-m", "uvicorn",
     $APP,
-    "--host", $Host,
+    "--host", $BindHost,
     "--port", $Port,
     "--log-level", "info",
     "--timeout-graceful-shutdown", "10"
@@ -64,7 +63,7 @@ if ($Dev) {
 Write-Host ""
 Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host "  Indian Options Research Desk" -ForegroundColor Cyan
-Write-Host "  http://$Host`:$Port" -ForegroundColor Cyan
+Write-Host "  http://$BindHost`:$Port" -ForegroundColor Cyan
 if ($Dev) {
     Write-Host "  Mode: DEVELOPMENT (hot-reload on)" -ForegroundColor Magenta
 } else {
@@ -75,9 +74,9 @@ Write-Host "==========================================" -ForegroundColor Cyan
 Write-Host ""
 
 # ── 5. Run with auto-restart ──────────────────────────────────────────────────
-$attempt    = 0
-$back_off   = 3    # seconds, doubles each crash up to $max_back_off
-$max_back   = 30
+$attempt  = 0
+$back_off = 3    # seconds, doubles each crash up to $max_back
+$max_back = 30
 
 while ($true) {
     $attempt++
