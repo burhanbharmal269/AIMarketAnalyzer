@@ -109,6 +109,25 @@
     });
   }
 
+  var _SETTINGS_KEY = "ird_settings_v1";
+
+  function _saveSettings() {
+    try { localStorage.setItem(_SETTINGS_KEY, JSON.stringify(settingValues())); } catch (_) {}
+  }
+
+  function _loadSettings() {
+    try {
+      var saved = JSON.parse(localStorage.getItem(_SETTINGS_KEY) || "null");
+      if (!saved) return;
+      if (saved.accountCapital) els.settings.accountCapital.value = saved.accountCapital;
+      if (saved.riskPercent)    els.settings.riskPercent.value    = saved.riskPercent;
+      if (saved.lossStreak != null) els.settings.lossStreak.value = saved.lossStreak;
+      if (saved.maxSpread)      els.settings.maxSpread.value      = saved.maxSpread;
+      if (saved.minVolume)      els.settings.minVolume.value      = saved.minVolume;
+      if (saved.eventWindow)    els.settings.eventWindow.value    = saved.eventWindow;
+    } catch (_) {}
+  }
+
   function settingValues() {
     return {
       accountCapital: +els.settings.accountCapital.value,
@@ -825,6 +844,12 @@
     els.journalForm.classList.add("hidden");
   });
   els.saveJournalButton.addEventListener("click", saveJournalEntry);
+
+  // Persist settings across page refreshes
+  _loadSettings();
+  Object.values(els.settings).forEach(function (el) {
+    if (el) el.addEventListener("change", _saveSettings);
+  });
 
   // Boot
   detectApi();
