@@ -1627,12 +1627,14 @@ class NSEDataSource:
 
         # ── Phase 1: option chain pre-fetch ──────────────────────────────────────
         if KITE_AVAILABLE:
-            # Kite: parallel fetch — no Akamai, no serial bottleneck
-            logger.info("Phase 1: parallel OC fetch via Kite Connect (%d symbols)", len(instruments))
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                futures = {pool.submit(self.get_option_chain, sym): sym for sym in instruments}
-                fetched = sum(1 for fut in as_completed(futures) if fut.result() is not None)
-            logger.info("Phase 1 complete: %d/%d option chains fetched (Kite)", fetched, len(instruments))
+            # Kite: single bulk fetch — 1 LTP call + ceil(N/490) quote batches
+            logger.info("Phase 1: bulk OC fetch via Kite Connect (%d symbols)", len(instruments))
+            from app.data_sources.kite import get_option_chain_bulk
+            bulk = get_option_chain_bulk(instruments)
+            for sym, oc_data in bulk.items():
+                self._cache[f"oc_{sym}"] = {"data": oc_data, "ts": time.time()}
+            fetched = len(bulk)
+            logger.info("Phase 1 complete: %d/%d option chains fetched (Kite bulk)", fetched, len(instruments))
         else:
             # NSE scraping: serial with per-symbol timeout (Akamai blocking requires fresh sessions)
             logger.info("Phase 1: serial OC fetch via NSE jugaad-data (%d symbols)", len(instruments))

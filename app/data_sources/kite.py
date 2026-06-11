@@ -553,6 +553,123 @@ def get_option_ltp(underlying: str, strike: float, opt_type: str,
         return None
 
 
+def get_option_chain_bulk(symbols: list[str]) -> dict[str, dict]:
+    """Fetch option chains for ALL symbols in minimal Kite API calls.
+
+    Replaces N×2 throttled calls (1 LTP + 1 quote per symbol) with:
+      - 1 batch LTP call for all underlyings
+      - ceil(total_contracts / 490) batch quote calls for ALL contracts
+
+    For 40 symbols this reduces ~80 throttled calls → ~16, saving ~20s.
+    Returns {symbol: oc_dict} in the same format as get_option_chain().
+    """
+    if not KITE_AVAILABLE:
+        return {}
+    try:
+        kite = kite_session.get_client()
+    except RuntimeError:
+        return {}
+
+    today = date.today()
+
+    # Step 1: Collect contracts for every symbol from cache — zero API calls
+    symbol_meta: dict[str, dict] = {}
+    all_nfo_keys: list[str] = []
+    udl_key_set: list[str] = []
+
+    for sym in symbols:
+        name   = _INDEX_NFO_MAP.get(sym.upper(), sym.upper())
+        expiry = _instrument_cache.nearest_expiry(kite, name)
+        if not expiry:
+            continue
+        contracts = _instrument_cache.get_by_symbol(kite, name, expiry, None)
+        if not contracts:
+            continue
+        udl_key = _INDEX_KITE_MAP.get(sym.upper(), f"NSE:{sym.upper()}")
+        symbol_meta[sym] = {"name": name, "expiry": expiry,
+                            "contracts": contracts, "udl_key": udl_key}
+        all_nfo_keys.extend(f"NFO:{c['tradingsymbol']}" for c in contracts)
+        if udl_key not in udl_key_set:
+            udl_key_set.append(udl_key)
+
+    if not symbol_meta:
+        return {}
+
+    # Step 2: One batch LTP for all underlyings
+    udl_ltps: dict[str, float] = {}
+    _throttle()
+    try:
+        raw = _with_auth(kite.ltp, udl_key_set)
+        udl_ltps = {k: v.get("last_price", 0.0) for k, v in raw.items()}
+    except Exception as exc:
+        logger.warning("Bulk LTP failed: %s", exc)
+
+    # Step 3: Batch quote ALL NFO contracts (490 per call)
+    unique_nfo = list(dict.fromkeys(all_nfo_keys))  # deduplicate, preserve order
+    all_quotes: dict[str, dict] = {}
+    for i in range(0, len(unique_nfo), 490):
+        chunk = unique_nfo[i : i + 490]
+        _throttle()
+        try:
+            batch = _with_auth(kite.quote, chunk)
+            all_quotes.update(batch)
+        except Exception as exc:
+            logger.warning("Bulk quote batch [%d] failed: %s", i // 490, exc)
+
+    # Step 4: Build per-symbol OC dicts from the pooled data
+    result: dict[str, dict] = {}
+    for sym, meta in symbol_meta.items():
+        expiry    = meta["expiry"]
+        contracts = meta["contracts"]
+        udl_ltp   = udl_ltps.get(meta["udl_key"], 0.0)
+        T         = max((expiry - today).days, 0) / 365.0
+
+        records_by_strike: dict[float, dict] = {}
+        for contract in contracts:
+            strike = contract.get("strike", 0.0)
+            itype  = contract.get("instrument_type", "")
+            key    = f"NFO:{contract['tradingsymbol']}"
+            q      = all_quotes.get(key, {})
+            ltp    = q.get("last_price",  0.0)
+            oi     = q.get("oi",          0)
+            oi_chg = q.get("oi_day_high", 0) - q.get("oi_day_low", 0)
+            volume = q.get("volume",      0)
+            depth  = q.get("depth",       {})
+            bids   = depth.get("buy",  [{}])
+            asks   = depth.get("sell", [{}])
+            bid    = bids[0].get("price", 0) if bids else 0
+            ask    = asks[0].get("price", 0) if asks else 0
+            iv_pct = compute_iv(ltp, udl_ltp, strike, T, itype) if udl_ltp > 0 and T > 0 else 0.0
+
+            if strike not in records_by_strike:
+                records_by_strike[strike] = {"strikePrice": strike, "expiryDate": str(expiry)}
+            records_by_strike[strike]["CE" if itype == "CE" else "PE"] = {
+                "strikePrice": strike, "expiryDate": str(expiry),
+                "lastPrice": ltp, "openInterest": oi,
+                "changeinOpenInterest": oi_chg, "totalTradedVolume": volume,
+                "impliedVolatility": iv_pct, "bidprice": bid, "askPrice": ask,
+            }
+
+        if not records_by_strike:
+            continue
+        records_list = sorted(records_by_strike.values(), key=lambda r: r["strikePrice"])
+        result[sym] = {
+            "records": {
+                "expiryDates":    [str(expiry)],
+                "data":           records_list,
+                "underlyingValue": udl_ltp,
+                "timestamp":      _now_ist().isoformat(),
+            },
+            "filtered": {"data": records_list, "underlyingValue": udl_ltp},
+            "_source": "kite",
+            "_expiry": str(expiry),
+        }
+
+    logger.info("Bulk OC fetch: %d/%d symbols, %d NFO contracts, %d quote batches",
+                len(result), len(symbols), len(unique_nfo), (len(unique_nfo) + 489) // 490)
+    return result
+
+
 def get_option_chain(symbol: str, expiry: date | None = None) -> dict:
     """Build a full option chain dict from Kite instruments + quotes.
 

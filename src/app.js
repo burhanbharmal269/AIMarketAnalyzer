@@ -633,7 +633,7 @@
   let _scanPollCount   = 0;
   let _scanStartedAt   = 0;
   const _POLL_INTERVAL_MS  = 5000;
-  const _POLL_MAX_ATTEMPTS = 24;    // give up after 2 min (24 × 5s)
+  const _POLL_MAX_ATTEMPTS = 48;    // give up after 4 min (48 × 5s)
 
   function _stopPolling() {
     if (_scanPollTimer)    { clearInterval(_scanPollTimer);    _scanPollTimer    = null; }

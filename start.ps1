@@ -37,7 +37,7 @@ if ($occupied) {
     $kill = Read-Host "Kill it and continue? [y/N]"
     if ($kill -match '^[Yy]') {
         try { Stop-Process -Id ([int]$pid_match) -Force -ErrorAction Stop }
-        catch { Write-Host "[WARN] Could not kill PID $pid_match — try manually" -ForegroundColor Yellow }
+        catch { Write-Host "[WARN] Could not kill PID $pid_match - try manually" -ForegroundColor Yellow }
         Start-Sleep -Seconds 1
     } else {
         Write-Host "Aborted." -ForegroundColor Red
@@ -96,7 +96,7 @@ while ($true) {
 
     # Ctrl+C produces exit code 0xC000013A (-1073741510) on Windows
     if ($exit_code -eq -1073741510 -or $exit_code -eq 130) {
-        Write-Host "[$ts] Interrupted by user — exiting." -ForegroundColor Yellow
+        Write-Host "[$ts] Interrupted by user - exiting." -ForegroundColor Yellow
         break
     }
 
